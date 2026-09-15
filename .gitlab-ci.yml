@@ -1,0 +1,16 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+
+stages:
+  - test
+
+unit_tests:
+  stage: test
+  image: python:3.13-slim-bookworm
+  before_script:
+    - python3 -m pip install --disable-pip-version-check --no-cache-dir -r requirements.txt
+  script:
+    - python3 -m unittest discover -s tests -v

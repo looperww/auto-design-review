@@ -1,93 +1,290 @@
-# automated design review
+# Portable GitLab security-review service
 
+This repository is a self-contained, read-only security checkpoint for GitLab.
+Clone it onto any Docker host and start it with Docker Compose. The authenticated
+setup page stores the GitLab token, Anthropic API key, GitLab URL, and all review
+settings in SQLite. It automatically discovers all projects visible to the
+GitLab token, reviews new merge requests and new MR revisions, and keeps reports
+locally.
 
+No GitLab Runner, webhook listener, pipeline trigger, or `.gitlab-ci.yml` change
+is required in product repositories.
 
-## Getting started
+## How it works
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+```text
+GitLab projects visible to the token
+              │
+              │ poll open MRs every five minutes
+              ▼
+     portable reviewer container
+              │
+              ├── MR metadata and diff
+              ├── exact read-only repository snapshot at the MR head SHA
+              ├── bounded source/sanitizer/sink context selection
+              └── centrally managed security-review skill
+              │
+              ▼
+          Claude Opus
+              │
+              ▼
+     local reports and review state
+              │
+              ▼
+ authenticated local web console
 ```
-cd existing_repo
-git remote add origin https://gitlab.bce.lu/security/automated-design-review.git
-git branch -M main
-git push -uf origin main
+
+The service never builds, imports, installs dependencies from, or executes
+product code. Repository archives are processed as untrusted data in memory.
+Claude receives the MR diff plus a bounded selection of full changed files and
+related files. All Claude Code tools are disabled.
+
+## Requirements
+
+- Docker with the Compose plugin.
+- Network access to the GitLab API, Docker image sources, Claude Code download
+  endpoints, and the Anthropic API.
+- At least 4 GB RAM for the Docker host.
+- An Anthropic API key with billing and a spending limit configured.
+- A GitLab fine-grained personal access token or service-account token.
+
+## GitLab token permissions
+
+Create the token at the highest company group that should be reviewed. The
+token's resource boundary is the deployment scope: every existing and future
+project visible inside that boundary is discovered automatically.
+
+Grant only these fine-grained permissions:
+
+| Resource | Permission | Why |
+| --- | --- | --- |
+| Project | Read | Discover the projects visible to the token. |
+| Merge Request | Read | Read open MRs, metadata, and diffs. |
+| Repository | Read | Download a source snapshot at the exact MR commit. |
+
+Do not grant create, update, approve, merge, push, administration, runner, or
+deployment permissions. The token-owning account should have only Reporter
+membership inherited from the top-level company group.
+
+For production, use a dedicated non-human service account instead of a person's
+token. Set an expiration date, record an owner, and define a rotation process.
+
+## Deploy
+
+### 1. Clone the repository
+
+```bash
+git clone git@gitlab.bce.lu:security/automated-design-review.git
+cd automated-design-review
 ```
 
-## Integrate with your tools
+### 2. Build and start
 
-* [Set up project integrations](https://gitlab.bce.lu/security/automated-design-review/-/settings/integrations)
+```bash
+docker compose up --detach --build
+```
 
-## Collaborate with your team
+The image installs Claude Code from Anthropic's stable channel during the build.
+The combined reviewer and web-console container runs as an unprivileged user
+with a read-only root filesystem, no Linux capabilities, no-new-privileges, and
+no Docker socket.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### 3. Check the service
 
-## Test and Deploy
+```bash
+docker compose ps
+```
 
-Use the built-in continuous integration in GitLab.
+```bash
+docker compose logs --follow app
+```
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+### 4. Create the administrator
 
-***
+The management console is bound to the deployment machine's localhost interface
+by default. On that machine, open:
 
-# Editing this README
+```text
+http://127.0.0.1:8080/setup
+```
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+Create the first administrator username and password. The password is
+PBKDF2-HMAC-SHA256 hashed with a unique salt and stored in SQLite. After the
+account is created, the setup page is disabled and you are directed to sign in.
 
-## Suggestions for a good README
+### 5. Sign in and configure the reviewer
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+After signing in, first review and save the runtime settings. Then configure:
 
-## Name
-Choose a self-explaining name for your project.
+- the GitLab URL;
+- the read-only GitLab token; and
+- the Anthropic API key.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+The two API credentials and GitLab URL are encrypted with AES-GCM using a key
+derived from the administrator password. Password hashes, encrypted credentials,
+operational settings, review state, report content, and report metadata are
+stored in SQLite in the persistent Docker volume.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+The reviewer remains locked and cannot contact GitLab or Anthropic until the
+runtime settings and encrypted credentials have both been saved.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+For a remote server, keep the console bound to localhost and use an SSH tunnel:
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+```bash
+ssh -L 8080:127.0.0.1:8080 user@security-review-server
+```
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+Then open `http://127.0.0.1:8080` on your computer. Do not publish the console
+directly to a company network or the internet without an approved HTTPS reverse
+proxy and an infrastructure security review.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+The web console provides review status, recent reports, validated runtime
+settings, and credential rotation. Stored secrets are never displayed again.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+After every container or host restart, sign in once to unlock the encrypted
+credential vault in memory. This is necessary because no plaintext credential
+or separate master encryption key is stored on disk. Until it is unlocked, the
+web console remains available but security reviews wait.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+Keep an approved backup of the Docker volume. The encryption password is not
+recoverable from SQLite. If it is lost, the API credentials must be revoked and
+the service must be initialized again. Fully unattended unlock after a restart
+would require an external secret manager or master key, which this deployment
+intentionally does not store.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+Before the first scan, choose whether to review existing open MRs in the setup
+page. The default records them as a baseline without spending Claude tokens.
+Any MR created later, or any new commit pushed to an MR, is reviewed
+automatically. Enabling existing-MR review can create significant API cost.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+## Read the reports
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+Reports can be opened from the authenticated web console. The Markdown report
+and its metadata are stored directly in SQLite with the MR identity, commit,
+selected context files, prompt size, Claude duration, and estimated Claude cost.
+Report records never contain either token; API credentials exist in a separate
+SQLite table only as authenticated ciphertext.
 
-## License
-For open source projects, say how it is licensed.
+## Automatic discovery
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+The service does not maintain a repository allowlist. The GitLab token itself
+defines the boundary. Every polling cycle:
+
+1. GitLab returns all active projects in which the token owner has at least
+   Reporter access.
+2. The service lists open MRs in those projects.
+3. The local SQLite database identifies MR commit SHAs not seen before.
+4. Unseen revisions are queued and reviewed in order.
+
+New projects are therefore included automatically when the service account
+inherits access to them. To exclude a project, remove that service account's
+access to the project or place the project outside the token's resource boundary.
+
+## Review-cycle limit
+
+`MAX_REVIEWS_PER_CYCLE=5` means that one polling cycle processes at most five
+pending MR revisions. It does not discard the remainder. For example, if 12 new
+MR revisions are found, the default configuration processes five, then five,
+then two over three cycles.
+
+Set the value to `0` in the web console to process all pending revisions in the
+same cycle. This still processes reviews sequentially, and any MRs created while
+that cycle is running are discovered in the next cycle. Unlimited mode can
+create a large and sudden API bill, so a finite limit is recommended for normal
+operation.
+
+Runtime settings saved in the web console are stored in SQLite and apply
+automatically on the next polling cycle. No `.env` file is used.
+
+## Context and data-flow analysis
+
+For each new MR revision, the reviewer downloads a repository archive at the
+exact source commit and selects:
+
+- full contents of changed text files;
+- related files sharing changed identifiers, functions, classes, and paths;
+- security-relevant files involving authentication, authorization, routes, and
+  permissions;
+- the complete MR diff and MR description.
+
+Claude is instructed to trace attacker-controlled input through transformations
+and sanitizers to SQL, command, filesystem, template, deserialization, logging,
+redirect, and outbound-request sinks. This is bounded, heuristic contextual
+analysis rather than a formal proof. Production assurance should combine it
+with the company's SAST and dependency-scanning controls.
+
+The default limits keep one review within a manageable input and cost envelope:
+
+| Setting | Default |
+| --- | ---: |
+| Poll interval | 300 seconds |
+| Reviews per cycle | 5; `0` means all pending |
+| Changed files | 200 |
+| Diff size | 300 KB |
+| Repository archive | 100 MB |
+| Context files | 20 |
+| Individual context file | 100 KB |
+| Total selected context | 350 KB |
+| Claude budget per review | USD 5.00 |
+
+Oversized, collapsed, or incomplete changes produce a manual-review-required
+report instead of a false clean result.
+
+## Operations
+
+Stop the service:
+
+```bash
+docker compose down
+```
+
+Update it without deleting review history:
+
+```bash
+git pull
+docker compose up --detach --build
+```
+
+The named data volume survives `docker compose down`. Do not use
+`docker compose down --volumes` unless you intentionally want to delete all
+review state and stored reports.
+
+Rotate a GitLab or Anthropic credential from the authenticated web console. The
+replacement is encrypted in SQLite and the reviewer starts using it without a
+container restart.
+
+## Security boundaries
+
+- GitLab access is read-only and limited by the token's resource boundary.
+- Product code is never executed.
+- Repository archives are never written into the container filesystem.
+- Claude Code runs in bare print mode with tools disabled and no session history.
+- The GitLab token is not put in Claude's process environment; only the
+  Anthropic API key is supplied to the isolated Claude process.
+- Secret-like unchanged files, private keys, dependency directories, generated
+  output, binary files, and oversized files are excluded from context.
+- The container cannot modify GitLab, approve an MR, merge code, or read
+  deployment secrets.
+- Web passwords are salted and hashed in SQLite; session tokens are stored only
+  as SHA-256 digests, forms use CSRF protection, and login attempts are limited.
+- The web console listens only on `127.0.0.1` at the Docker host by default.
+
+Because selected proprietary source code is sent to Anthropic, obtain company
+approval for the provider, data-processing terms, retention settings, permitted
+repositories, and geographic processing before production use.
+
+## Local tests
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m unittest discover -s tests -v
+```
+
+## Official references
+
+- [GitLab Projects API](https://docs.gitlab.com/api/projects/)
+- [GitLab Merge Requests API](https://docs.gitlab.com/api/merge_requests/)
+- [GitLab repository archive API](https://docs.gitlab.com/api/repositories/#retrieve-file-archive)
+- [GitLab fine-grained token permissions](https://docs.gitlab.com/auth/tokens/fine_grained_access_tokens_rest/)
+- [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage)
+- [Claude Code installation](https://code.claude.com/docs/en/setup)
