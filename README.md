@@ -262,11 +262,12 @@ GitLab and LLM credentials, and runtime settings remain unchanged. The reviewer
 is then woken for a fresh discovery cycle; open MRs created before the reset
 time are not imported again.
 
-After every container or host restart, sign in once to unlock the encrypted
-credential vault in memory. This is necessary because no plaintext credential
-or separate master encryption key is stored on disk. Until it is unlocked, the
-web console remains available but both GitLab discovery and security reviews
-wait.
+After every container or host restart, any existing authenticated web session
+is invalidated and the administrator is redirected to the sign-in page. Signing
+in again automatically unlocks the encrypted credential vault in memory. No
+separate unlock action exists in Settings. This is necessary because no
+plaintext credential or separate master encryption key is stored on disk;
+until sign-in succeeds, both GitLab discovery and security reviews wait.
 
 Keep an approved backup of the host `data/` folder. Stop the service before
 copying it so the SQLite backup is consistent. The encryption password is not

@@ -1,4 +1,5 @@
 import io
+import http.client
 import os
 import sqlite3
 import subprocess
@@ -692,6 +693,47 @@ class DiscoveryInventoryTests(unittest.TestCase):
 
 
 class WebAuthenticationTests(unittest.TestCase):
+    def test_restart_invalidates_session_and_requires_fresh_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WebStore(root / "state.sqlite3")
+            user_id = store.create_first_user(
+                "security-admin",
+                "a secure test password",
+                Credentials("https://gitlab.example.com", "test-token", "test-key"),
+            )
+            session_token, _ = store.create_session(user_id)
+            handler = handler_factory(store, root / "reports", False, MemoryVault())
+            handler.log_message = lambda *_args: None
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=5
+            )
+            try:
+                connection.request(
+                    "GET", "/", headers={"Cookie": f"reviewer_session={session_token}"}
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 303)
+                self.assertEqual(response.getheader("Location"), "/login?reason=restart")
+                self.assertIn("Max-Age=0", response.getheader("Set-Cookie", ""))
+
+                connection.request("GET", "/login?reason=restart")
+                response = connection.getresponse()
+                login_page = response.read().decode("utf-8")
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+
+            self.assertIsNone(store.session(session_token))
+            self.assertIn("The service was restarted", login_page)
+            self.assertNotIn("Unlock service", login_page)
+
     def test_authenticated_dashboard_and_repository_routes_are_separate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

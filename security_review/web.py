@@ -1197,6 +1197,16 @@ def handler_factory(
             session = self.session()
             if session is None:
                 self.redirect("/login")
+                return None
+            token, _ = session
+            active_credentials, _ = vault.snapshot()
+            if store.credentials_configured() and active_credentials is None:
+                store.delete_session(token)
+                headers = [
+                    ("Set-Cookie", self.make_cookie("reviewer_session", "", 0))
+                ]
+                self.redirect("/login?reason=restart", headers)
+                return None
             return session
 
         def preauth_token(self) -> tuple[str, list[tuple[str, str]]]:
@@ -1225,7 +1235,7 @@ def handler_factory(
             elif parsed.path == "/setup":
                 self.show_setup()
             elif parsed.path == "/login":
-                self.show_login()
+                self.show_login(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/settings":
                 self.show_settings(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/repositories":
@@ -1249,8 +1259,6 @@ def handler_factory(
                     self.login(form)
                 elif parsed.path == "/logout":
                     self.logout(form)
-                elif parsed.path == "/unlock":
-                    self.unlock(form)
                 elif parsed.path == "/credentials":
                     self.update_credentials(form)
                 elif parsed.path == "/credentials/test-gitlab":
@@ -1312,15 +1320,22 @@ def handler_factory(
             store.create_first_user(username, password)
             self.redirect("/login")
 
-        def show_login(self, error: str = "") -> None:
+        def show_login(
+            self, query: dict[str, list[str]] | None = None, error: str = ""
+        ) -> None:
             if store.user_count() == 0:
                 self.redirect("/setup")
                 return
             csrf, headers = self.preauth_token()
             error_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
+            restart_notice = (
+                "<p class='notice'>The service was restarted. Sign in again to unlock the encrypted credentials.</p>"
+                if (query or {}).get("reason", [""])[0] == "restart"
+                else ""
+            )
             body = f"""
             <div class='card auth'><h1>Security Review</h1><p class='sub'>Sign in to manage review settings and see results.</p>
-            {error_html}<form method='post' action='/login'>
+            {restart_notice}{error_html}<form method='post' action='/login'>
             <input type='hidden' name='csrf' value='{html.escape(csrf)}'>
             <div class='field'><label for='username'>Username</label><input id='username' name='username' autocomplete='username' required></div><br>
             <div class='field'><label for='password'>Password</label><input id='password' name='password' type='password' autocomplete='current-password' required></div>
@@ -1344,7 +1359,7 @@ def handler_factory(
             )
             if user is None:
                 store.record_failed_login(remote)
-                self.show_login("Invalid username or password.")
+                self.show_login(error="Invalid username or password.")
                 return
             if store.credentials_configured():
                 try:
@@ -1352,7 +1367,7 @@ def handler_factory(
                         store.unlock_credentials_with_key(password)
                     )
                 except ReviewError as exc:
-                    self.show_login(str(exc))
+                    self.show_login(error=str(exc))
                     return
                 vault.set(credentials, salt=salt, encryption_key=encryption_key)
             else:
@@ -1372,29 +1387,6 @@ def handler_factory(
             store.delete_session(token)
             headers = [("Set-Cookie", self.make_cookie("reviewer_session", "", 0))]
             self.redirect("/login", headers)
-
-        def unlock(self, form: dict[str, str]) -> None:
-            session = self.require_session()
-            if session is None:
-                return
-            _, user = session
-            if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
-                raise ReviewError("Invalid form token.")
-            password = form.get("password", "")
-            authenticated = store.authenticate(str(user["username"]), password)
-            if authenticated is None:
-                self.redirect("/settings?message=" + urllib.parse.quote("The password was not accepted."))
-                return
-            credentials, salt, encryption_key = store.unlock_credentials_with_key(
-                password
-            )
-            vault.set(credentials, salt=salt, encryption_key=encryption_key)
-            message = (
-                "Credential vault unlocked; GitLab discovery and LLM reviews can run."
-                if credentials.llm_api_key
-                else "Credential vault unlocked; GitLab discovery can run. Add an LLM API key to begin reviews."
-            )
-            self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def update_credentials(self, form: dict[str, str]) -> None:
             session = self.require_session()
@@ -1670,8 +1662,8 @@ def handler_factory(
             active_credentials, _ = vault.snapshot()
             if active_credentials is None and store.credentials_configured():
                 return (
-                    "<p class='error'>The reviewer is locked after a restart. "
-                    "<a href='/settings'>Open Settings</a> to unlock it.</p>"
+                    "<p class='error'>The credential session is unavailable. "
+                    "Sign out and sign in again.</p>"
                 )
             if active_credentials is None:
                 return (
@@ -1890,12 +1882,10 @@ def handler_factory(
             active_credentials, _ = vault.snapshot()
             credentials_configured = store.credentials_configured()
             if credentials_configured and active_credentials is None:
-                credential_panel = f"""
-                <section class='card'><h2>Unlock encrypted credentials</h2>
-                <p class='error'>The encrypted credentials are safe in SQLite, but the reviewer must be unlocked after a restart.</p>
-                <form method='post' action='/unlock'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'>
-                <div class='field'><label for='unlock_password'>Administrator password</label><input id='unlock_password' name='password' type='password' autocomplete='current-password' required></div>
-                <div class='actions'><button type='submit'>Unlock service</button></div></form></section>"""
+                credential_panel = (
+                    "<section class='card'><h2>Credential session expired</h2>"
+                    "<p class='error'>Sign out and sign in again to unlock the encrypted credentials.</p></section>"
+                )
             elif not credentials_configured and not vault.ready_for_updates():
                 credential_panel = (
                     "<section class='card'><h2>Configure encrypted credentials</h2>"
@@ -1974,11 +1964,7 @@ def handler_factory(
                 for setting in RUNTIME_SETTINGS
             }
             store.save_settings(normalized)
-            active_credentials, _ = vault.snapshot()
-            if store.credentials_configured() and active_credentials is None:
-                message = "Settings saved. Unlock the reviewer with your administrator password."
-            else:
-                message = "Settings saved. They will apply on the next polling cycle."
+            message = "Settings saved. They will apply on the next polling cycle."
             self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def reset_review_data(self, form: dict[str, str]) -> None:
