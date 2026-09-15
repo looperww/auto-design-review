@@ -293,7 +293,7 @@ status and have no report until the selected LLM reviews them.
 The dashboard combines visible repositories and fetched-MR activity in one
 **Repositories and MRs** table. For each repository it shows:
 
-- the numeric GitLab repository ID;
+- the numeric GitLab ID;
 - **Up** when the latest GitLab MR-list request for that repository succeeded,
   **Down** when it failed, and **Unknown** before the first completed check;
 - the number of distinct MRs in the selected period, counting multiple commit
