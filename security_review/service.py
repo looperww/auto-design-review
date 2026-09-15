@@ -567,6 +567,7 @@ class ReviewState:
                 report_content TEXT,
                 metadata_json TEXT,
                 discovered_at TEXT NOT NULL,
+                mr_created_at TEXT NOT NULL,
                 reviewed_at TEXT NOT NULL,
                 PRIMARY KEY (project_id, mr_iid, head_sha)
             )
@@ -584,6 +585,14 @@ class ReviewState:
             self.connection.execute(
                 "UPDATE reviews SET discovered_at = reviewed_at WHERE discovered_at IS NULL"
             )
+        if "mr_created_at" not in review_columns:
+            self.connection.execute(
+                "ALTER TABLE reviews ADD COLUMN mr_created_at TEXT NOT NULL DEFAULT ''"
+            )
+            self.connection.execute(
+                "UPDATE reviews SET mr_created_at = discovered_at "
+                "WHERE mr_created_at = ''"
+            )
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
@@ -599,10 +608,26 @@ class ReviewState:
                 web_url TEXT NOT NULL,
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
-                is_visible INTEGER NOT NULL DEFAULT 1
+                is_visible INTEGER NOT NULL DEFAULT 1,
+                last_check_status TEXT NOT NULL DEFAULT 'unknown',
+                last_check_error TEXT NOT NULL DEFAULT ''
             )
             """
         )
+        visible_project_columns = {
+            str(row[1])
+            for row in self.connection.execute("PRAGMA table_info(visible_projects)")
+        }
+        if "last_check_status" not in visible_project_columns:
+            self.connection.execute(
+                "ALTER TABLE visible_projects ADD COLUMN "
+                "last_check_status TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        if "last_check_error" not in visible_project_columns:
+            self.connection.execute(
+                "ALTER TABLE visible_projects ADD COLUMN "
+                "last_check_error TEXT NOT NULL DEFAULT ''"
+            )
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -630,8 +655,8 @@ class ReviewState:
             """
             INSERT OR IGNORE INTO reviews
                 (project_id, mr_iid, head_sha, project_path, status, report_path,
-                 report_content, metadata_json, discovered_at, reviewed_at)
-            VALUES (?, ?, ?, ?, 'pending', '', '', '', ?, ?)
+                 report_content, metadata_json, discovered_at, mr_created_at, reviewed_at)
+            VALUES (?, ?, ?, ?, 'pending', '', '', '', ?, ?, ?)
             """,
             (
                 target.project_id,
@@ -639,6 +664,7 @@ class ReviewState:
                 target.head_sha,
                 target.project_path,
                 discovered_at,
+                target.created_at or discovered_at,
                 discovered_at,
             ),
         )
@@ -658,14 +684,15 @@ class ReviewState:
             """
             INSERT INTO reviews
                 (project_id, mr_iid, head_sha, project_path, status, report_path,
-                 report_content, metadata_json, discovered_at, reviewed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 report_content, metadata_json, discovered_at, mr_created_at, reviewed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, mr_iid, head_sha) DO UPDATE SET
                 project_path = excluded.project_path,
                 status = excluded.status,
                 report_path = excluded.report_path,
                 report_content = excluded.report_content,
                 metadata_json = excluded.metadata_json,
+                mr_created_at = excluded.mr_created_at,
                 reviewed_at = excluded.reviewed_at
             """,
             (
@@ -678,6 +705,7 @@ class ReviewState:
                 report_content,
                 metadata_json,
                 reviewed_at,
+                target.created_at or reviewed_at,
                 reviewed_at,
             ),
         )
@@ -736,6 +764,30 @@ class ReviewState:
                 """,
                 (project_id, project_path, web_url, observed_at, observed_at),
             )
+        self.connection.commit()
+
+    def record_project_check(
+        self, project_id: int, status: str, error: str = ""
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE visible_projects
+            SET last_check_status = ?, last_check_error = ?
+            WHERE project_id = ?
+            """,
+            (status, error[:500], project_id),
+        )
+        self.connection.commit()
+
+    def record_all_project_checks(self, status: str, error: str = "") -> None:
+        self.connection.execute(
+            """
+            UPDATE visible_projects
+            SET last_check_status = ?, last_check_error = ?
+            WHERE is_visible = 1
+            """,
+            (status, error[:500]),
+        )
         self.connection.commit()
 
     def runtime_settings(self) -> dict[str, str]:
@@ -1360,7 +1412,12 @@ def discover_targets(
     client: GitLabClient, state: ReviewState | None = None
 ) -> list[ReviewTarget]:
     targets: list[ReviewTarget] = []
-    projects = client.list_projects()
+    try:
+        projects = client.list_projects()
+    except ReviewError as exc:
+        if state is not None:
+            state.record_all_project_checks("down", str(exc))
+        raise
     if state is not None:
         state.record_visible_projects(projects)
     deployment_started_at = state.deployment_started_at() if state is not None else None
@@ -1369,10 +1426,18 @@ def discover_targets(
         if not isinstance(project_path, str) or not project_path:
             continue
         try:
+            project_id = int(project["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        try:
             merge_requests = client.list_open_merge_requests(project_path)
         except ReviewError as exc:
+            if state is not None:
+                state.record_project_check(project_id, "down", str(exc))
             print(f"Could not inspect {project_path}: {exc}", file=sys.stderr, flush=True)
             continue
+        if state is not None:
+            state.record_project_check(project_id, "up")
         for mr in merge_requests:
             target = target_from(project, mr)
             if deployment_started_at is not None:

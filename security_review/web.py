@@ -41,6 +41,20 @@ LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_LOGIN_ATTEMPTS = 10
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,64}$")
 VAULT_ASSOCIATED_DATA = b"gitlab-security-review-vault-v1"
+APP_JAVASCRIPT = b"""(() => {
+  const provider = document.getElementById('llm_provider');
+  const customField = document.getElementById('custom_api_url_field');
+  const customInput = document.getElementById('llm_api_url');
+  if (!provider || !customField || !customInput) return;
+  const updateCustomField = () => {
+    const visible = provider.value === 'custom';
+    customField.hidden = !visible;
+    customInput.disabled = !visible;
+  };
+  provider.addEventListener('change', updateCustomField);
+  updateCustomField();
+})();
+"""
 
 
 @dataclass(frozen=True)
@@ -59,10 +73,8 @@ def credential_key(password: str, salt: bytes) -> bytes:
     )
 
 
-def encrypt_credentials(credentials: Credentials, password: str) -> tuple[str, str, str]:
-    salt = secrets.token_bytes(16)
-    nonce = secrets.token_bytes(12)
-    plaintext = json.dumps(
+def credential_payload(credentials: Credentials) -> bytes:
+    return json.dumps(
         {
             "gitlab_url": credentials.gitlab_url,
             "gitlab_token": credentials.gitlab_token,
@@ -73,22 +85,32 @@ def encrypt_credentials(credentials: Credentials, password: str) -> tuple[str, s
         },
         separators=(",", ":"),
     ).encode("utf-8")
-    ciphertext = AESGCM(credential_key(password, salt)).encrypt(
-        nonce, plaintext, VAULT_ASSOCIATED_DATA
+
+
+def encrypt_credentials_with_key(
+    credentials: Credentials, salt: bytes, key: bytes
+) -> tuple[str, str, str]:
+    if len(salt) != 16 or len(key) != 32:
+        raise ReviewError("The in-memory credential encryption context is invalid.")
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(key).encrypt(
+        nonce, credential_payload(credentials), VAULT_ASSOCIATED_DATA
     )
     return salt.hex(), nonce.hex(), ciphertext.hex()
 
 
-def decrypt_credentials(
-    salt_hex: str, nonce_hex: str, ciphertext_hex: str, password: str
+def encrypt_credentials(credentials: Credentials, password: str) -> tuple[str, str, str]:
+    salt = secrets.token_bytes(16)
+    return encrypt_credentials_with_key(credentials, salt, credential_key(password, salt))
+
+
+def decrypt_credentials_with_key(
+    nonce_hex: str, ciphertext_hex: str, key: bytes
 ) -> Credentials:
     try:
-        salt = bytes.fromhex(salt_hex)
         nonce = bytes.fromhex(nonce_hex)
         ciphertext = bytes.fromhex(ciphertext_hex)
-        plaintext = AESGCM(credential_key(password, salt)).decrypt(
-            nonce, ciphertext, VAULT_ASSOCIATED_DATA
-        )
+        plaintext = AESGCM(key).decrypt(nonce, ciphertext, VAULT_ASSOCIATED_DATA)
         payload = json.loads(plaintext)
         credentials = Credentials(
             gitlab_url=str(payload["gitlab_url"]),
@@ -109,14 +131,45 @@ def decrypt_credentials(
     return credentials
 
 
+def decrypt_credentials(
+    salt_hex: str, nonce_hex: str, ciphertext_hex: str, password: str
+) -> Credentials:
+    try:
+        salt = bytes.fromhex(salt_hex)
+    except ValueError as exc:
+        raise ReviewError("The credential vault could not be unlocked.") from exc
+    return decrypt_credentials_with_key(
+        nonce_hex, ciphertext_hex, credential_key(password, salt)
+    )
+
+
 class MemoryVault:
     def __init__(self):
         self.condition = threading.Condition()
         self.credentials: Credentials | None = None
+        self.kdf_salt: bytes | None = None
+        self.encryption_key: bytes | None = None
         self.version = 0
 
-    def set(self, credentials: Credentials) -> None:
+    def prepare(self, password: str, salt: bytes | None = None) -> None:
+        selected_salt = salt or secrets.token_bytes(16)
+        key = credential_key(password, selected_salt)
         with self.condition:
+            self.kdf_salt = selected_salt
+            self.encryption_key = key
+
+    def set(
+        self,
+        credentials: Credentials,
+        *,
+        salt: bytes | None = None,
+        encryption_key: bytes | None = None,
+    ) -> None:
+        with self.condition:
+            if salt is not None:
+                self.kdf_salt = salt
+            if encryption_key is not None:
+                self.encryption_key = encryption_key
             self.credentials = credentials
             self.version += 1
             self.condition.notify_all()
@@ -124,6 +177,14 @@ class MemoryVault:
     def snapshot(self) -> tuple[Credentials | None, int]:
         with self.condition:
             return self.credentials, self.version
+
+    def encryption_context(self) -> tuple[bytes, bytes]:
+        with self.condition:
+            if self.kdf_salt is None or self.encryption_key is None:
+                raise ReviewError(
+                    "The credential vault is locked. Sign in again to unlock it."
+                )
+            return self.kdf_salt, self.encryption_key
 
     def wait_for_credentials(self) -> tuple[Credentials, int]:
         with self.condition:
@@ -304,6 +365,7 @@ class WebStore:
                     report_content TEXT,
                     metadata_json TEXT,
                     discovered_at TEXT NOT NULL,
+                    mr_created_at TEXT NOT NULL,
                     reviewed_at TEXT NOT NULL,
                     PRIMARY KEY (project_id, mr_iid, head_sha)
                 )
@@ -321,6 +383,15 @@ class WebStore:
                 connection.execute(
                     "UPDATE reviews SET discovered_at = reviewed_at WHERE discovered_at IS NULL"
                 )
+            if "mr_created_at" not in review_columns:
+                connection.execute(
+                    "ALTER TABLE reviews ADD COLUMN "
+                    "mr_created_at TEXT NOT NULL DEFAULT ''"
+                )
+                connection.execute(
+                    "UPDATE reviews SET mr_created_at = discovered_at "
+                    "WHERE mr_created_at = ''"
+                )
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
@@ -336,10 +407,26 @@ class WebStore:
                     web_url TEXT NOT NULL,
                     first_seen_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL,
-                    is_visible INTEGER NOT NULL DEFAULT 1
+                    is_visible INTEGER NOT NULL DEFAULT 1,
+                    last_check_status TEXT NOT NULL DEFAULT 'unknown',
+                    last_check_error TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
+            visible_project_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(visible_projects)")
+            }
+            if "last_check_status" not in visible_project_columns:
+                connection.execute(
+                    "ALTER TABLE visible_projects ADD COLUMN "
+                    "last_check_status TEXT NOT NULL DEFAULT 'unknown'"
+                )
+            if "last_check_error" not in visible_project_columns:
+                connection.execute(
+                    "ALTER TABLE visible_projects ADD COLUMN "
+                    "last_check_error TEXT NOT NULL DEFAULT ''"
+                )
 
     def user_count(self) -> int:
         with self.connect() as connection:
@@ -406,8 +493,12 @@ class WebStore:
                 "SELECT 1 FROM credential_vault WHERE id = 1"
             ).fetchone() is not None
 
-    def save_credentials(self, credentials: Credentials, password: str) -> None:
-        salt, nonce, ciphertext = encrypt_credentials(credentials, password)
+    def save_encrypted_credentials(
+        self, credentials: Credentials, salt: bytes, encryption_key: bytes
+    ) -> None:
+        salt_hex, nonce, ciphertext = encrypt_credentials_with_key(
+            credentials, salt, encryption_key
+        )
         with self.connect() as connection:
             connection.execute(
                 """
@@ -419,22 +510,37 @@ class WebStore:
                                               ciphertext = excluded.ciphertext,
                                               updated_at = excluded.updated_at
                 """,
-                (salt, nonce, ciphertext, now_iso()),
+                (salt_hex, nonce, ciphertext, now_iso()),
             )
 
+    def save_credentials(self, credentials: Credentials, password: str) -> None:
+        salt = secrets.token_bytes(16)
+        self.save_encrypted_credentials(
+            credentials, salt, credential_key(password, salt)
+        )
+
     def unlock_credentials(self, password: str) -> Credentials:
+        credentials, _, _ = self.unlock_credentials_with_key(password)
+        return credentials
+
+    def unlock_credentials_with_key(
+        self, password: str
+    ) -> tuple[Credentials, bytes, bytes]:
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT kdf_salt, nonce, ciphertext FROM credential_vault WHERE id = 1"
             ).fetchone()
         if row is None:
             raise ReviewError("GitLab credentials have not been configured.")
-        return decrypt_credentials(
-            str(row["kdf_salt"]),
-            str(row["nonce"]),
-            str(row["ciphertext"]),
-            password,
+        try:
+            salt = bytes.fromhex(str(row["kdf_salt"]))
+        except ValueError as exc:
+            raise ReviewError("The credential vault could not be unlocked.") from exc
+        key = credential_key(password, salt)
+        credentials = decrypt_credentials_with_key(
+            str(row["nonce"]), str(row["ciphertext"]), key
         )
+        return credentials, salt, key
 
     def login_blocked(self, remote_address: str) -> bool:
         cutoff = int(time.time()) - LOGIN_WINDOW_SECONDS
@@ -549,10 +655,87 @@ class WebStore:
         with self.connect() as connection:
             return connection.execute(
                 """
-                SELECT project_id, project_path, web_url, first_seen_at, last_seen_at
+                SELECT project_id, project_path, web_url, first_seen_at, last_seen_at,
+                       last_check_status, last_check_error
                 FROM visible_projects WHERE is_visible = 1
                 ORDER BY project_path COLLATE NOCASE
                 """
+            ).fetchall()
+
+    def repository_activity(
+        self, period: str, selected_date: str = ""
+    ) -> tuple[list[sqlite3.Row], datetime, datetime]:
+        now = datetime.now(timezone.utc)
+        if selected_date:
+            try:
+                start = datetime.strptime(selected_date, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError as exc:
+                raise ReviewError("Choose a valid calendar date.") from exc
+            end = start + timedelta(days=1)
+        else:
+            durations = {
+                "day": timedelta(days=1),
+                "week": timedelta(days=7),
+                "month": timedelta(days=30),
+            }
+            start = now - durations.get(period, durations["week"])
+            end = now
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                WITH first_discovery AS (
+                    SELECT project_id, mr_iid,
+                           MIN(COALESCE(NULLIF(mr_created_at, ''), discovered_at)) AS mr_at
+                    FROM reviews
+                    GROUP BY project_id, mr_iid
+                ), activity AS (
+                    SELECT project_id, COUNT(*) AS mr_count,
+                           MAX(mr_at) AS latest_mr_at
+                    FROM first_discovery
+                    WHERE mr_at >= ? AND mr_at < ?
+                    GROUP BY project_id
+                )
+                SELECT projects.project_id, projects.project_path, projects.web_url,
+                       projects.last_seen_at, projects.last_check_status,
+                       projects.last_check_error,
+                       COALESCE(activity.mr_count, 0) AS mr_count,
+                       activity.latest_mr_at
+                FROM visible_projects AS projects
+                LEFT JOIN activity ON activity.project_id = projects.project_id
+                WHERE projects.is_visible = 1
+                ORDER BY projects.project_path COLLATE NOCASE
+                """,
+                (start.isoformat(), end.isoformat()),
+            ).fetchall()
+        return rows, start, end
+
+    def repository_mrs(
+        self, project_id: int, start: datetime, end: datetime
+    ) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                WITH ranked AS (
+                    SELECT project_id, project_path, mr_iid, head_sha, status,
+                           report_path, report_content, mr_created_at, reviewed_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY project_id, mr_iid
+                               ORDER BY reviewed_at DESC
+                           ) AS revision_rank
+                    FROM reviews
+                    WHERE project_id = ?
+                      AND COALESCE(NULLIF(mr_created_at, ''), discovered_at) >= ?
+                      AND COALESCE(NULLIF(mr_created_at, ''), discovered_at) < ?
+                )
+                SELECT project_id, project_path, mr_iid, head_sha, status,
+                       report_path, report_content, mr_created_at, reviewed_at
+                FROM ranked
+                WHERE revision_rank = 1
+                ORDER BY mr_created_at DESC, mr_iid DESC
+                """,
+                (project_id, start.isoformat(), end.isoformat()),
             ).fetchall()
 
     def mr_activity(self, period: str) -> tuple[int, list[sqlite3.Row]]:
@@ -599,7 +782,7 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#14213d;--muted:#65758b;--line:#dbe3ed;--blue:#246bfd;--bg:#f5f8fc;--card:#fff;--red:#b42318;--green:#16803c}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed{color:var(--red)}.completed{color:var(--green)}.pending{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
+main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(170px,1fr) auto;gap:8px;align-items:end}.date-filter label{grid-column:1/-1}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
 """
 
 
@@ -657,7 +840,7 @@ def handler_factory(
         def security_headers(self) -> None:
             self.send_header(
                 "Content-Security-Policy",
-                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+                "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; form-action 'self'; "
                 "base-uri 'none'; frame-ancestors 'none'",
             )
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -680,6 +863,14 @@ def handler_factory(
                 self.send_header(key, value)
             self.end_headers()
             self.wfile.write(encoded)
+
+        def send_javascript(self) -> None:
+            self.send_response(200)
+            self.security_headers()
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(APP_JAVASCRIPT)))
+            self.end_headers()
+            self.wfile.write(APP_JAVASCRIPT)
 
         def redirect(
             self, location: str, extra_headers: list[tuple[str, str]] | None = None
@@ -748,12 +939,16 @@ def handler_factory(
                 self.end_headers()
                 self.wfile.write(payload)
                 return
-            if parsed.path == "/setup":
+            if parsed.path == "/app.js":
+                self.send_javascript()
+            elif parsed.path == "/setup":
                 self.show_setup()
             elif parsed.path == "/login":
                 self.show_login()
             elif parsed.path == "/report":
                 self.show_report(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/repository":
+                self.show_repository(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/":
                 self.show_dashboard(urllib.parse.parse_qs(parsed.query))
             else:
@@ -864,11 +1059,15 @@ def handler_factory(
                 return
             if store.credentials_configured():
                 try:
-                    credentials = store.unlock_credentials(password)
+                    credentials, salt, encryption_key = (
+                        store.unlock_credentials_with_key(password)
+                    )
                 except ReviewError as exc:
                     self.show_login(str(exc))
                     return
-                vault.set(credentials)
+                vault.set(credentials, salt=salt, encryption_key=encryption_key)
+            else:
+                vault.prepare(password)
             store.clear_failed_logins(remote)
             token, _ = store.create_session(int(user["id"]))
             headers = [("Set-Cookie", self.make_cookie("reviewer_session", token, SESSION_LIFETIME_SECONDS))]
@@ -897,8 +1096,10 @@ def handler_factory(
             if authenticated is None:
                 self.redirect("/?message=" + urllib.parse.quote("The password was not accepted."))
                 return
-            credentials = store.unlock_credentials(password)
-            vault.set(credentials)
+            credentials, salt, encryption_key = store.unlock_credentials_with_key(
+                password
+            )
+            vault.set(credentials, salt=salt, encryption_key=encryption_key)
             message = (
                 "Credential vault unlocked; GitLab discovery and LLM reviews can run."
                 if credentials.llm_api_key
@@ -913,9 +1114,9 @@ def handler_factory(
             _, user = session
             if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
                 raise ReviewError("Invalid form token.")
-            password, existing = self.credential_context(form, user)
+            existing, salt, encryption_key = self.credential_context()
             credentials = self.merged_credentials(form, existing)
-            store.save_credentials(credentials, password)
+            store.save_encrypted_credentials(credentials, salt, encryption_key)
             vault.set(credentials)
             message = (
                 "Credentials saved; GitLab discovery and LLM reviews are active."
@@ -924,18 +1125,14 @@ def handler_factory(
             )
             self.redirect("/?message=" + urllib.parse.quote(message))
 
-        def credential_context(
-            self, form: dict[str, str], user: sqlite3.Row
-        ) -> tuple[str, Credentials]:
-            password = form.get("password", "")
-            if store.authenticate(str(user["username"]), password) is None:
-                raise ReviewError("The administrator password was not accepted.")
-            existing = (
-                store.unlock_credentials(password)
-                if store.credentials_configured()
-                else Credentials("", "", "")
-            )
-            return password, existing
+        def credential_context(self) -> tuple[Credentials, bytes, bytes]:
+            existing, _ = vault.snapshot()
+            salt, encryption_key = vault.encryption_context()
+            if store.credentials_configured() and existing is None:
+                raise ReviewError(
+                    "The credential vault is locked. Sign in again before changing credentials."
+                )
+            return existing or Credentials("", "", ""), salt, encryption_key
 
         def merged_credentials(
             self, form: dict[str, str], existing: Credentials
@@ -965,7 +1162,7 @@ def handler_factory(
             _, user = session
             if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
                 raise ReviewError("Invalid form token.")
-            _, existing = self.credential_context(form, user)
+            existing, _, _ = self.credential_context()
             credentials = self.merged_credentials(form, existing)
             projects = GitLabClient(
                 credentials.gitlab_url, credentials.gitlab_token
@@ -984,7 +1181,7 @@ def handler_factory(
             _, user = session
             if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
                 raise ReviewError("Invalid form token.")
-            _, existing = self.credential_context(form, user)
+            existing, _, _ = self.credential_context()
             credentials = self.merged_credentials(form, existing)
             config = Config.from_credentials(
                 credentials.gitlab_url,
@@ -1020,14 +1217,26 @@ def handler_factory(
             period = query.get("period", ["week"])[0]
             if period not in {"day", "week", "month"}:
                 period = "week"
+            selected_date = query.get("date", [""])[0].strip()
             period_labels = {
                 "day": "last 24 hours",
                 "week": "last 7 days",
                 "month": "last 30 days",
             }
             counts, _ = store.dashboard()
-            fetched_mrs, recent = store.mr_activity(period)
-            projects = store.visible_projects()
+            date_error = ""
+            try:
+                projects, _, _ = store.repository_activity(period, selected_date)
+            except ReviewError as exc:
+                date_error = str(exc)
+                selected_date = ""
+                projects, _, _ = store.repository_activity(period)
+            fetched_mrs = sum(int(project["mr_count"]) for project in projects)
+            filter_label = (
+                f"{selected_date} UTC"
+                if selected_date
+                else period_labels[period]
+            )
             scan_status = store.scan_status()
             active_credentials, _ = vault.snapshot()
             heartbeat = Path(os.environ.get("HEARTBEAT_FILE", "/data/heartbeat"))
@@ -1049,7 +1258,13 @@ def handler_factory(
                 reviewer_label = "Waiting for reviewer heartbeat"
                 reviewer_class = "failed"
             message = query.get("message", [""])[0]
-            notice = f"<p class='notice'>{html.escape(message)}</p>" if message else ""
+            notice_text = message or date_error
+            notice_class = "error" if date_error and not message else "notice"
+            notice = (
+                f"<p class='{notice_class}'>{html.escape(notice_text)}</p>"
+                if notice_text
+                else ""
+            )
             check_state = scan_status.get("last_gitlab_check_status", "")
             check_time = scan_status.get("last_gitlab_check_at", "")[:19].replace("T", " ")
             if check_state == "success":
@@ -1077,6 +1292,9 @@ def handler_factory(
                 f"href='/?period={choice}'>{label}</a>"
                 for choice, label in (("day", "Day"), ("week", "Week"), ("month", "Month"))
             )
+            activity_query = (
+                {"date": selected_date} if selected_date else {"period": period}
+            )
             project_rows = []
             for project in projects:
                 project_path = html.escape(str(project["project_path"]))
@@ -1089,39 +1307,45 @@ def handler_factory(
                     )
                 else:
                     project_name = project_path
+                project_status = str(project["last_check_status"])
+                if project_status not in {"up", "down"}:
+                    project_status = "unknown"
+                status_title = (
+                    str(project["last_check_error"])
+                    if project_status == "down"
+                    else (
+                        "Latest GitLab repository check succeeded."
+                        if project_status == "up"
+                        else "Awaiting the first repository check."
+                    )
+                )
+                latest_mr = (
+                    str(project["latest_mr_at"])[:19].replace("T", " ") + " UTC"
+                    if project["latest_mr_at"]
+                    else "—"
+                )
+                mr_count = int(project["mr_count"])
+                detail_query = urllib.parse.urlencode(
+                    {"project_id": int(project["project_id"]), **activity_query}
+                )
+                mr_count_display = (
+                    f"<a href='/repository?{detail_query}'>{mr_count}</a>"
+                    if mr_count
+                    else "0"
+                )
                 project_rows.append(
                     "<tr>"
                     f"<td>{project_name}</td>"
-                    f"<td>{html.escape(str(project['last_seen_at'])[:19])}</td>"
+                    f"<td><span class='status {html.escape(project_status)}' "
+                    f"title='{html.escape(status_title)}'>{html.escape(project_status.title())}</span></td>"
+                    f"<td>{mr_count_display}</td>"
+                    f"<td>{html.escape(latest_mr)}</td>"
                     "</tr>"
                 )
             visible_project_rows = "".join(project_rows) or (
-                "<tr><td colspan='2'>No repositories discovered yet.</td></tr>"
+                "<tr><td colspan='4'>No repositories discovered yet.</td></tr>"
             )
             fields = "".join(form_field(item.key, settings[item.key]) for item in RUNTIME_SETTINGS)
-            rows = []
-            for row in recent:
-                params = urllib.parse.urlencode(
-                    {
-                        "project_id": row["project_id"],
-                        "mr_iid": row["mr_iid"],
-                        "sha": row["head_sha"],
-                    }
-                )
-                report_link = (
-                    f"<a href='/report?{params}'>View</a>"
-                    if row["report_content"] or row["report_path"]
-                    else "—"
-                )
-                rows.append(
-                    "<tr>"
-                    f"<td>{html.escape(str(row['project_path']))}</td>"
-                    f"<td>!{int(row['mr_iid'])}</td>"
-                    f"<td><code>{html.escape(str(row['head_sha'])[:12])}</code></td>"
-                    f"<td class='status {html.escape(str(row['status']))}'>{html.escape(str(row['status']))}</td>"
-                    f"<td>{html.escape(str(row['discovered_at'])[:19])}</td><td>{report_link}</td></tr>"
-                )
-            table_rows = "".join(rows) or "<tr><td colspan='6'>No reviews recorded yet.</td></tr>"
             credentials_configured = store.credentials_configured()
             if active_credentials is None and credentials_configured:
                 vault_panel = f"""
@@ -1154,18 +1378,18 @@ def handler_factory(
                 displayed_credentials.llm_provider
             ]
             llm_api_url = displayed_credentials.llm_api_url
+            custom_url_hidden = "" if displayed_credentials.llm_provider == "custom" else " hidden"
             body = f"""
             <header><div><h1>Security Review</h1><p class='sub'>Signed in as {html.escape(str(user['username']))}</p></div>
             <div class='top-actions'><span class='status {reviewer_class}'>{reviewer_label}</span>
             <form method='post' action='/logout'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><button class='secondary'>Sign out</button></form></div></header>
             {notice}{vault_panel}<section class='card'><h2>GitLab connection</h2>{scan_panel}</section>
-            <section class='card'><h2>Visible repositories ({len(projects)})</h2>
-            <p class='sub'>Every repository currently visible to the configured GitLab token.</p>
-            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Last seen</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div></section>
-            <section class='card'><h2>Fetched MRs</h2>
-            <p class='sub'>Counts distinct MRs first discovered after this deployment ({html.escape(deployment_time + ' UTC' if deployment_time else 'initializing')}). MRs created before deployment are excluded.</p>
-            <div class='actions'>{period_links}</div><div class='grid activity-grid'>
-            <div class='metric'>Fetched in the {period_labels[period]}<strong>{fetched_mrs}</strong></div></div></section>
+            <section class='card'><h2>Repositories and fetched MRs</h2>
+            <p class='sub'>Shows every currently visible repository and distinct MRs first discovered after this deployment ({html.escape(deployment_time + ' UTC' if deployment_time else 'initializing')}). Current filter: {html.escape(filter_label)}.</p>
+            <div class='filter-bar'><div class='actions'>{period_links}</div>
+            <form class='date-filter' method='get' action='/'><label for='activity_date'>Specific date (UTC)</label><input id='activity_date' name='date' type='date' value='{html.escape(selected_date)}' max='{datetime.now(timezone.utc).date().isoformat()}'><button class='secondary' type='submit'>Apply date</button></form></div>
+            <div class='grid activity-grid'><div class='metric'>Fetched MRs in {html.escape(filter_label)}<strong>{fetched_mrs}</strong></div><div class='metric'>Visible repositories<strong>{len(projects)}</strong></div></div>
+            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Status</th><th>MRs</th><th>Latest MR</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div></section>
             <section class='card'><h2>Review status</h2><div class='grid'>
             <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
             <div class='metric'>Completed<strong>{counts.get('completed', 0)}</strong></div>
@@ -1177,17 +1401,16 @@ def handler_factory(
             <section class='card'><h2>Configure or rotate encrypted credentials</h2><p class='sub'>Save GitLab access first to test discovery. The LLM API key is optional and can be added later. Existing secrets are kept when their fields are left blank and the provider is unchanged.</p>
             <form method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
             <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
-            <div class='field'><label for='rotate_password'>Administrator password</label><input id='rotate_password' name='password' type='password' autocomplete='current-password' required></div>
             <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off'><small>Required the first time; leave blank later to keep the stored token.</small></div>
             <div class='field'><label for='llm_provider'>LLM provider</label><select id='llm_provider' name='llm_provider'>{provider_options}</select><small>Anthropic is the default. Custom means an OpenAI-compatible Chat Completions endpoint.</small></div>
             <div class='field'><label for='llm_model'>Model</label><input id='llm_model' name='llm_model' value='{html.escape(llm_model)}' maxlength='256'><small>Use a model available to the selected provider account.</small></div>
-            <div class='field'><label for='llm_api_url'>Custom API URL</label><input id='llm_api_url' name='llm_api_url' type='url' value='{html.escape(llm_api_url)}' placeholder='https://llm.example.com/v1/chat/completions'><small>Used only for Custom; enter the exact HTTPS Chat Completions endpoint.</small></div>
+            <div class='field' id='custom_api_url_field'{custom_url_hidden}><label for='llm_api_url'>Custom API URL</label><input id='llm_api_url' name='llm_api_url' type='url' value='{html.escape(llm_api_url)}' placeholder='https://llm.example.com/v1/chat/completions'><small>Enter the exact HTTPS Chat Completions endpoint.</small></div>
             <div class='field'><label for='llm_api_key'>LLM API key (optional)</label><input id='llm_api_key' name='llm_api_key' type='password' autocomplete='off'><small>Leave blank for discovery only. When changing provider, enter that provider's key.</small></div>
             </div><div class='actions'><button type='submit'>Save encrypted credentials</button>
             <button class='secondary' type='submit' formaction='/credentials/test-gitlab'>Test GitLab access</button>
             <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test LLM connection</button></div>
             <p class='sub'>Tests do not save the entered values. The LLM test sends one minimal request using the selected provider and model and may incur a very small API charge.</p></form></section>
-            <section class='card'><h2>MR revisions discovered in the {period_labels[period]}</h2><div class='table-wrap'><table><thead><tr><th>Project</th><th>MR</th><th>Commit</th><th>Status</th><th>Discovered</th><th>Report</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
+            <script src='/app.js' defer></script>"""
             self.send_page(200, page("Dashboard", body))
 
         def update_settings(self, form: dict[str, str]) -> None:
@@ -1208,6 +1431,93 @@ def handler_factory(
             else:
                 message = "Settings saved. They will apply on the next polling cycle."
             self.redirect("/?message=" + urllib.parse.quote(message))
+
+        def show_repository(self, query: dict[str, list[str]]) -> None:
+            if self.require_session() is None:
+                return
+            try:
+                project_id = int(query.get("project_id", [""])[0])
+            except ValueError:
+                self.send_page(
+                    400,
+                    page(
+                        "Invalid repository",
+                        "<div class='card'><h1>Invalid repository reference</h1>"
+                        "<a class='button secondary' href='/'>Return</a></div>",
+                    ),
+                )
+                return
+            period = query.get("period", ["week"])[0]
+            if period not in {"day", "week", "month"}:
+                period = "week"
+            selected_date = query.get("date", [""])[0].strip()
+            try:
+                projects, start, end = store.repository_activity(period, selected_date)
+            except ReviewError as exc:
+                self.send_page(
+                    400,
+                    page(
+                        "Invalid date",
+                        f"<div class='card'><h1>Invalid date</h1><p class='error'>{html.escape(str(exc))}</p>"
+                        "<a class='button secondary' href='/'>Return</a></div>",
+                    ),
+                )
+                return
+            project = next(
+                (row for row in projects if int(row["project_id"]) == project_id),
+                None,
+            )
+            if project is None:
+                self.send_page(
+                    404,
+                    page(
+                        "Repository not found",
+                        "<div class='card'><h1>Repository not found</h1>"
+                        "<a class='button secondary' href='/'>Return</a></div>",
+                    ),
+                )
+                return
+            rows = []
+            for row in store.repository_mrs(project_id, start, end):
+                params = urllib.parse.urlencode(
+                    {
+                        "project_id": row["project_id"],
+                        "mr_iid": row["mr_iid"],
+                        "sha": row["head_sha"],
+                    }
+                )
+                report_link = (
+                    f"<a href='/report?{params}'>View report</a>"
+                    if row["report_content"] or row["report_path"]
+                    else "—"
+                )
+                rows.append(
+                    "<tr>"
+                    f"<td>!{int(row['mr_iid'])}</td>"
+                    f"<td><code>{html.escape(str(row['head_sha'])[:12])}</code></td>"
+                    f"<td class='status {html.escape(str(row['status']))}'>{html.escape(str(row['status']))}</td>"
+                    f"<td>{html.escape(str(row['mr_created_at'])[:19].replace('T', ' '))} UTC</td>"
+                    f"<td>{report_link}</td></tr>"
+                )
+            table_rows = "".join(rows) or (
+                "<tr><td colspan='5'>No MRs in this period.</td></tr>"
+            )
+            filter_label = (
+                f"{selected_date} UTC"
+                if selected_date
+                else {"day": "last 24 hours", "week": "last 7 days", "month": "last 30 days"}[period]
+            )
+            back_query = urllib.parse.urlencode(
+                {"date": selected_date} if selected_date else {"period": period}
+            )
+            body = f"""
+            <header><div><h1>{html.escape(str(project['project_path']))}</h1>
+            <p class='sub'>Latest revision of each MR in {html.escape(filter_label)}</p></div>
+            <a class='button secondary' href='/?{back_query}'>Back to repositories</a></header>
+            <section class='card'><div class='table-wrap'><table><thead><tr>
+            <th>MR</th><th>Latest commit</th><th>Review status</th><th>MR created</th><th>Report</th>
+            </tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
+            self.send_page(200, page("Repository MRs", body))
 
         def show_report(self, query: dict[str, list[str]]) -> None:
             if self.require_session() is None:

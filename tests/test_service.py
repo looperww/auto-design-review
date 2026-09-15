@@ -408,7 +408,59 @@ class DiscoveryInventoryTests(unittest.TestCase):
                 row[0] for row in state.connection.execute("SELECT head_sha FROM reviews")
             ]
             self.assertEqual(stored_shas, ["after-deployment"])
-            self.assertEqual(len(WebStore(database).visible_projects()), 2)
+            projects = WebStore(database).visible_projects()
+            self.assertEqual(len(projects), 2)
+            statuses = {
+                row["project_path"]: row["last_check_status"] for row in projects
+            }
+            self.assertEqual(statuses["company/first"], "up")
+            self.assertEqual(statuses["company/second"], "up")
+            state.close()
+
+    def test_repository_activity_uses_mr_dates_and_project_health(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            state = ReviewState(database)
+            state.record_visible_projects(self.FakeGitLabClient().list_projects())
+            state.record_project_check(1, "up")
+            state.record_project_check(2, "down", "Access failed")
+            state.queue(
+                ReviewTarget(
+                    1,
+                    "company/first",
+                    7,
+                    "first-sha",
+                    "",
+                    "2026-09-15T08:30:00Z",
+                )
+            )
+            state.queue(
+                ReviewTarget(
+                    1,
+                    "company/first",
+                    7,
+                    "second-sha",
+                    "",
+                    "2026-09-15T08:30:00Z",
+                )
+            )
+            rows, start, end = WebStore(database).repository_activity(
+                "week", "2026-09-15"
+            )
+            by_project = {row["project_path"]: row for row in rows}
+            self.assertEqual(start.isoformat(), "2026-09-15T00:00:00+00:00")
+            self.assertEqual(end.isoformat(), "2026-09-16T00:00:00+00:00")
+            self.assertEqual(by_project["company/first"]["mr_count"], 1)
+            self.assertEqual(
+                by_project["company/first"]["latest_mr_at"],
+                "2026-09-15T08:30:00Z",
+            )
+            self.assertEqual(by_project["company/first"]["last_check_status"], "up")
+            self.assertEqual(by_project["company/second"]["mr_count"], 0)
+            self.assertEqual(by_project["company/second"]["last_check_status"], "down")
+            self.assertEqual(
+                len(WebStore(database).repository_mrs(1, start, end)), 1
+            )
             state.close()
 
     def test_mr_activity_filters_distinct_mrs_by_period(self):
@@ -482,6 +534,26 @@ class WebAuthenticationTests(unittest.TestCase):
         )
         with self.assertRaises(ReviewError):
             decrypt_credentials(salt, nonce, ciphertext, "wrong password")
+
+    def test_unlocked_encryption_key_can_rotate_credentials_without_password(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = WebStore(Path(directory) / "state.sqlite3")
+            original = Credentials(
+                "https://gitlab.example.com", "old-gitlab-token", "old-llm-key"
+            )
+            store.create_first_user(
+                "security-admin", "a secure test password", original
+            )
+            _, salt, encryption_key = store.unlock_credentials_with_key(
+                "a secure test password"
+            )
+            replacement = Credentials(
+                "https://gitlab.example.com", "new-gitlab-token", "new-llm-key"
+            )
+            store.save_encrypted_credentials(replacement, salt, encryption_key)
+            self.assertEqual(
+                store.unlock_credentials("a secure test password"), replacement
+            )
 
     def test_gitlab_credentials_can_be_saved_without_anthropic_key(self):
         credentials = validated_credentials(

@@ -145,6 +145,9 @@ After signing in, configure:
 - optionally, the selected provider's API key; and
 - for Custom only, the exact HTTPS OpenAI-compatible Chat Completions URL.
 
+The Custom API URL field is hidden unless **Custom** is selected in the provider
+dropdown.
+
 The GitLab token can be saved without an LLM API key. The service then
 checks the GitLab connection, discovers open MR revisions, and records them as
 `pending` in SQLite. It does not download repository archives or diffs and does
@@ -182,8 +185,9 @@ Before saving, use the two credential-test buttons in the web console:
   key, URL, and model. Anthropic uses a USD 0.05 hard budget for this test; other
   providers receive a 16-token output limit. A very small API charge may occur.
 
-Testing does not save or replace either credential. The administrator password
-is still required so a blank input can securely reuse an encrypted stored value.
+Testing does not save or replace either credential. Signing in derives and
+unlocks the vault encryption key in memory, so the credential form does not ask
+for the administrator password again. The plaintext password is never retained.
 
 The GitLab and active LLM API credentials, provider, model, custom URL, and GitLab
 URL are encrypted with AES-GCM using a key derived from the administrator
@@ -205,8 +209,9 @@ Then open `http://127.0.0.1:6789` on your computer. Do not publish the console
 directly to a company network or the internet without an approved HTTPS reverse
 proxy and an infrastructure security review.
 
-The web console provides review status, recent reports, validated runtime
-settings, and credential rotation. Stored secrets are never displayed again.
+The web console provides review status, repository health and MR activity,
+validated runtime settings, and credential rotation. Stored secrets are never
+displayed again.
 
 After every container or host restart, sign in once to unlock the encrypted
 credential vault in memory. This is necessary because no plaintext credential
@@ -244,9 +249,21 @@ SQLite table only as authenticated ciphertext.
 MR revisions discovered before the LLM key is configured appear with a `pending`
 status and have no report until the selected LLM reviews them.
 
-The dashboard includes Day, Week, and Month filters. These show the number of
-distinct MRs first discovered during the last 24 hours, 7 days, or 30 days and
-filter the MR-revision table to the same period.
+The dashboard combines visible repositories and fetched-MR activity in one
+table. For each repository it shows:
+
+- **Up** when the latest GitLab MR-list request for that repository succeeded,
+  **Down** when it failed, and **Unknown** before the first completed check;
+- the number of distinct MRs in the selected period, counting multiple commit
+  revisions of one MR only once; and
+- the latest MR creation date and time in that period.
+
+Click a non-zero MR count to open that repository's filtered MR list and its
+available security reports.
+
+Day, Week, and Month select rolling windows of 24 hours, 7 days, and 30 days.
+The administrator can also select a specific UTC calendar date. MRs created
+before the deployment cutoff remain excluded.
 
 ## Automatic discovery
 
@@ -363,9 +380,10 @@ Store the backup in an approved protected location because it contains company
 security-review records and encrypted credentials. Never delete `data/` unless
 you intentionally want to erase all stored configuration and review history.
 
-Rotate a GitLab or LLM credential from the authenticated web console. The
-replacement is encrypted in SQLite and the reviewer starts using it without a
-container restart.
+Rotate a GitLab or LLM credential from the authenticated, unlocked web console.
+The replacement is encrypted in SQLite and the reviewer starts using it without
+a container restart. Re-entering the administrator password is not required;
+only its derived encryption key remains in process memory after sign-in.
 
 ## Security boundaries
 
@@ -387,6 +405,9 @@ container restart.
   deployment secrets.
 - Web passwords are salted and hashed in SQLite; session tokens are stored only
   as SHA-256 digests, forms use CSRF protection, and login attempts are limited.
+- The credential-vault encryption key is derived during sign-in, held only in
+  process memory, and lost on restart. The administrator password is not stored
+  in memory for credential changes.
 - The web console listens only on `127.0.0.1:6789` at the Docker host by
   default. The container continues to listen internally on port `8080`.
 
