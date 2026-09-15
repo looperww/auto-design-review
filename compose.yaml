@@ -17,7 +17,9 @@ services:
     ports:
       - "127.0.0.1:6789:8080"
     volumes:
-      - review-data:/data
+      - type: bind
+        source: ./data
+        target: /data
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=256m
@@ -36,6 +38,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-
-volumes:
-  review-data:

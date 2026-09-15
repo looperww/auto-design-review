@@ -78,7 +78,23 @@ git clone git@gitlab.bce.lu:security/automated-design-review.git
 cd automated-design-review
 ```
 
-### 2. Build and start
+### 2. Prepare the persistent data folder
+
+The container stores its SQLite database, encrypted credentials, runtime
+settings, review state, and reports in the repository's `data/` folder. Prepare
+that folder for the container's unprivileged user (UID `10001`):
+
+```bash
+mkdir -p data
+sudo chown 10001:10001 data
+sudo chmod 700 data
+```
+
+The folder is excluded by both Git and the Docker build context. Never commit or
+copy its contents into an image because it contains encrypted credentials and
+company security-review records.
+
+### 3. Build and start
 
 ```bash
 docker compose up --detach --build
@@ -89,7 +105,7 @@ The combined reviewer and web-console container is named
 `automated-design-review`. It runs as an unprivileged user with a read-only root
 filesystem, no Linux capabilities, no-new-privileges, and no Docker socket.
 
-### 3. Check the service
+### 4. Check the service
 
 ```bash
 docker compose ps
@@ -99,7 +115,7 @@ docker compose ps
 docker compose logs --follow app
 ```
 
-### 4. Create the administrator
+### 5. Create the administrator
 
 The management console is bound to the deployment machine's localhost interface
 by default. On that machine, open:
@@ -112,7 +128,7 @@ Create the first administrator username and password. The password is
 PBKDF2-HMAC-SHA256 hashed with a unique salt and stored in SQLite. After the
 account is created, the setup page is disabled and you are directed to sign in.
 
-### 5. Sign in and configure the reviewer
+### 6. Sign in and configure the reviewer
 
 After signing in, first review and save the runtime settings. Then configure:
 
@@ -123,7 +139,8 @@ After signing in, first review and save the runtime settings. Then configure:
 The two API credentials and GitLab URL are encrypted with AES-GCM using a key
 derived from the administrator password. Password hashes, encrypted credentials,
 operational settings, review state, report content, and report metadata are
-stored in SQLite in the persistent Docker volume.
+stored in SQLite under the host's `data/` folder, which is mounted inside the
+container at `/data`.
 
 The reviewer remains locked and cannot contact GitLab or Anthropic until the
 runtime settings and encrypted credentials have both been saved.
@@ -146,7 +163,8 @@ credential vault in memory. This is necessary because no plaintext credential
 or separate master encryption key is stored on disk. Until it is unlocked, the
 web console remains available but security reviews wait.
 
-Keep an approved backup of the Docker volume. The encryption password is not
+Keep an approved backup of the host `data/` folder. Stop the service before
+copying it so the SQLite backup is consistent. The encryption password is not
 recoverable from SQLite. If it is lost, the API credentials must be revoked and
 the service must be initialized again. Fully unattended unlock after a restart
 would require an external secret manager or master key, which this deployment
@@ -245,9 +263,23 @@ git pull
 docker compose up --detach --build
 ```
 
-The named data volume survives `docker compose down`. Do not use
-`docker compose down --volumes` unless you intentionally want to delete all
-review state and stored reports.
+The host `data/` folder survives container replacement, image rebuilding, and
+`docker compose down`. A normal update therefore preserves the administrator
+account, encrypted API credentials, settings, review history, and reports.
+
+Back up the persistent data safely:
+
+```bash
+docker compose stop app
+tar -czf ../automated-design-review-data-backup.tgz data
+docker compose start app
+```
+
+To restore, stop the service, replace the `data/` folder with the backed-up
+contents, restore ownership to UID and GID `10001`, and start the service again.
+Store the backup in an approved protected location because it contains company
+security-review records and encrypted credentials. Never delete `data/` unless
+you intentionally want to erase all stored configuration and review history.
 
 Rotate a GitLab or Anthropic credential from the authenticated web console. The
 replacement is encrypted in SQLite and the reviewer starts using it without a
