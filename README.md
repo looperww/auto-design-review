@@ -85,9 +85,9 @@ docker compose up --detach --build
 ```
 
 The image installs Claude Code from Anthropic's stable channel during the build.
-The combined reviewer and web-console container runs as an unprivileged user
-with a read-only root filesystem, no Linux capabilities, no-new-privileges, and
-no Docker socket.
+The combined reviewer and web-console container is named
+`automated-design-review`. It runs as an unprivileged user with a read-only root
+filesystem, no Linux capabilities, no-new-privileges, and no Docker socket.
 
 ### 3. Check the service
 
@@ -105,7 +105,7 @@ The management console is bound to the deployment machine's localhost interface
 by default. On that machine, open:
 
 ```text
-http://127.0.0.1:8080/setup
+http://127.0.0.1:6789/setup
 ```
 
 Create the first administrator username and password. The password is
@@ -131,10 +131,10 @@ runtime settings and encrypted credentials have both been saved.
 For a remote server, keep the console bound to localhost and use an SSH tunnel:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 user@security-review-server
+ssh -L 6789:127.0.0.1:6789 user@security-review-server
 ```
 
-Then open `http://127.0.0.1:8080` on your computer. Do not publish the console
+Then open `http://127.0.0.1:6789` on your computer. Do not publish the console
 directly to a company network or the internet without an approved HTTPS reverse
 proxy and an infrastructure security review.
 
@@ -267,7 +267,8 @@ container restart.
   deployment secrets.
 - Web passwords are salted and hashed in SQLite; session tokens are stored only
   as SHA-256 digests, forms use CSRF protection, and login attempts are limited.
-- The web console listens only on `127.0.0.1` at the Docker host by default.
+- The web console listens only on `127.0.0.1:6789` at the Docker host by
+  default. The container continues to listen internally on port `8080`.
 
 Because selected proprietary source code is sent to Anthropic, obtain company
 approval for the provider, data-processing terms, retention settings, permitted

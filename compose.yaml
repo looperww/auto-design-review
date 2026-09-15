@@ -1,5 +1,6 @@
 services:
   app:
+    container_name: automated-design-review
     build:
       context: .
       args:
@@ -14,7 +15,7 @@ services:
       WEB_HOST: 0.0.0.0
       WEB_PORT: 8080
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:6789:8080"
     volumes:
       - review-data:/data
     read_only: true
