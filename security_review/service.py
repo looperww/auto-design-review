@@ -1679,8 +1679,11 @@ def run_poll(config: Config) -> int:
         time.sleep(current_config.poll_interval_seconds)
 
 
-def run_managed_poll(state_db: Path, vault: Any) -> None:
+def run_managed_poll(
+    state_db: Path, vault: Any, operation_lock: Any | None = None
+) -> None:
     state = ReviewState(state_db)
+    lock = operation_lock or threading.RLock()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     print("Managed reviewer started; waiting for the encrypted vault to be unlocked.", flush=True)
     while True:
@@ -1698,16 +1701,20 @@ def run_managed_poll(state_db: Path, vault: Any) -> None:
             )
             sleep_seconds = config.poll_interval_seconds
             client = GitLabClient(config.gitlab_url, config.gitlab_token)
-            counters = scan_once(client, state, config)
-            state.set_metadata("last_gitlab_check_at", utc_now())
-            state.set_metadata("last_gitlab_check_status", "success")
-            state.set_metadata("last_gitlab_check_summary", json.dumps(counters, sort_keys=True))
-            state.set_metadata("last_gitlab_check_error", "")
+            with lock:
+                counters = scan_once(client, state, config)
+                state.set_metadata("last_gitlab_check_at", utc_now())
+                state.set_metadata("last_gitlab_check_status", "success")
+                state.set_metadata(
+                    "last_gitlab_check_summary", json.dumps(counters, sort_keys=True)
+                )
+                state.set_metadata("last_gitlab_check_error", "")
             print(f"Scan complete: {json.dumps(counters, sort_keys=True)}", flush=True)
         except ReviewError as exc:
-            state.set_metadata("last_gitlab_check_at", utc_now())
-            state.set_metadata("last_gitlab_check_status", "failed")
-            state.set_metadata("last_gitlab_check_error", str(exc))
+            with lock:
+                state.set_metadata("last_gitlab_check_at", utc_now())
+                state.set_metadata("last_gitlab_check_status", "failed")
+                state.set_metadata("last_gitlab_check_error", str(exc))
             print(f"Scan failed: {exc}", file=sys.stderr, flush=True)
         vault.wait_for_change(vault_version, sleep_seconds)
 

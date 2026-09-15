@@ -236,6 +236,15 @@ activity, review status, and security findings. Runtime controls and credential
 rotation are kept on the separate authenticated **Settings** page. Stored
 secrets are never displayed again.
 
+The Settings page also provides a protected **Reset repository and MR data**
+action. The administrator must type `RESET` exactly before it runs. The reset
+deletes the repository inventory, every MR revision, report, and parsed finding,
+clears the previous GitLab scan status, and records the reset time as a new
+deployment cutoff. Administrator accounts, active login sessions, encrypted
+GitLab and LLM credentials, and runtime settings remain unchanged. The reviewer
+is then woken for a fresh discovery cycle; open MRs created before the reset
+time are not imported again.
+
 After every container or host restart, sign in once to unlock the encrypted
 credential vault in memory. This is necessary because no plaintext credential
 or separate master encryption key is stored on disk. Until it is unlocked, the

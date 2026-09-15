@@ -758,6 +758,67 @@ class WebAuthenticationTests(unittest.TestCase):
                 "2026-09-15T10:00:00+00:00",
             )
 
+    def test_review_data_reset_preserves_admin_credentials_and_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            store = WebStore(database)
+            credentials = Credentials(
+                "https://gitlab.example.com", "gitlab-test-token", "llm-test-key"
+            )
+            user_id = store.create_first_user(
+                "security-admin",
+                "a secure test password",
+                credentials,
+                {"MAX_REVIEWS_PER_CYCLE": "5"},
+            )
+            session_token, _ = store.create_session(user_id)
+            state = ReviewState(database)
+            state.record_visible_projects(
+                [
+                    {
+                        "id": 1,
+                        "path_with_namespace": "company/app",
+                        "web_url": "https://gitlab.example.com/company/app",
+                    }
+                ]
+            )
+            state.queue(
+                ReviewTarget(
+                    1,
+                    "company/app",
+                    7,
+                    "test-sha",
+                    "https://gitlab.example.com/company/app/-/merge_requests/7",
+                    "2026-09-15T11:00:00Z",
+                )
+            )
+            state.set_metadata("last_gitlab_check_status", "success")
+            state.close()
+
+            reset_at = "2026-09-15T12:00:00+00:00"
+            with patch("security_review.web.now_iso", return_value=reset_at):
+                self.assertEqual(store.reset_review_data(), (1, 1, reset_at))
+
+            self.assertEqual(store.user_count(), 1)
+            self.assertIsNotNone(
+                store.authenticate("security-admin", "a secure test password")
+            )
+            self.assertEqual(
+                store.unlock_credentials("a secure test password"), credentials
+            )
+            self.assertEqual(store.settings()["MAX_REVIEWS_PER_CYCLE"], "5")
+            self.assertIsNotNone(store.session(session_token))
+            self.assertEqual(store.visible_projects(), [])
+            self.assertEqual(store.dashboard(), ({}, []))
+            status = store.scan_status()
+            self.assertEqual(status["deployment_started_at"], reset_at)
+            self.assertNotIn("last_gitlab_check_status", status)
+            with store.connect() as connection:
+                initialized = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'initialized'"
+                ).fetchone()
+            self.assertEqual(str(initialized["value"]), reset_at)
+
 
 if __name__ == "__main__":
     unittest.main()

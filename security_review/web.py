@@ -309,6 +309,11 @@ class MemoryVault:
             if self.version == version:
                 self.condition.wait(timeout=timeout)
 
+    def notify_change(self) -> None:
+        with self.condition:
+            self.version += 1
+            self.condition.notify_all()
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -390,6 +395,7 @@ class WebStore:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
+        self.operation_lock = threading.RLock()
         self.initialize()
 
     @contextmanager
@@ -738,6 +744,34 @@ class WebStore:
                     (key, value, now_iso()),
                 )
 
+    def reset_review_data(self) -> tuple[int, int, str]:
+        with self.operation_lock:
+            reset_at = now_iso()
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                repository_count = int(
+                    connection.execute("SELECT COUNT(*) FROM visible_projects").fetchone()[0]
+                )
+                review_count = int(
+                    connection.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+                )
+                connection.execute("DELETE FROM reviews")
+                connection.execute("DELETE FROM visible_projects")
+                connection.execute(
+                    "DELETE FROM metadata WHERE key LIKE 'last_gitlab_check_%'"
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO metadata (key, value) VALUES "
+                    "('deployment_started_at', ?)",
+                    (reset_at,),
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO metadata (key, value) VALUES "
+                    "('initialized', ?)",
+                    (reset_at,),
+                )
+        return repository_count, review_count, reset_at
+
     def dashboard(self) -> tuple[dict[str, int], list[sqlite3.Row]]:
         with self.connect() as connection:
             counts = {
@@ -932,7 +966,7 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#14213d;--muted:#65758b;--line:#dbe3ed;--blue:#246bfd;--bg:#f5f8fc;--card:#fff;--red:#b42318;--green:#16803c}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:800}.severity-critical,.severity-high{background:#fff0ef;color:var(--red)}.severity-medium{background:#fff7df;color:#8a5700}.severity-low{background:#eaf0f8;color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
+main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.danger-zone{border-color:#f4b4ae}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.danger{background:var(--red)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:800}.severity-critical,.severity-high{background:#fff0ef;color:var(--red)}.severity-medium{background:#fff7df;color:#8a5700}.severity-low{background:#eaf0f8;color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
 """
 
 
@@ -1137,6 +1171,8 @@ def handler_factory(
                     self.fetch_llm_models(form)
                 elif parsed.path == "/settings":
                     self.update_settings(form)
+                elif parsed.path == "/reset-review-data":
+                    self.reset_review_data(form)
                 else:
                     self.send_page(404, page("Not found", "<div class='card'><h1>Not found</h1></div>"))
             except (ReviewError, UnicodeDecodeError) as exc:
@@ -1706,7 +1742,14 @@ def handler_factory(
             <form method='post' action='/logout'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><button class='secondary'>Sign out</button></form></div></header>
             {notice}<section class='card'><h2>Runtime settings</h2><p class='sub'>Saved in SQLite and applied automatically at the next polling cycle.</p>
             <form method='post' action='/settings'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>{fields}</div><div class='actions'><button type='submit'>Save settings</button></div></form></section>
-            {credential_panel}<script src='/app.js' defer></script>"""
+            {credential_panel}
+            <section class='card danger-zone'><h2>Reset repository and MR data</h2>
+            <p>Clear the repository inventory, MR revisions, reports, and findings from SQLite and start a new deployment period. Administrator accounts, encrypted credentials, runtime settings, and the current login are preserved.</p>
+            <p class='error'><strong>This cannot be undone.</strong> Open MRs created before the reset time will not be imported again.</p>
+            <form method='post' action='/reset-review-data'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'>
+            <div class='field'><label for='reset_confirmation'>Type RESET to confirm</label><input id='reset_confirmation' name='confirmation' autocomplete='off' pattern='RESET' required></div>
+            <div class='actions'><button class='danger' type='submit'>Clear repositories and MRs</button></div></form></section>
+            <script src='/app.js' defer></script>"""
             self.send_page(200, page("Settings", body))
 
         def update_settings(self, form: dict[str, str]) -> None:
@@ -1726,6 +1769,26 @@ def handler_factory(
                 message = "Settings saved. Unlock the reviewer with your administrator password."
             else:
                 message = "Settings saved. They will apply on the next polling cycle."
+            self.redirect("/settings?message=" + urllib.parse.quote(message))
+
+        def reset_review_data(self, form: dict[str, str]) -> None:
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
+                raise ReviewError("Invalid form token.")
+            if form.get("confirmation", "") != "RESET":
+                raise ReviewError(
+                    "Type RESET exactly to confirm deletion of repository and MR data."
+                )
+            repositories, reviews, reset_at = store.reset_review_data()
+            vault.notify_change()
+            message = (
+                f"Review data reset at {reset_at}: removed {repositories} repository "
+                f"record(s) and {reviews} MR revision(s). Administrator accounts, "
+                "credentials, and runtime settings were preserved."
+            )
             self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def show_repository(self, query: dict[str, list[str]]) -> None:
@@ -1882,7 +1945,7 @@ def run_web(managed: bool = False) -> int:
 
         threading.Thread(
             target=run_managed_poll,
-            args=(state_db, vault),
+            args=(state_db, vault, store.operation_lock),
             daemon=True,
         ).start()
     server = ThreadingHTTPServer(
