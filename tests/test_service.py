@@ -6,6 +6,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from security_review.service import (  # noqa: E402
     Config,
+    GitLabClient,
     ReviewError,
     ReviewState,
     ReviewTarget,
@@ -251,6 +253,34 @@ class ConfigurationTests(unittest.TestCase):
     def test_model_fetch_requires_an_api_key(self):
         with self.assertRaises(ReviewError):
             list_llm_models("openai", "")
+
+    def test_gitlab_project_discovery_403_explains_required_permission(self):
+        denied = urllib.error.HTTPError(
+            "https://gitlab.example.com/api/v4/projects",
+            403,
+            "Forbidden",
+            {},
+            None,
+        )
+        with patch("security_review.service.urllib.request.urlopen", side_effect=denied):
+            with self.assertRaisesRegex(ReviewError, "User boundary.*Project: Read"):
+                GitLabClient(
+                    "https://gitlab.example.com", "gitlab-test-token"
+                ).list_projects()
+
+    def test_gitlab_401_explains_invalid_or_expired_token(self):
+        denied = urllib.error.HTTPError(
+            "https://gitlab.example.com/api/v4/projects",
+            401,
+            "Unauthorized",
+            {},
+            None,
+        )
+        with patch("security_review.service.urllib.request.urlopen", side_effect=denied):
+            with self.assertRaisesRegex(ReviewError, "active, not expired or revoked"):
+                GitLabClient(
+                    "https://gitlab.example.com", "gitlab-test-token"
+                ).list_projects()
 
 
 class PathTests(unittest.TestCase):

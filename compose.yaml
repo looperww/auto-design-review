@@ -15,7 +15,7 @@ services:
       WEB_HOST: 0.0.0.0
       WEB_PORT: 8080
     ports:
-      - "127.0.0.1:6789:8080"
+      - "0.0.0.0:6789:8080"
     volumes:
       - type: bind
         source: ./data

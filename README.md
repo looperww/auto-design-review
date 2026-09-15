@@ -59,13 +59,22 @@ Create the token at the highest company group that should be reviewed. The
 token's resource boundary is the deployment scope: every existing and future
 project visible inside that boundary is discovered automatically.
 
-Grant only these fine-grained permissions:
+Grant only these fine-grained permissions. The project-discovery permission is
+under the token's **User** boundary; the review permissions use the selected
+company group/project boundary:
 
-| Resource | Permission | Why |
-| --- | --- | --- |
-| Project | Read | Discover the projects visible to the token. |
-| Merge Request | Read | Read open MRs, metadata, and diffs. |
-| Repository | Read | Download a source snapshot at the exact MR commit. |
+| Boundary | Resource | Permission | Why |
+| --- | --- | --- | --- |
+| User | Project | Read | Discover projects visible to the token owner. |
+| Group and project | Merge Request | Read | Read open MRs, metadata, and diffs. |
+| Group and project | Repository | Read | Download a source snapshot at the exact MR commit. |
+
+If the GitLab version offers legacy scopes instead of resource permissions, use
+`read_api`. A 403 during **Test GitLab access** usually means **User → Project:
+Read** is missing from a fine-grained token, the selected resource boundary does
+not contain the projects, or a GitLab access policy is denying the request. A
+401 normally means the token is invalid, expired, revoked, incomplete, or was
+created for a different GitLab instance.
 
 Do not grant create, update, approve, merge, push, administration, runner, or
 deployment permissions. The token-owning account should have only Reporter
@@ -124,12 +133,16 @@ docker compose logs --follow app
 
 ### 5. Create the administrator
 
-The management console is bound to the deployment machine's localhost interface
-by default. On that machine, open:
+The management console is bound to all host network interfaces on port `6789`.
+Open it using the deployment machine's IP address:
 
 ```text
-http://127.0.0.1:6789/setup
+http://SERVER-IP:6789/setup
 ```
+
+Restrict inbound TCP port `6789` to the approved management network in the host
+or network firewall. For production, place the service behind an approved HTTPS
+reverse proxy rather than transmitting credentials over plain HTTP.
 
 Create the first administrator username and password. The password is
 PBKDF2-HMAC-SHA256 hashed with a unique salt and stored in SQLite. After the
@@ -213,15 +226,10 @@ The service cannot contact GitLab until the encrypted GitLab credentials have
 been saved and unlocked. LLM reviews remain disabled until the encrypted active
 provider key is also present.
 
-For a remote server, keep the console bound to localhost and use an SSH tunnel:
-
-```bash
-ssh -L 6789:127.0.0.1:6789 user@security-review-server
-```
-
-Then open `http://127.0.0.1:6789` on your computer. Do not publish the console
-directly to a company network or the internet without an approved HTTPS reverse
-proxy and an infrastructure security review.
+The container publishes `0.0.0.0:6789`, so the console is reachable through any
+host interface permitted by the firewall. Do not expose this port directly to
+the internet. An SSH tunnel remains an option if direct network access is later
+disabled.
 
 The home page is a dedicated dashboard for GitLab health, repository and MR
 activity, review status, and security findings. Runtime controls and credential
@@ -432,8 +440,9 @@ only its derived encryption key remains in process memory after sign-in.
 - The credential-vault encryption key is derived during sign-in, held only in
   process memory, and lost on restart. The administrator password is not stored
   in memory for credential changes.
-- The web console listens only on `127.0.0.1:6789` at the Docker host by
-  default. The container continues to listen internally on port `8080`.
+- The web console listens on `0.0.0.0:6789` at the Docker host and therefore
+  relies on a host/network firewall and an approved HTTPS reverse proxy for
+  production access. The container listens internally on port `8080`.
 
 Because selected proprietary source code is sent to the active LLM provider,
 obtain company approval for that provider, data-processing terms, retention
@@ -453,6 +462,8 @@ python3 -m unittest discover -s tests -v
 - [GitLab Merge Requests API](https://docs.gitlab.com/api/merge_requests/)
 - [GitLab repository archive API](https://docs.gitlab.com/api/repositories/#retrieve-file-archive)
 - [GitLab fine-grained token permissions](https://docs.gitlab.com/auth/tokens/fine_grained_access_tokens_rest/)
+- [GitLab access-token scopes](https://docs.gitlab.com/security/tokens/access_token_scopes/)
+- [GitLab token troubleshooting](https://docs.gitlab.com/security/tokens/token_troubleshooting/)
 - [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage)
 - [Claude Code installation](https://code.claude.com/docs/en/setup)
 - [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)

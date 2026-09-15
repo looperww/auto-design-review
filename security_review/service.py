@@ -458,6 +458,25 @@ class GitLabClient:
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
                 raise ReviewError("GitLab API rate limit reached; try again later.") from exc
+            if exc.code == 401:
+                raise ReviewError(
+                    "GitLab rejected the token. Check that it is complete, active, "
+                    "not expired or revoked, and belongs to the configured GitLab URL."
+                ) from exc
+            if exc.code == 403 and path.strip("/") == "projects":
+                raise ReviewError(
+                    "GitLab denied project discovery. For a fine-grained personal "
+                    "access token, grant User boundary → Project: Read and ensure "
+                    "the token owner can access the target projects. For a legacy "
+                    "token, grant read_api. A GitLab administrator may also need to "
+                    "check token, IP, or external-authorization policies."
+                ) from exc
+            if exc.code == 403:
+                raise ReviewError(
+                    "GitLab recognized the token but denied this request. Check the "
+                    "token's resource boundary, read permissions, the token owner's "
+                    "project role, and GitLab access policies."
+                ) from exc
             raise ReviewError(f"GitLab API request failed with HTTP {exc.code}.") from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise ReviewError("GitLab API request failed or timed out.") from exc
