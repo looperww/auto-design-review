@@ -24,6 +24,9 @@ from security_review.service import (  # noqa: E402
     effective_runtime_settings,
     is_context_candidate,
     normalized_archive_path,
+    run_custom_llm,
+    run_gemini,
+    run_openai,
     parse_mr_url,
     scan_once,
     test_claude_api_key as verify_claude_api_key,
@@ -43,7 +46,7 @@ def config_for_test(root: Path, **overrides):
     values = {
         "gitlab_url": "https://gitlab.example.com",
         "gitlab_token": "test-token",
-        "anthropic_api_key": "test-anthropic-key",
+        "llm_api_key": "test-anthropic-key",
         "report_dir": root / "reports",
         "state_db": root / "state.sqlite3",
         "skill_path": root / "SKILL.md",
@@ -58,7 +61,7 @@ def config_for_test(root: Path, **overrides):
         "max_context_file_bytes": 100_000,
         "max_context_bytes": 300_000,
         "max_context_scan_bytes": 1_000_000,
-        "claude_model": "opus",
+        "llm_model": "opus",
         "claude_max_budget_usd": "5.00",
         "claude_max_turns": "3",
     }
@@ -86,7 +89,7 @@ class ConfigurationTests(unittest.TestCase):
         ):
             config = Config.from_env()
         self.assertEqual(config.gitlab_url, "https://gitlab.com")
-        self.assertEqual(config.claude_model, "opus")
+        self.assertEqual(config.llm_model, "opus")
 
     def test_placeholder_secret_is_rejected(self):
         with patch.dict(
@@ -109,7 +112,23 @@ class ConfigurationTests(unittest.TestCase):
         config = Config.from_credentials(
             "https://gitlab.example.com", "gitlab-secret", ""
         )
-        self.assertEqual(config.anthropic_api_key, "")
+        self.assertEqual(config.llm_api_key, "")
+
+    def test_provider_defaults_are_selected(self):
+        openai = Config.from_credentials(
+            "https://gitlab.example.com",
+            "gitlab-secret",
+            "openai-secret",
+            llm_provider="openai",
+        )
+        gemini = Config.from_credentials(
+            "https://gitlab.example.com",
+            "gitlab-secret",
+            "gemini-secret",
+            llm_provider="gemini",
+        )
+        self.assertEqual(openai.llm_model, "gpt-6-astra")
+        self.assertEqual(gemini.llm_model, "gemini-3.8-flash")
 
     def test_anthropic_key_test_uses_claude_code_with_a_bounded_request(self):
         completed = subprocess.CompletedProcess(
@@ -127,6 +146,54 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(ReviewError):
                 verify_claude_api_key("")
         run.assert_not_called()
+
+    def test_openai_uses_responses_api_without_storage(self):
+        config = config_for_test(
+            Path("/tmp"),
+            llm_provider="openai",
+            llm_model="gpt-test",
+        )
+        response = {
+            "output": [{"content": [{"type": "output_text", "text": "# Report"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+        }
+        with patch("security_review.service.post_json", return_value=response) as post:
+            report, metadata = run_openai("review this", config)
+        self.assertEqual(report, "# Report")
+        self.assertEqual(metadata["usage"]["input_tokens"], 10)
+        self.assertEqual(post.call_args.args[0], "https://api.openai.com/v1/responses")
+        self.assertFalse(post.call_args.args[2]["store"])
+
+    def test_gemini_uses_generate_content_api(self):
+        config = config_for_test(
+            Path("/tmp"),
+            llm_provider="gemini",
+            llm_model="gemini-test",
+        )
+        response = {
+            "candidates": [{"content": {"parts": [{"text": "# Gemini report"}]}}]
+        }
+        with patch("security_review.service.post_json", return_value=response) as post:
+            report, _ = run_gemini("review this", config)
+        self.assertEqual(report, "# Gemini report")
+        self.assertIn("gemini-test:generateContent", post.call_args.args[0])
+        self.assertEqual(post.call_args.args[1]["x-goog-api-key"], "test-anthropic-key")
+
+    def test_custom_provider_uses_exact_openai_compatible_endpoint(self):
+        config = config_for_test(
+            Path("/tmp"),
+            llm_provider="custom",
+            llm_api_url="https://llm.example.com/v1/chat/completions",
+            llm_model="company-model",
+        )
+        response = {"choices": [{"message": {"content": "# Custom report"}}]}
+        with patch("security_review.service.post_json", return_value=response) as post:
+            report, _ = run_custom_llm("review this", config)
+        self.assertEqual(report, "# Custom report")
+        self.assertEqual(
+            post.call_args.args[0], "https://llm.example.com/v1/chat/completions"
+        )
+        self.assertEqual(post.call_args.args[2]["model"], "company-model")
 
 
 class PathTests(unittest.TestCase):
@@ -263,7 +330,7 @@ class CycleLimitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = ReviewState(root / "state.sqlite3")
-            discovery_config = config_for_test(root, anthropic_api_key="")
+            discovery_config = config_for_test(root, llm_api_key="")
             with (
                 patch("security_review.service.discover_targets", return_value=targets),
                 patch("security_review.service.review_target") as review,
@@ -333,7 +400,7 @@ class DiscoveryInventoryTests(unittest.TestCase):
             result = scan_once(
                 self.FakeGitLabClient(),
                 state,
-                config_for_test(root, anthropic_api_key=""),
+                config_for_test(root, llm_api_key=""),
             )
             self.assertEqual(result["discovered"], 1)
             self.assertEqual(result["queued"], 1)
@@ -424,6 +491,32 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertEqual(
             decrypt_credentials(salt, nonce, ciphertext, "correct password"), credentials
         )
+
+    def test_non_anthropic_provider_configuration_is_encrypted(self):
+        credentials = validated_credentials(
+            "https://gitlab.example.com",
+            "gitlab-test-token",
+            "openai-test-key",
+            "openai",
+            "",
+            "gpt-company",
+        )
+        salt, nonce, ciphertext = encrypt_credentials(credentials, "correct password")
+        restored = decrypt_credentials(salt, nonce, ciphertext, "correct password")
+        self.assertEqual(restored, credentials)
+        self.assertEqual(restored.llm_provider, "openai")
+        self.assertNotIn("openai-test-key", ciphertext)
+
+    def test_custom_provider_requires_an_https_endpoint_when_key_is_present(self):
+        with self.assertRaises(ReviewError):
+            validated_credentials(
+                "https://gitlab.example.com",
+                "gitlab-test-token",
+                "custom-test-key",
+                "custom",
+                "http://localhost:9000/v1/chat/completions",
+                "company-model",
+            )
 
     def test_scan_status_is_shared_with_web_console(self):
         with tempfile.TemporaryDirectory() as directory:

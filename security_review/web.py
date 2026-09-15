@@ -23,11 +23,15 @@ from cryptography.exceptions import InvalidTag
 
 from .service import (
     GitLabClient,
+    LLM_DEFAULT_MODELS,
+    LLM_PROVIDER_LABELS,
+    LLM_PROVIDERS,
     RUNTIME_SETTINGS,
+    Config,
     ReviewError,
     effective_runtime_settings,
     normalize_runtime_setting,
-    test_claude_api_key,
+    test_llm_connection,
 )
 
 
@@ -43,7 +47,10 @@ VAULT_ASSOCIATED_DATA = b"gitlab-security-review-vault-v1"
 class Credentials:
     gitlab_url: str
     gitlab_token: str
-    anthropic_api_key: str
+    llm_api_key: str
+    llm_provider: str = "anthropic"
+    llm_api_url: str = ""
+    llm_model: str = ""
 
 
 def credential_key(password: str, salt: bytes) -> bytes:
@@ -59,7 +66,10 @@ def encrypt_credentials(credentials: Credentials, password: str) -> tuple[str, s
         {
             "gitlab_url": credentials.gitlab_url,
             "gitlab_token": credentials.gitlab_token,
-            "anthropic_api_key": credentials.anthropic_api_key,
+            "llm_api_key": credentials.llm_api_key,
+            "llm_provider": credentials.llm_provider,
+            "llm_api_url": credentials.llm_api_url,
+            "llm_model": credentials.llm_model,
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -83,12 +93,19 @@ def decrypt_credentials(
         credentials = Credentials(
             gitlab_url=str(payload["gitlab_url"]),
             gitlab_token=str(payload["gitlab_token"]),
-            anthropic_api_key=str(payload.get("anthropic_api_key", "")),
+            llm_api_key=str(
+                payload.get("llm_api_key", payload.get("anthropic_api_key", ""))
+            ),
+            llm_provider=str(payload.get("llm_provider", "anthropic")),
+            llm_api_url=str(payload.get("llm_api_url", "")),
+            llm_model=str(payload.get("llm_model", "")),
         )
     except (ValueError, KeyError, TypeError, json.JSONDecodeError, InvalidTag) as exc:
         raise ReviewError("The credential vault could not be unlocked.") from exc
     if not credentials.gitlab_url.strip() or not credentials.gitlab_token.strip():
         raise ReviewError("The credential vault does not contain GitLab access.")
+    if credentials.llm_provider not in LLM_PROVIDERS:
+        raise ReviewError("The credential vault contains an unsupported LLM provider.")
     return credentials
 
 
@@ -149,19 +166,51 @@ def token_digest(token: str) -> str:
 
 
 def validated_credentials(
-    gitlab_url: str, gitlab_token: str, anthropic_api_key: str
+    gitlab_url: str,
+    gitlab_token: str,
+    llm_api_key: str,
+    llm_provider: str = "anthropic",
+    llm_api_url: str = "",
+    llm_model: str = "",
 ) -> Credentials:
     url = gitlab_url.strip().rstrip("/")
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
         raise ReviewError("GitLab URL must be a valid HTTPS address.")
     gitlab_token = gitlab_token.strip()
-    anthropic_api_key = anthropic_api_key.strip()
+    llm_api_key = llm_api_key.strip()
+    llm_provider = llm_provider.strip().lower()
+    llm_api_url = llm_api_url.strip()
+    llm_model = llm_model.strip() or LLM_DEFAULT_MODELS.get(llm_provider, "")
     if not 8 <= len(gitlab_token) <= 4096:
         raise ReviewError("GitLab token is missing or has an invalid length.")
-    if anthropic_api_key and not 8 <= len(anthropic_api_key) <= 4096:
-        raise ReviewError("Anthropic API key has an invalid length.")
-    return Credentials(url, gitlab_token, anthropic_api_key)
+    if llm_provider not in LLM_PROVIDERS:
+        raise ReviewError("Select a supported LLM provider.")
+    if llm_api_key and not 8 <= len(llm_api_key) <= 4096:
+        raise ReviewError("LLM API key has an invalid length.")
+    if llm_model and len(llm_model) > 256:
+        raise ReviewError("LLM model name is too long.")
+    if llm_api_key and not llm_model:
+        raise ReviewError("Enter a model name for the selected LLM provider.")
+    if llm_provider == "custom" and llm_api_key and not llm_api_url:
+        raise ReviewError("Enter a custom LLM API URL when an API key is configured.")
+    if llm_provider == "custom" and llm_api_url:
+        parsed_llm = urllib.parse.urlparse(llm_api_url)
+        if (
+            parsed_llm.scheme != "https"
+            or not parsed_llm.netloc
+            or parsed_llm.username
+            or parsed_llm.password
+            or parsed_llm.fragment
+        ):
+            raise ReviewError("Custom LLM API URL must be a valid HTTPS address without a fragment.")
+    elif llm_provider != "custom":
+        llm_api_url = ""
+    if len(llm_api_url) > 2048:
+        raise ReviewError("Custom LLM API URL is too long.")
+    return Credentials(
+        url, gitlab_token, llm_api_key, llm_provider, llm_api_url, llm_model
+    )
 
 
 class WebStore:
@@ -726,8 +775,8 @@ def handler_factory(
                     self.update_credentials(form)
                 elif parsed.path == "/credentials/test-gitlab":
                     self.test_gitlab_credentials(form)
-                elif parsed.path == "/credentials/test-anthropic":
-                    self.test_anthropic_credentials(form)
+                elif parsed.path == "/credentials/test-llm":
+                    self.test_llm_credentials(form)
                 elif parsed.path == "/settings":
                     self.update_settings(form)
                 else:
@@ -851,9 +900,9 @@ def handler_factory(
             credentials = store.unlock_credentials(password)
             vault.set(credentials)
             message = (
-                "Credential vault unlocked; GitLab discovery and Claude reviews can run."
-                if credentials.anthropic_api_key
-                else "Credential vault unlocked; GitLab discovery can run. Add an Anthropic API key to begin reviews."
+                "Credential vault unlocked; GitLab discovery and LLM reviews can run."
+                if credentials.llm_api_key
+                else "Credential vault unlocked; GitLab discovery can run. Add an LLM API key to begin reviews."
             )
             self.redirect("/?message=" + urllib.parse.quote(message))
 
@@ -869,9 +918,9 @@ def handler_factory(
             store.save_credentials(credentials, password)
             vault.set(credentials)
             message = (
-                "Credentials saved; GitLab discovery and Claude reviews are active."
-                if credentials.anthropic_api_key
-                else "GitLab access saved; MR discovery is active. Add an Anthropic API key later to review queued MRs."
+                "Credentials saved; GitLab discovery and LLM reviews are active."
+                if credentials.llm_api_key
+                else "GitLab access saved; MR discovery is active. Add an LLM API key later to review queued MRs."
             )
             self.redirect("/?message=" + urllib.parse.quote(message))
 
@@ -893,11 +942,20 @@ def handler_factory(
         ) -> Credentials:
             submitted_gitlab_url = form.get("gitlab_url", "").strip()
             submitted_gitlab_token = form.get("gitlab_token", "").strip()
-            submitted_anthropic_key = form.get("anthropic_api_key", "").strip()
+            submitted_provider = form.get("llm_provider", "anthropic").strip().lower()
+            submitted_llm_key = form.get("llm_api_key", "").strip()
+            retained_llm_key = (
+                existing.llm_api_key
+                if submitted_provider == existing.llm_provider
+                else ""
+            )
             return validated_credentials(
                 submitted_gitlab_url or existing.gitlab_url,
                 submitted_gitlab_token or existing.gitlab_token,
-                submitted_anthropic_key or existing.anthropic_api_key,
+                submitted_llm_key or retained_llm_key,
+                submitted_provider,
+                form.get("llm_api_url", "").strip(),
+                form.get("llm_model", "").strip(),
             )
 
         def test_gitlab_credentials(self, form: dict[str, str]) -> None:
@@ -919,7 +977,7 @@ def handler_factory(
                 )
             )
 
-        def test_anthropic_credentials(self, form: dict[str, str]) -> None:
+        def test_llm_credentials(self, form: dict[str, str]) -> None:
             session = self.require_session()
             if session is None:
                 return
@@ -927,13 +985,22 @@ def handler_factory(
             if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
                 raise ReviewError("Invalid form token.")
             _, existing = self.credential_context(form, user)
-            api_key = form.get("anthropic_api_key", "").strip() or existing.anthropic_api_key
-            model = effective_runtime_settings(store.settings())["CLAUDE_MODEL"]
-            test_claude_api_key(api_key, model)
+            credentials = self.merged_credentials(form, existing)
+            config = Config.from_credentials(
+                credentials.gitlab_url,
+                credentials.gitlab_token,
+                credentials.llm_api_key,
+                store.settings(),
+                llm_provider=credentials.llm_provider,
+                llm_api_url=credentials.llm_api_url,
+                llm_model=credentials.llm_model,
+            )
+            test_llm_connection(config)
+            provider_label = LLM_PROVIDER_LABELS[credentials.llm_provider]
             self.redirect(
                 "/?message="
                 + urllib.parse.quote(
-                    f"Anthropic API key test succeeded with Claude Code using the {model} model."
+                    f"LLM connection test succeeded with {provider_label} using the {config.llm_model} model."
                 )
             )
 
@@ -971,7 +1038,7 @@ def handler_factory(
             if running and active_credentials is not None:
                 reviewer_label = (
                     "Reviews active"
-                    if active_credentials.anthropic_api_key
+                    if active_credentials.llm_api_key
                     else "GitLab discovery active"
                 )
                 reviewer_class = "completed"
@@ -1067,15 +1134,26 @@ def handler_factory(
             elif active_credentials is None:
                 vault_panel = "<p class='error'>GitLab access is not configured. Enter it below to start MR discovery.</p>"
                 gitlab_url = "https://gitlab.com"
-            elif not active_credentials.anthropic_api_key:
+            elif not active_credentials.llm_api_key:
                 vault_panel = (
                     "<p class='notice'>GitLab discovery is unlocked. Open MR revisions are queued without downloading code. "
-                    "Add an Anthropic API key to start reviewing the queue.</p>"
+                    "Add an LLM API key to start reviewing the queue.</p>"
                 )
                 gitlab_url = active_credentials.gitlab_url
             else:
-                vault_panel = "<p class='notice'>GitLab discovery and Claude security reviews are unlocked.</p>"
+                provider_label = html.escape(LLM_PROVIDER_LABELS[active_credentials.llm_provider])
+                vault_panel = f"<p class='notice'>GitLab discovery and {provider_label} security reviews are unlocked.</p>"
                 gitlab_url = active_credentials.gitlab_url
+            displayed_credentials = active_credentials or Credentials("", "", "")
+            provider_options = "".join(
+                f"<option value='{provider}' {'selected' if displayed_credentials.llm_provider == provider else ''}>"
+                f"{html.escape(LLM_PROVIDER_LABELS[provider])}</option>"
+                for provider in LLM_PROVIDERS
+            )
+            llm_model = displayed_credentials.llm_model or LLM_DEFAULT_MODELS[
+                displayed_credentials.llm_provider
+            ]
+            llm_api_url = displayed_credentials.llm_api_url
             body = f"""
             <header><div><h1>Security Review</h1><p class='sub'>Signed in as {html.escape(str(user['username']))}</p></div>
             <div class='top-actions'><span class='status {reviewer_class}'>{reviewer_label}</span>
@@ -1096,16 +1174,19 @@ def handler_factory(
             <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div></div></section>
             <section class='card'><h2>Runtime settings</h2><p class='sub'>Saved in SQLite and applied automatically at the next polling cycle.</p>
             <form method='post' action='/settings'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>{fields}</div><div class='actions'><button type='submit'>Save settings</button></div></form></section>
-            <section class='card'><h2>Configure or rotate encrypted credentials</h2><p class='sub'>Save GitLab access first to test discovery. The Anthropic API key is optional and can be added later. Existing secrets are kept when their fields are left blank.</p>
+            <section class='card'><h2>Configure or rotate encrypted credentials</h2><p class='sub'>Save GitLab access first to test discovery. The LLM API key is optional and can be added later. Existing secrets are kept when their fields are left blank and the provider is unchanged.</p>
             <form method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
             <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
             <div class='field'><label for='rotate_password'>Administrator password</label><input id='rotate_password' name='password' type='password' autocomplete='current-password' required></div>
             <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off'><small>Required the first time; leave blank later to keep the stored token.</small></div>
-            <div class='field'><label for='rotate_anthropic_key'>Anthropic API key (optional)</label><input id='rotate_anthropic_key' name='anthropic_api_key' type='password' autocomplete='off'><small>Leave blank initially for discovery only; later, a blank field keeps the stored key.</small></div>
+            <div class='field'><label for='llm_provider'>LLM provider</label><select id='llm_provider' name='llm_provider'>{provider_options}</select><small>Anthropic is the default. Custom means an OpenAI-compatible Chat Completions endpoint.</small></div>
+            <div class='field'><label for='llm_model'>Model</label><input id='llm_model' name='llm_model' value='{html.escape(llm_model)}' maxlength='256'><small>Use a model available to the selected provider account.</small></div>
+            <div class='field'><label for='llm_api_url'>Custom API URL</label><input id='llm_api_url' name='llm_api_url' type='url' value='{html.escape(llm_api_url)}' placeholder='https://llm.example.com/v1/chat/completions'><small>Used only for Custom; enter the exact HTTPS Chat Completions endpoint.</small></div>
+            <div class='field'><label for='llm_api_key'>LLM API key (optional)</label><input id='llm_api_key' name='llm_api_key' type='password' autocomplete='off'><small>Leave blank for discovery only. When changing provider, enter that provider's key.</small></div>
             </div><div class='actions'><button type='submit'>Save encrypted credentials</button>
             <button class='secondary' type='submit' formaction='/credentials/test-gitlab'>Test GitLab access</button>
-            <button class='secondary' type='submit' formaction='/credentials/test-anthropic'>Test Anthropic API key</button></div>
-            <p class='sub'>Tests do not save the entered values. The Anthropic test sends one minimal request through Claude Code using the configured model and may incur a very small API charge.</p></form></section>
+            <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test LLM connection</button></div>
+            <p class='sub'>Tests do not save the entered values. The LLM test sends one minimal request using the selected provider and model and may incur a very small API charge.</p></form></section>
             <section class='card'><h2>MR revisions discovered in the {period_labels[period]}</h2><div class='table-wrap'><table><thead><tr><th>Project</th><th>MR</th><th>Commit</th><th>Status</th><th>Discovered</th><th>Report</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
             self.send_page(200, page("Dashboard", body))
 
