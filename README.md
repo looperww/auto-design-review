@@ -242,11 +242,12 @@ disabled.
 
 The authenticated console uses a responsive sidebar with three primary pages:
 
-- **Dashboard** is the main operational view. It shows review outcomes, the
-  prioritized security-finding queue, and GitLab connection health.
+- **Dashboard** is the main operational view. It shows review outcomes and the
+  prioritized security-finding queue. A compact green/red indicator beneath
+  the page title shows the latest GitLab connection status.
 - **Repositories** provides a focused inventory of repository coverage,
   per-repository access status, MR activity, finding totals, date filters, and
-  pagination. Overall GitLab connection health remains on Dashboard.
+  pagination. Overall GitLab health remains in the compact Dashboard header.
 - **Settings** contains runtime controls, credential tests and rotation, and the
   protected data-reset action.
 

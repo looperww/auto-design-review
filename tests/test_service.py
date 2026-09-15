@@ -770,7 +770,9 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("<h2>Review status</h2>", dashboard)
             self.assertNotIn("<h2>Repositories and MRs</h2>", dashboard)
             self.assertNotIn("Open MR revisions are queued", dashboard)
-            self.assertIn("<h2>GitLab connection</h2>", dashboard)
+            self.assertNotIn("<h2>GitLab connection</h2>", dashboard)
+            self.assertIn("class='connection-dot down'", dashboard)
+            self.assertIn("GitLab connection not yet verified", dashboard)
             self.assertIn("href='/' aria-current='page'", dashboard)
             self.assertIn("<h1>Repositories</h1>", repositories)
             self.assertIn("<h2>Repositories and MRs</h2>", repositories)
@@ -791,6 +793,8 @@ class WebAuthenticationTests(unittest.TestCase):
             "repositories",
             "Reviews active",
             "completed",
+            "",
+            ("GitLab connected", "up"),
         )
 
         self.assertIn("href='/'", rendered)
@@ -802,6 +806,8 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertNotIn("<admin>", rendered)
         self.assertIn("value='&#x27;csrf-token'", rendered)
         self.assertIn("Reviews active", rendered)
+        self.assertIn("class='connection-dot up'", rendered)
+        self.assertIn("GitLab connected", rendered)
 
     def test_password_hash_round_trip(self):
         salt, digest, iterations = password_record("a sufficiently long password")
