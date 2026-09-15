@@ -1679,10 +1679,7 @@ def handler_factory(
                     "<a href='/settings'>Open Settings</a> to start MR discovery.</p>"
                 )
             if not active_credentials.llm_api_key:
-                return (
-                    "<p class='notice'>GitLab discovery is active. Open MR revisions are queued without downloading code. "
-                    "<a href='/settings'>Add an LLM API key</a> to start reviewing the queue.</p>"
-                )
+                return ""
             provider = html.escape(LLM_PROVIDER_LABELS[active_credentials.llm_provider])
             return f"<p class='notice'>GitLab discovery and {provider} security reviews are active.</p>"
 
@@ -1857,7 +1854,6 @@ def handler_factory(
             )
             body = f"""
             {date_notice}{self.vault_notice()}
-            <section class='card connection-card'><div class='section-heading'><div><h2>GitLab connection</h2><p class='sub'>Repository discovery and access status.</p></div><a class='button secondary' href='/settings'>Manage connection</a></div>{self.gitlab_connection_panel()}</section>
             <section class='card'><div class='section-heading'><div><h2>Repositories and MRs</h2><p class='sub'>Visible repositories and MRs first discovered after {html.escape(deployment_time + ' UTC' if deployment_time else 'initialization')}. Current filter: {html.escape(str(context['filter_label']))}.</p></div></div>
             {self.filter_controls(context, '/repositories')}
             <div class='grid'><div class='metric'>Visible repositories<strong>{total_repositories}</strong></div><div class='metric'>Fetched MRs<strong>{fetched_mrs}</strong></div><div class='metric'>Findings<strong>{len(findings)}</strong></div></div>

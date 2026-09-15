@@ -700,7 +700,9 @@ class WebAuthenticationTests(unittest.TestCase):
                 "security-admin", "a secure test password"
             )
             session_token, _ = store.create_session(user_id)
-            handler = handler_factory(store, root / "reports", False, MemoryVault())
+            vault = MemoryVault()
+            vault.set(Credentials("https://gitlab.example.com", "test-token", ""))
+            handler = handler_factory(store, root / "reports", False, vault)
             handler.log_message = lambda *_args: None
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -724,10 +726,13 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("<h1>Review dashboard</h1>", dashboard)
             self.assertIn("<h2>Review status</h2>", dashboard)
             self.assertNotIn("<h2>Repositories and MRs</h2>", dashboard)
+            self.assertNotIn("Open MR revisions are queued", dashboard)
+            self.assertIn("<h2>GitLab connection</h2>", dashboard)
             self.assertIn("href='/' aria-current='page'", dashboard)
             self.assertIn("<h1>Repositories</h1>", repositories)
             self.assertIn("<h2>Repositories and MRs</h2>", repositories)
             self.assertNotIn("<h2>Review status</h2>", repositories)
+            self.assertNotIn("<h2>GitLab connection</h2>", repositories)
             self.assertIn(
                 "href='/repositories' aria-current='page'", repositories
             )
