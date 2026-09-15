@@ -1689,6 +1689,7 @@ def handler_factory(
                 project_rows.append(
                     "<tr>"
                     f"<td>{project_name}</td>"
+                    f"<td>{int(project['project_id'])}</td>"
                     f"<td><span class='status {html.escape(project_status)}' "
                     f"title='{html.escape(status_title)}'>{html.escape(project_status.title())}</span></td>"
                     f"<td>{mr_count_display}</td>"
@@ -1697,7 +1698,7 @@ def handler_factory(
                     "</tr>"
                 )
             visible_project_rows = "".join(project_rows) or (
-                "<tr><td colspan='5'>No repositories discovered yet.</td></tr>"
+                "<tr><td colspan='6'>No repositories discovered yet.</td></tr>"
             )
             credentials_configured = store.credentials_configured()
             if active_credentials is None and credentials_configured:
@@ -1733,7 +1734,7 @@ def handler_factory(
             <div><label for='activity_end_date'>End date (UTC)</label><input id='activity_end_date' name='end_date' type='date' value='{html.escape(end_date)}' max='{maximum_filter_date}' required></div>
             <button class='secondary' type='submit'>Apply range</button></form></div>
             <div class='grid activity-grid'><div class='metric'>Fetched MRs in {html.escape(filter_label)}<strong>{fetched_mrs}</strong></div><div class='metric'>Visible repositories<strong>{total_repositories}</strong></div><div class='metric'>Findings<strong>{len(findings)}</strong></div></div>
-            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div>{repository_pagination}</section>
+            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Repository ID</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div>{repository_pagination}</section>
             <section class='card'><h2>Review status</h2><div class='grid'>
             <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
             <div class='metric'>Completed<strong>{counts.get('completed', 0)}</strong></div>
