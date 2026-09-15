@@ -663,17 +663,24 @@ class WebStore:
             ).fetchall()
 
     def repository_activity(
-        self, period: str, selected_date: str = ""
+        self, period: str, start_date: str = "", end_date: str = ""
     ) -> tuple[list[sqlite3.Row], datetime, datetime]:
         now = datetime.now(timezone.utc)
-        if selected_date:
+        if bool(start_date) != bool(end_date):
+            raise ReviewError("Choose both a start date and an end date.")
+        if start_date and end_date:
             try:
-                start = datetime.strptime(selected_date, "%Y-%m-%d").replace(
+                start = datetime.strptime(start_date, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+                final_day = datetime.strptime(end_date, "%Y-%m-%d").replace(
                     tzinfo=timezone.utc
                 )
             except ValueError as exc:
-                raise ReviewError("Choose a valid calendar date.") from exc
-            end = start + timedelta(days=1)
+                raise ReviewError("Choose a valid start and end date.") from exc
+            if final_day < start:
+                raise ReviewError("The end date cannot be earlier than the start date.")
+            end = final_day + timedelta(days=1)
         else:
             durations = {
                 "day": timedelta(days=1),
@@ -782,7 +789,7 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#14213d;--muted:#65758b;--line:#dbe3ed;--blue:#246bfd;--bg:#f5f8fc;--card:#fff;--red:#b42318;--green:#16803c}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(170px,1fr) auto;gap:8px;align-items:end}.date-filter label{grid-column:1/-1}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
+main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
 """
 
 
@@ -1217,7 +1224,8 @@ def handler_factory(
             period = query.get("period", ["week"])[0]
             if period not in {"day", "week", "month"}:
                 period = "week"
-            selected_date = query.get("date", [""])[0].strip()
+            start_date = query.get("start_date", [""])[0].strip()
+            end_date = query.get("end_date", [""])[0].strip()
             period_labels = {
                 "day": "last 24 hours",
                 "week": "last 7 days",
@@ -1226,15 +1234,22 @@ def handler_factory(
             counts, _ = store.dashboard()
             date_error = ""
             try:
-                projects, _, _ = store.repository_activity(period, selected_date)
+                projects, _, _ = store.repository_activity(
+                    period, start_date, end_date
+                )
             except ReviewError as exc:
                 date_error = str(exc)
-                selected_date = ""
+                start_date = ""
+                end_date = ""
                 projects, _, _ = store.repository_activity(period)
             fetched_mrs = sum(int(project["mr_count"]) for project in projects)
             filter_label = (
-                f"{selected_date} UTC"
-                if selected_date
+                (
+                    f"{start_date} UTC"
+                    if start_date == end_date
+                    else f"{start_date} to {end_date} UTC"
+                )
+                if start_date and end_date
                 else period_labels[period]
             )
             scan_status = store.scan_status()
@@ -1293,7 +1308,9 @@ def handler_factory(
                 for choice, label in (("day", "Day"), ("week", "Week"), ("month", "Month"))
             )
             activity_query = (
-                {"date": selected_date} if selected_date else {"period": period}
+                {"start_date": start_date, "end_date": end_date}
+                if start_date and end_date
+                else {"period": period}
             )
             project_rows = []
             for project in projects:
@@ -1379,6 +1396,7 @@ def handler_factory(
             ]
             llm_api_url = displayed_credentials.llm_api_url
             custom_url_hidden = "" if displayed_credentials.llm_provider == "custom" else " hidden"
+            maximum_filter_date = datetime.now(timezone.utc).date().isoformat()
             body = f"""
             <header><div><h1>Security Review</h1><p class='sub'>Signed in as {html.escape(str(user['username']))}</p></div>
             <div class='top-actions'><span class='status {reviewer_class}'>{reviewer_label}</span>
@@ -1387,7 +1405,10 @@ def handler_factory(
             <section class='card'><h2>Repositories and fetched MRs</h2>
             <p class='sub'>Shows every currently visible repository and distinct MRs first discovered after this deployment ({html.escape(deployment_time + ' UTC' if deployment_time else 'initializing')}). Current filter: {html.escape(filter_label)}.</p>
             <div class='filter-bar'><div class='actions'>{period_links}</div>
-            <form class='date-filter' method='get' action='/'><label for='activity_date'>Specific date (UTC)</label><input id='activity_date' name='date' type='date' value='{html.escape(selected_date)}' max='{datetime.now(timezone.utc).date().isoformat()}'><button class='secondary' type='submit'>Apply date</button></form></div>
+            <form class='date-filter' method='get' action='/'>
+            <div><label for='activity_start_date'>Start date (UTC)</label><input id='activity_start_date' name='start_date' type='date' value='{html.escape(start_date)}' max='{maximum_filter_date}' required></div>
+            <div><label for='activity_end_date'>End date (UTC)</label><input id='activity_end_date' name='end_date' type='date' value='{html.escape(end_date)}' max='{maximum_filter_date}' required></div>
+            <button class='secondary' type='submit'>Apply range</button></form></div>
             <div class='grid activity-grid'><div class='metric'>Fetched MRs in {html.escape(filter_label)}<strong>{fetched_mrs}</strong></div><div class='metric'>Visible repositories<strong>{len(projects)}</strong></div></div>
             <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Status</th><th>MRs</th><th>Latest MR</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div></section>
             <section class='card'><h2>Review status</h2><div class='grid'>
@@ -1450,9 +1471,12 @@ def handler_factory(
             period = query.get("period", ["week"])[0]
             if period not in {"day", "week", "month"}:
                 period = "week"
-            selected_date = query.get("date", [""])[0].strip()
+            start_date = query.get("start_date", [""])[0].strip()
+            end_date = query.get("end_date", [""])[0].strip()
             try:
-                projects, start, end = store.repository_activity(period, selected_date)
+                projects, start, end = store.repository_activity(
+                    period, start_date, end_date
+                )
             except ReviewError as exc:
                 self.send_page(
                     400,
@@ -1503,12 +1527,18 @@ def handler_factory(
                 "<tr><td colspan='5'>No MRs in this period.</td></tr>"
             )
             filter_label = (
-                f"{selected_date} UTC"
-                if selected_date
+                (
+                    f"{start_date} UTC"
+                    if start_date == end_date
+                    else f"{start_date} to {end_date} UTC"
+                )
+                if start_date and end_date
                 else {"day": "last 24 hours", "week": "last 7 days", "month": "last 30 days"}[period]
             )
             back_query = urllib.parse.urlencode(
-                {"date": selected_date} if selected_date else {"period": period}
+                {"start_date": start_date, "end_date": end_date}
+                if start_date and end_date
+                else {"period": period}
             )
             body = f"""
             <header><div><h1>{html.escape(str(project['project_path']))}</h1>

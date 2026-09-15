@@ -445,7 +445,7 @@ class DiscoveryInventoryTests(unittest.TestCase):
                 )
             )
             rows, start, end = WebStore(database).repository_activity(
-                "week", "2026-09-15"
+                "week", "2026-09-15", "2026-09-15"
             )
             by_project = {row["project_path"]: row for row in rows}
             self.assertEqual(start.isoformat(), "2026-09-15T00:00:00+00:00")
@@ -461,6 +461,10 @@ class DiscoveryInventoryTests(unittest.TestCase):
             self.assertEqual(
                 len(WebStore(database).repository_mrs(1, start, end)), 1
             )
+            with self.assertRaises(ReviewError):
+                WebStore(database).repository_activity(
+                    "week", "2026-09-16", "2026-09-15"
+                )
             state.close()
 
     def test_mr_activity_filters_distinct_mrs_by_period(self):

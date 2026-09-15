@@ -262,8 +262,9 @@ Click a non-zero MR count to open that repository's filtered MR list and its
 available security reports.
 
 Day, Week, and Month select rolling windows of 24 hours, 7 days, and 30 days.
-The administrator can also select a specific UTC calendar date. MRs created
-before the deployment cutoff remain excluded.
+The administrator can also select an inclusive UTC start-date and end-date
+range; choosing the same date in both fields filters one calendar day. MRs
+created before the deployment cutoff remain excluded.
 
 ## Automatic discovery
 
