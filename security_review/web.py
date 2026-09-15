@@ -758,6 +758,11 @@ class WebStore:
                 "DELETE FROM web_sessions WHERE token_digest = ?", (token_digest(token),)
             )
 
+    def delete_all_sessions(self) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute("DELETE FROM web_sessions")
+            return max(cursor.rowcount, 0)
+
     def settings(self) -> dict[str, str]:
         with self.connect() as connection:
             rows = connection.execute("SELECT key, value FROM settings").fetchall()
@@ -1194,9 +1199,19 @@ def handler_factory(
             return (token, row) if row is not None else None
 
         def require_session(self) -> tuple[str, sqlite3.Row] | None:
+            cookie_token = cookie_value(
+                self.headers.get("Cookie"), "reviewer_session"
+            )
             session = self.session()
             if session is None:
-                self.redirect("/login")
+                headers = (
+                    [("Set-Cookie", self.make_cookie("reviewer_session", "", 0))]
+                    if cookie_token
+                    else []
+                )
+                self.redirect(
+                    "/login?reason=restart" if cookie_token else "/login", headers
+                )
                 return None
             token, _ = session
             active_credentials, _ = vault.snapshot()
@@ -2147,6 +2162,7 @@ def run_web(managed: bool = False) -> int:
         "on",
     }
     store = WebStore(state_db)
+    invalidated_sessions = store.delete_all_sessions()
     vault = MemoryVault()
     if managed:
         from .service import run_managed_poll
@@ -2160,6 +2176,11 @@ def run_web(managed: bool = False) -> int:
         (host, port), handler_factory(store, report_dir, secure_cookies, vault)
     )
     print(f"Security Review web console listening on {host}:{port}", flush=True)
+    if invalidated_sessions:
+        print(
+            f"Invalidated {invalidated_sessions} existing web session(s) after restart.",
+            flush=True,
+        )
     if store.user_count() == 0:
         print("Open /setup to create the first administrator account.", flush=True)
     try:

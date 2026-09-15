@@ -703,6 +703,7 @@ class WebAuthenticationTests(unittest.TestCase):
                 Credentials("https://gitlab.example.com", "test-token", "test-key"),
             )
             session_token, _ = store.create_session(user_id)
+            self.assertEqual(store.delete_all_sessions(), 1)
             handler = handler_factory(store, root / "reports", False, MemoryVault())
             handler.log_message = lambda *_args: None
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
