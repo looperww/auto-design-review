@@ -48,6 +48,7 @@ FINDING_HEADING_PATTERN = re.compile(
     r"(?m)^### \[(CRITICAL|HIGH|MEDIUM|LOW)\] ([^\r\n]+?)\s*$"
 )
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+REPOSITORIES_PER_PAGE = 10
 VAULT_ASSOCIATED_DATA = b"gitlab-security-review-vault-v1"
 APP_JAVASCRIPT = b"""(() => {
   const provider = document.getElementById('llm_provider');
@@ -164,6 +165,27 @@ def collect_security_findings(
         )
     )
     return findings, counts
+
+
+def paginate_repositories(
+    repositories: list[Any], requested_page: str
+) -> tuple[list[Any], int, int]:
+    try:
+        page_number = int(requested_page)
+    except ValueError:
+        page_number = 1
+    total_pages = max(
+        1,
+        (len(repositories) + REPOSITORIES_PER_PAGE - 1)
+        // REPOSITORIES_PER_PAGE,
+    )
+    page_number = min(max(page_number, 1), total_pages)
+    start = (page_number - 1) * REPOSITORIES_PER_PAGE
+    return (
+        repositories[start : start + REPOSITORIES_PER_PAGE],
+        page_number,
+        total_pages,
+    )
 
 
 @dataclass(frozen=True)
@@ -979,7 +1001,7 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#14213d;--muted:#65758b;--line:#dbe3ed;--blue:#246bfd;--bg:#f5f8fc;--card:#fff;--red:#b42318;--green:#16803c}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.danger-zone{border-color:#f4b4ae}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.danger{background:var(--red)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:800}.severity-critical,.severity-high{background:#fff0ef;color:var(--red)}.severity-medium{background:#fff7df;color:#8a5700}.severity-low{background:#eaf0f8;color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
+main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.danger-zone{border-color:#f4b4ae}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.danger{background:var(--red)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.pagination{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:18px}.pagination .actions{margin-top:0}.page-selector{display:flex;align-items:center;gap:8px}.page-selector label{font-weight:700}.page-selector select{padding:10px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:800}.severity-critical,.severity-high{background:#fff0ef;color:var(--red)}.severity-medium{background:#fff7df;color:#8a5700}.severity-low{background:#eaf0f8;color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
 """
 
 
@@ -1488,6 +1510,10 @@ def handler_factory(
                 store.latest_review_reports(activity_start, activity_end)
             )
             fetched_mrs = sum(int(project["mr_count"]) for project in projects)
+            total_repositories = len(projects)
+            paged_projects, repository_page, repository_page_count = (
+                paginate_repositories(projects, query.get("repo_page", ["1"])[0])
+            )
             filter_label = (
                 (
                     f"{start_date} UTC"
@@ -1557,6 +1583,45 @@ def handler_factory(
                 if start_date and end_date
                 else {"period": period}
             )
+            page_options = "".join(
+                f"<option value='{page_number}' "
+                f"{'selected' if page_number == repository_page else ''}>"
+                f"{page_number}</option>"
+                for page_number in range(1, repository_page_count + 1)
+            )
+            page_hidden_fields = "".join(
+                f"<input type='hidden' name='{html.escape(key)}' "
+                f"value='{html.escape(value)}'>"
+                for key, value in activity_query.items()
+            )
+            previous_page = (
+                f"<a class='button secondary' href='/?{urllib.parse.urlencode({**activity_query, 'repo_page': repository_page - 1})}'>Previous</a>"
+                if repository_page > 1
+                else ""
+            )
+            next_page = (
+                f"<a class='button secondary' href='/?{urllib.parse.urlencode({**activity_query, 'repo_page': repository_page + 1})}'>Next</a>"
+                if repository_page < repository_page_count
+                else ""
+            )
+            if total_repositories:
+                first_repository = (repository_page - 1) * REPOSITORIES_PER_PAGE + 1
+                last_repository = min(
+                    repository_page * REPOSITORIES_PER_PAGE, total_repositories
+                )
+                repository_range = (
+                    f"Showing {first_repository}–{last_repository} of "
+                    f"{total_repositories} repositories"
+                )
+            else:
+                repository_range = "No repositories to display"
+            repository_pagination = f"""
+            <div class='pagination'><p class='sub'>{repository_range}</p>
+            <div class='actions'>{previous_page}<form class='page-selector' method='get' action='/'>
+            {page_hidden_fields}<label for='repo_page'>Page</label>
+            <select id='repo_page' name='repo_page'>{page_options}</select>
+            <span>of {repository_page_count}</span><button class='secondary' type='submit'>Go</button>
+            </form>{next_page}</div></div>"""
             finding_rows = []
             for finding in findings:
                 severity = str(finding["severity"])
@@ -1583,7 +1648,7 @@ def handler_factory(
                 "<tr><td colspan='4'>No security findings in this period.</td></tr>"
             )
             project_rows = []
-            for project in projects:
+            for project in paged_projects:
                 project_path = html.escape(str(project["project_path"]))
                 raw_url = str(project["web_url"])
                 parsed_url = urllib.parse.urlparse(raw_url)
@@ -1667,8 +1732,8 @@ def handler_factory(
             <div><label for='activity_start_date'>Start date (UTC)</label><input id='activity_start_date' name='start_date' type='date' value='{html.escape(start_date)}' max='{maximum_filter_date}' required></div>
             <div><label for='activity_end_date'>End date (UTC)</label><input id='activity_end_date' name='end_date' type='date' value='{html.escape(end_date)}' max='{maximum_filter_date}' required></div>
             <button class='secondary' type='submit'>Apply range</button></form></div>
-            <div class='grid activity-grid'><div class='metric'>Fetched MRs in {html.escape(filter_label)}<strong>{fetched_mrs}</strong></div><div class='metric'>Visible repositories<strong>{len(projects)}</strong></div><div class='metric'>Findings<strong>{len(findings)}</strong></div></div>
-            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div></section>
+            <div class='grid activity-grid'><div class='metric'>Fetched MRs in {html.escape(filter_label)}<strong>{fetched_mrs}</strong></div><div class='metric'>Visible repositories<strong>{total_repositories}</strong></div><div class='metric'>Findings<strong>{len(findings)}</strong></div></div>
+            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div>{repository_pagination}</section>
             <section class='card'><h2>Review status</h2><div class='grid'>
             <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
             <div class='metric'>Completed<strong>{counts.get('completed', 0)}</strong></div>

@@ -301,6 +301,11 @@ The dashboard combines visible repositories and fetched-MR activity in one
   those MRs; and
 - the latest MR creation date and time in that period.
 
+The table displays 10 repositories per page. A page-number selector and
+Previous/Next controls move between pages while preserving the active rolling
+period or custom UTC date range. Dashboard totals continue to cover all visible
+repositories, not only the current page.
+
 Click a non-zero MR count to open that repository's filtered MR list and its
 available security reports.
 

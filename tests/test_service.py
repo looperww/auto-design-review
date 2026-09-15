@@ -43,6 +43,7 @@ from security_review.web import (  # noqa: E402
     collect_security_findings,
     decrypt_credentials,
     encrypt_credentials,
+    paginate_repositories,
     parse_security_findings,
     password_record,
     validated_credentials,
@@ -666,6 +667,22 @@ class DiscoveryInventoryTests(unittest.TestCase):
             self.assertEqual(store.mr_activity("week")[0], 2)
             self.assertEqual(store.mr_activity("month")[0], 3)
             state.close()
+
+    def test_repository_pagination_uses_ten_rows_and_clamps_page_number(self):
+        repositories = list(range(23))
+        first, first_page, page_count = paginate_repositories(repositories, "1")
+        second, second_page, _ = paginate_repositories(repositories, "2")
+        last, last_page, _ = paginate_repositories(repositories, "99")
+        invalid, invalid_page, _ = paginate_repositories(repositories, "invalid")
+
+        self.assertEqual(first, list(range(10)))
+        self.assertEqual(second, list(range(10, 20)))
+        self.assertEqual(last, list(range(20, 23)))
+        self.assertEqual((first_page, second_page, last_page), (1, 2, 3))
+        self.assertEqual(page_count, 3)
+        self.assertEqual(invalid, first)
+        self.assertEqual(invalid_page, 1)
+        self.assertEqual(paginate_repositories([], "1"), ([], 1, 1))
 
 
 class WebAuthenticationTests(unittest.TestCase):
