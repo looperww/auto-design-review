@@ -240,11 +240,15 @@ host interface permitted by the firewall. Do not expose this port directly to
 the internet. An SSH tunnel remains an option if direct network access is later
 disabled.
 
-The authenticated console uses a responsive sidebar with three primary pages:
+The authenticated console uses a responsive sidebar with four primary pages:
 
 - **Dashboard** is the main operational view. It shows review outcomes and the
-  prioritized security-finding queue. A compact green/red indicator beneath
-  the page title shows the latest GitLab connection status.
+  Critical and High security-finding queue. A compact green/red indicator
+  beneath the page title shows the latest GitLab connection status.
+- **Completed MRs** lists the latest completed review for every MR, including
+  SAFE reviews with no findings. Results can be filtered by severity, and each
+  row expands to show the reviewed diff, review summary, severity rationale,
+  and finding evidence.
 - **Repositories** provides a focused inventory of repository coverage,
   per-repository access status, MR activity, finding totals, date filters, and
   pagination. Overall GitLab health remains in the compact Dashboard header.
@@ -290,10 +294,12 @@ used to validate GitLab access.
 
 ## Read the reports
 
-Reports can be opened from the authenticated web console. The Markdown report
-and its metadata are stored directly in SQLite with the MR identity, commit,
-selected context files, prompt size, provider, model, token usage when returned,
-and Anthropic duration and estimated cost when returned.
+Reports can be opened from the authenticated web console. The Markdown report,
+bounded reviewed diff, and metadata are stored directly in SQLite with the MR
+identity, commit, selected context files, prompt size, provider, model, token
+usage when returned, and Anthropic duration and estimated cost when returned.
+Reviews created before diff retention was introduced remain visible, but their
+expanded view explains that the historical diff is unavailable.
 Report records never contain either token; API credentials exist in a separate
 SQLite table only as authenticated ciphertext.
 
@@ -314,17 +320,22 @@ The Repositories page combines visible repositories and fetched-MR activity in o
 
 The table displays 10 repositories per page. A page-number selector and
 Previous/Next controls move between pages while preserving the active rolling
-period or custom UTC date range. Dashboard totals continue to cover all visible
+period or custom UTC date range. Repository totals continue to cover all visible
 repositories, not only the current page.
 
 Click a non-zero MR count to open that repository's filtered MR list and its
 available security reports.
 
-The Dashboard **Security findings** section lists all parsed findings for the active period,
-ordered Critical, High, Medium, then Low. Each row shows the finding title, a
-direct link to the corresponding GitLab MR, and an expandable vulnerability
-details panel. A report containing the required `No high-confidence security
-findings.` result adds no finding rows.
+The Dashboard **High-severity findings** section lists only Critical and High
+findings for the active period. Each row shows the finding title, a direct link
+to the corresponding GitLab MR, and an expandable vulnerability details panel.
+
+The Completed MRs table uses the same **Severity**, **Finding title**, **MR**,
+and **Vulnerability details** columns. It includes Critical, High, Medium, Low,
+and SAFE results and displays 20 rows per page. Clicking a result row expands a
+full-width evidence panel. SAFE means the evidence-bounded review established
+no high-confidence vulnerability; it is not a guarantee that the repository is
+vulnerability-free.
 
 On both Dashboard and Repositories, Day, Week, and Month select rolling windows
 of 24 hours, 7 days, and 30 days. The administrator can also select an inclusive

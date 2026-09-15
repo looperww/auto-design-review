@@ -68,14 +68,22 @@ Assign severity by plausible business impact:
 Return concise Markdown with these sections:
 
 1. `# Security review`
-2. `## Summary`: one or two sentences.
+2. `## Summary`: one or two sentences describing what changed and the security
+   conclusion. When there are no findings, identify the relevant validation,
+   authorization, encoding, or other safeguards that prevented a credible
+   attacker-controlled path to a sensitive sink.
 3. `## Findings`: begin every finding with exactly
    `### [SEVERITY] Short title`, where `SEVERITY` is `CRITICAL`, `HIGH`,
    `MEDIUM`, or `LOW`. Then give file and line reference, changed behaviour,
    credible exploitation path, business impact, and a specific remediation.
 4. If there are no evidence-backed findings, write under `## Findings` exactly:
    `No high-confidence security findings.`
-5. If GitLab reports that any diff is incomplete, do not declare the review
+5. `## Overall severity rationale`: explain why the highest assigned severity is
+   appropriate. If there are no findings, explain why the reviewed change is
+   classified as `SAFE`, including the concrete safeguards or data-flow evidence
+   considered. State that this is an evidence-bounded review, not a guarantee
+   that the repository is vulnerability-free.
+6. If GitLab reports that any diff is incomplete, do not declare the review
    clean; state that manual review is required.
 
 ## Non-negotiable boundaries

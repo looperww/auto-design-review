@@ -49,8 +49,41 @@ FINDING_HEADING_PATTERN = re.compile(
 )
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 REPOSITORIES_PER_PAGE = 10
+COMPLETED_ROWS_PER_PAGE = 20
+COMPLETED_SEVERITIES = {"all", "critical", "high", "medium", "low", "safe"}
+SEVERITY_EXPLANATIONS = {
+    "CRITICAL": "Critical indicates a credible path to broad compromise of sensitive systems, users, or company data.",
+    "HIGH": "High indicates a credible path to meaningful unauthorized access, sensitive-data exposure, or code execution.",
+    "MEDIUM": "Medium indicates a material but limited risk, or a risk that requires important preconditions.",
+    "LOW": "Low indicates a defensible security weakness with limited plausible impact.",
+    "SAFE": (
+        "Safe means this review established no evidence-backed vulnerability in the changed code and supplied context. "
+        "No credible attacker-controlled path to a sensitive sink was identified; this is not a guarantee that the repository is vulnerability-free."
+    ),
+}
 VAULT_ASSOCIATED_DATA = b"gitlab-security-review-vault-v1"
 APP_JAVASCRIPT = b"""(() => {
+  for (const row of document.querySelectorAll('.expandable-row')) {
+    const details = document.getElementById(row.dataset.detailsId || '');
+    const button = row.querySelector('.row-toggle');
+    if (!details) continue;
+    const setExpanded = (expanded) => {
+      details.hidden = !expanded;
+      row.setAttribute('aria-expanded', String(expanded));
+      if (button) button.textContent = expanded ? 'Hide review' : 'View review';
+    };
+    const toggle = () => setExpanded(details.hidden);
+    row.addEventListener('click', (event) => {
+      if (event.target.closest('a, button')) return;
+      toggle();
+    });
+    row.addEventListener('keydown', (event) => {
+      if (event.target !== row || !['Enter', ' '].includes(event.key)) return;
+      event.preventDefault();
+      toggle();
+    });
+    if (button) button.addEventListener('click', toggle);
+  }
   const provider = document.getElementById('llm_provider');
   const customField = document.getElementById('custom_api_url_field');
   const customInput = document.getElementById('llm_api_url');
@@ -117,6 +150,9 @@ def parse_security_findings(report: str) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(report)
+        next_section = re.search(r"(?m)^##\s+", report[match.end() : end])
+        if next_section is not None:
+            end = match.end() + next_section.start()
         details = report[match.end() : end].strip()
         findings.append(
             {
@@ -126,6 +162,13 @@ def parse_security_findings(report: str) -> list[dict[str, str]]:
             }
         )
     return findings
+
+
+def report_section(report: str, heading: str) -> str:
+    match = re.search(
+        rf"(?ms)^##\s+{re.escape(heading)}\s*$\n?(.*?)(?=^##\s+|\Z)", report
+    )
+    return match.group(1).strip() if match else ""
 
 
 def collect_security_findings(
@@ -165,6 +208,64 @@ def collect_security_findings(
         )
     )
     return findings, counts
+
+
+def completed_review_entries(
+    reviews: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for review in reviews:
+        report = str(review["report_content"] or "")
+        summary = report_section(report, "Summary") or "Security review completed."
+        overall_rationale = report_section(report, "Overall severity rationale")
+        findings = parse_security_findings(report)
+        project_url = str(review["project_web_url"] or "")
+        parsed_url = urllib.parse.urlparse(project_url)
+        mr_iid = int(review["mr_iid"])
+        mr_url = (
+            project_url.rstrip("/") + f"/-/merge_requests/{mr_iid}"
+            if parsed_url.scheme == "https" and parsed_url.netloc
+            else ""
+        )
+        base = {
+            "project_id": int(review["project_id"]),
+            "project_path": str(review["project_path"]),
+            "mr_iid": mr_iid,
+            "mr_url": mr_url,
+            "head_sha": str(review["head_sha"]),
+            "summary": summary,
+            "diff_content": str(review["diff_content"] or ""),
+            "reviewed_at": str(review["reviewed_at"]),
+        }
+        if not findings:
+            entries.append(
+                {
+                    **base,
+                    "severity": "SAFE",
+                    "title": "No evidence-backed findings",
+                    "finding_details": (
+                        "The review found no high-confidence security finding in the supplied change and bounded repository context."
+                    ),
+                    "severity_explanation": overall_rationale
+                    or SEVERITY_EXPLANATIONS["SAFE"],
+                }
+            )
+            continue
+        for finding in findings:
+            severity = str(finding["severity"])
+            explanation = SEVERITY_EXPLANATIONS[severity]
+            if overall_rationale:
+                explanation += "\n\nOverall review rationale:\n" + overall_rationale
+            entries.append(
+                {
+                    **base,
+                    "severity": severity,
+                    "title": str(finding["title"]),
+                    "finding_details": str(finding["details"]),
+                    "severity_explanation": explanation,
+                }
+            )
+    return entries
 
 
 def paginate_repositories(
@@ -516,6 +617,7 @@ class WebStore:
                     status TEXT NOT NULL,
                     report_path TEXT,
                     report_content TEXT,
+                    diff_content TEXT,
                     metadata_json TEXT,
                     discovered_at TEXT NOT NULL,
                     mr_created_at TEXT NOT NULL,
@@ -529,6 +631,8 @@ class WebStore:
             }
             if "report_content" not in review_columns:
                 connection.execute("ALTER TABLE reviews ADD COLUMN report_content TEXT")
+            if "diff_content" not in review_columns:
+                connection.execute("ALTER TABLE reviews ADD COLUMN diff_content TEXT")
             if "metadata_json" not in review_columns:
                 connection.execute("ALTER TABLE reviews ADD COLUMN metadata_json TEXT")
             if "discovered_at" not in review_columns:
@@ -962,6 +1066,36 @@ class WebStore:
                 (start.isoformat(), end.isoformat()),
             ).fetchall()
 
+    def completed_reviews(self) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                WITH ranked AS (
+                    SELECT reviews.project_id, reviews.project_path,
+                           reviews.mr_iid, reviews.head_sha, reviews.status,
+                           reviews.report_content, reviews.diff_content,
+                           reviews.metadata_json, reviews.reviewed_at,
+                           projects.web_url AS project_web_url,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY reviews.project_id, reviews.mr_iid
+                               ORDER BY reviews.reviewed_at DESC
+                           ) AS revision_rank
+                    FROM reviews
+                    LEFT JOIN visible_projects AS projects
+                      ON projects.project_id = reviews.project_id
+                    WHERE reviews.status IN ('completed', 'high_severity')
+                      AND reviews.report_content IS NOT NULL
+                      AND reviews.report_content != ''
+                )
+                SELECT project_id, project_path, mr_iid, head_sha, status,
+                       report_content, diff_content, metadata_json, reviewed_at,
+                       project_web_url
+                FROM ranked
+                WHERE revision_rank = 1
+                ORDER BY reviewed_at DESC, project_path COLLATE NOCASE, mr_iid DESC
+                """
+            ).fetchall()
+
     def mr_activity(self, period: str) -> tuple[int, list[sqlite3.Row]]:
         durations = {
             "day": timedelta(days=1),
@@ -1006,9 +1140,10 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#172033;--muted:#667085;--line:#e3e8ef;--blue:#2563eb;--blue-dark:#1746a2;--blue-soft:#edf4ff;--bg:#f5f7fb;--card:#fff;--sidebar:#111827;--sidebar-muted:#a8b3c5;--red:#b42318;--red-soft:#fff1f0;--green:#16803c;--green-soft:#ebf8ef;--amber:#9a6700;--amber-soft:#fff7df;--shadow:0 12px 32px rgba(17,24,39,.06)}
 *{box-sizing:border-box}html{min-height:100%}body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45}a{color:var(--blue);text-underline-offset:2px}.public-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}.app-shell{display:grid;grid-template-columns:252px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;background:var(--sidebar);color:#fff;padding:24px 16px 18px;display:flex;flex-direction:column}.brand{display:flex;align-items:center;gap:12px;color:#fff;text-decoration:none;padding:0 10px 24px;border-bottom:1px solid rgba(255,255,255,.1)}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:linear-gradient(145deg,#3b82f6,#1d4ed8);font-size:13px;font-weight:850;letter-spacing:.04em;box-shadow:0 8px 18px rgba(37,99,235,.3)}.brand strong{display:block;font-size:15px}.brand small{display:block;color:var(--sidebar-muted);font-size:11px;margin-top:1px}.side-nav{display:grid;gap:6px;padding:22px 0}.side-nav a{display:flex;align-items:center;gap:12px;padding:11px 12px;border-radius:9px;color:var(--sidebar-muted);font-weight:650;text-decoration:none}.side-nav a:hover{background:rgba(255,255,255,.07);color:#fff}.side-nav a[aria-current=page]{background:#243c66;color:#fff;box-shadow:inset 3px 0 #60a5fa}.nav-icon{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:rgba(255,255,255,.08);font-size:11px;font-weight:800}.sidebar-footer{margin-top:auto;border-top:1px solid rgba(255,255,255,.1);padding:18px 10px 0}.service-state{display:flex;align-items:flex-start;gap:9px;color:var(--sidebar-muted);font-size:12px;line-height:1.35;margin-bottom:17px}.service-dot{width:9px;height:9px;margin-top:3px;border-radius:50%;background:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.14);flex:0 0 auto}.service-dot.completed{background:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.14)}.service-dot.failed{background:#f87171;box-shadow:0 0 0 3px rgba(248,113,113,.14)}.user-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}.user-avatar{display:grid;place-items:center;width:32px;height:32px;border-radius:50%;background:#334155;color:#fff;font-size:12px;font-weight:800}.user-row span{font-size:13px;overflow:hidden;text-overflow:ellipsis}.signout{width:100%;background:transparent;border:1px solid rgba(255,255,255,.16);color:#d9e1ec;padding:9px 12px}.signout:hover{background:rgba(255,255,255,.07)}.app-main{min-width:0;padding:34px clamp(24px,4vw,56px) 72px}.content{width:100%;max-width:1440px;margin:0 auto}.page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:28px}.eyebrow{color:var(--blue);font-size:12px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;margin:0 0 7px}.page-header h1{font-size:32px;line-height:1.15;margin:0;letter-spacing:-.025em}.page-header .sub{max-width:720px}.connection-status{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:14px;margin:9px 0 0}.connection-dot{width:9px;height:9px;border-radius:50%;background:var(--red);box-shadow:0 0 0 3px rgba(180,35,24,.1);flex:0 0 auto}.connection-dot.up{background:var(--green);box-shadow:0 0 0 3px rgba(22,128,60,.12)}.header-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}h1{font-size:31px;margin:0}h2{font-size:20px;margin:0 0 8px;letter-spacing:-.01em}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px}.sub{color:var(--muted);margin:6px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:var(--shadow);margin-bottom:22px}.danger-zone{border-color:#f2b8b3}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{position:relative;padding:19px 20px;border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,#fff,#fbfcfe);color:var(--muted);font-size:13px;font-weight:650}.metric strong{display:block;color:var(--ink);font-size:29px;line-height:1.2;margin-top:7px;letter-spacing:-.03em}.metric.critical{border-color:#f2b8b3;background:linear-gradient(180deg,#fff,var(--red-soft))}.metric.success{border-color:#b9dfc4;background:linear-gradient(180deg,#fff,var(--green-soft))}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus,button:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid #bed4ff;outline-offset:2px;border-color:var(--blue)}[hidden]{display:none!important}button,.button{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:10px 15px;cursor:pointer;text-decoration:none;font:inherit}.button:hover,button:hover{filter:brightness(.97)}.secondary{background:var(--blue-soft);color:var(--blue-dark)}.danger{background:var(--red)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:20px;padding:16px;background:#f8fafc;border:1px solid var(--line);border-radius:12px}.filter-bar .actions{margin-top:0}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.pagination{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:18px}.pagination .actions{margin-top:0}.page-selector{display:flex;align-items:center;gap:8px}.page-selector label{font-weight:700}.page-selector select{padding:10px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.notice,.error{padding:13px 15px;border-radius:10px;margin-bottom:18px;border:1px solid transparent}.notice{background:var(--green-soft);border-color:#c9e8d2;color:#116329}.error{background:var(--red-soft);border-color:#f5c7c3;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:13px 11px;border-bottom:1px solid var(--line);vertical-align:top}tbody tr:hover{background:#f8faff}tbody tr:last-child td{border-bottom:0}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.065em;white-space:nowrap}.status{font-weight:750}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:850;letter-spacing:.035em}.severity-critical,.severity-high{background:var(--red-soft);color:var(--red)}.severity-medium{background:var(--amber-soft);color:var(--amber)}.severity-low{background:var(--blue-soft);color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}.empty-state{text-align:center;color:var(--muted);padding:34px!important}.table-wrap{overflow:auto}.muted-link{color:var(--muted)}
+.severity-safe{background:var(--green-soft);color:var(--green)}.severity-filter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}.severity-filter .button{padding:8px 12px}.expandable-row{cursor:pointer}.expandable-row:focus{outline:3px solid #bed4ff;outline-offset:-3px}.row-toggle{padding:7px 10px;font-size:13px;white-space:nowrap}.expanded-review td{padding:0 11px 18px;background:#f8fafc}.review-details{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px}.review-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}.review-section{border:1px solid var(--line);border-radius:10px;padding:16px}.review-section h3{font-size:14px;margin:0 0 8px}.review-copy{white-space:pre-wrap;margin:0;color:var(--ink)}.diff-view{max-height:520px;overflow:auto;margin:8px 0 0;font-size:12px}.historical-note{color:var(--muted);font-style:italic}.review-meta{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-top:14px}
 .grid+.table-wrap{margin-top:22px}
 @media(max-width:900px){.app-shell{grid-template-columns:1fr}.sidebar{position:relative;height:auto;padding:14px 18px}.brand{padding:0 4px 14px}.side-nav{display:flex;overflow:auto;padding:12px 0 0}.side-nav a{white-space:nowrap}.sidebar-footer{display:flex;align-items:center;gap:14px;margin:12px 0 0;padding:12px 4px 0}.service-state{margin:0;margin-right:auto}.user-row{margin:0}.signout{width:auto}.app-main{padding:26px 20px 56px}.page-header{margin-bottom:22px}}
-@media(max-width:680px){.grid,.form-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination,.page-header,.section-heading{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}.page-header h1{font-size:28px}.app-main{padding:22px 14px 48px}.card{padding:18px}.sidebar-footer{align-items:stretch;flex-wrap:wrap}.service-state{width:100%}.table-wrap{overflow:auto}}
+@media(max-width:680px){.grid,.form-grid,.review-detail-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination,.page-header,.section-heading{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}.page-header h1{font-size:28px}.app-main{padding:22px 14px 48px}.card{padding:18px}.sidebar-footer{align-items:stretch;flex-wrap:wrap}.service-state{width:100%}.table-wrap{overflow:auto}}
 """
 
 
@@ -1041,6 +1176,7 @@ def application_page(
     navigation_items = []
     for key, href, icon, label in (
         ("dashboard", "/", "D", "Dashboard"),
+        ("completed", "/completed", "C", "Completed MRs"),
         ("repositories", "/repositories", "R", "Repositories"),
         ("settings", "/settings", "S", "Settings"),
     ):
@@ -1261,6 +1397,8 @@ def handler_factory(
                 self.show_settings(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/repositories":
                 self.show_repositories(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/completed":
+                self.show_completed(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/report":
                 self.show_report(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/repository":
@@ -1678,7 +1816,7 @@ def handler_factory(
                     "</details></td></tr>"
                 )
             return "".join(rows) or (
-                "<tr><td class='empty-state' colspan='4'>No security findings in this period.</td></tr>"
+                "<tr><td class='empty-state' colspan='4'>No Critical or High security findings in this period.</td></tr>"
             )
 
         def vault_notice(self) -> str:
@@ -1724,6 +1862,11 @@ def handler_factory(
                     context["activity_start"], context["activity_end"]
                 )
             )
+            findings = [
+                finding
+                for finding in findings
+                if str(finding["severity"]) in {"CRITICAL", "HIGH"}
+            ]
             date_notice = (
                 f"<p class='error'>{html.escape(str(context['date_error']))}</p>"
                 if context["date_error"]
@@ -1739,7 +1882,7 @@ def handler_factory(
               <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
               <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div>
             </div></section>
-            <section class='card'><div class='section-heading'><div><h2>Security findings</h2><p class='sub'>Latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}; ordered from Critical to Low.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
+            <section class='card'><div class='section-heading'><div><h2>High-severity findings</h2><p class='sub'>Critical and High findings from the latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
             {self.filter_controls(context, '/')}
             <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th></tr></thead><tbody>{self.findings_rows(findings)}</tbody></table></div></section>"""
             connection_status = self.gitlab_connection_status()
@@ -1752,6 +1895,137 @@ def handler_factory(
                 "dashboard",
                 "<a class='button secondary' href='/repositories'>View repositories</a>",
                 connection_status,
+            )
+
+        def show_completed(self, query: dict[str, list[str]]) -> None:
+            if store.user_count() == 0:
+                self.redirect("/setup")
+                return
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            reviews = store.completed_reviews()
+            entries = completed_review_entries(reviews)
+            selected_severity = query.get("severity", ["all"])[0].lower()
+            if selected_severity not in COMPLETED_SEVERITIES:
+                selected_severity = "all"
+            filtered_entries = (
+                entries
+                if selected_severity == "all"
+                else [
+                    entry
+                    for entry in entries
+                    if str(entry["severity"]).lower() == selected_severity
+                ]
+            )
+            try:
+                requested_page = int(query.get("page", ["1"])[0])
+            except ValueError:
+                requested_page = 1
+            page_count = max(
+                1,
+                (len(filtered_entries) + COMPLETED_ROWS_PER_PAGE - 1)
+                // COMPLETED_ROWS_PER_PAGE,
+            )
+            page_number = min(max(requested_page, 1), page_count)
+            start = (page_number - 1) * COMPLETED_ROWS_PER_PAGE
+            page_entries = filtered_entries[start : start + COMPLETED_ROWS_PER_PAGE]
+            severity_counts = {
+                severity: sum(
+                    1
+                    for entry in entries
+                    if str(entry["severity"]).lower() == severity
+                )
+                for severity in ("critical", "high", "medium", "low", "safe")
+            }
+            filter_links = "".join(
+                f"<a class='button {'primary' if value == selected_severity else 'secondary'}' "
+                f"href='/completed?severity={value}'>{label} ({len(entries) if value == 'all' else severity_counts[value]})</a>"
+                for value, label in (
+                    ("all", "All"),
+                    ("critical", "Critical"),
+                    ("high", "High"),
+                    ("medium", "Medium"),
+                    ("low", "Low"),
+                    ("safe", "Safe"),
+                )
+            )
+            rows = []
+            for index, entry in enumerate(page_entries, start=start):
+                severity = str(entry["severity"])
+                detail_id = f"completed-review-{index}"
+                mr_label = (
+                    f"{html.escape(str(entry['project_path']))} !{int(entry['mr_iid'])}"
+                )
+                mr_url = str(entry["mr_url"])
+                mr_display = (
+                    f"<a href='{html.escape(mr_url)}' target='_blank' rel='noopener noreferrer'>{mr_label}</a>"
+                    if mr_url
+                    else mr_label
+                )
+                diff_content = str(entry["diff_content"])
+                diff_display = (
+                    f"<pre class='diff-view'>{html.escape(diff_content)}</pre>"
+                    if diff_content
+                    else "<p class='historical-note'>The reviewed diff was not retained for this historical record. New reviews store the bounded diff automatically.</p>"
+                )
+                report_query = urllib.parse.urlencode(
+                    {
+                        "project_id": int(entry["project_id"]),
+                        "mr_iid": int(entry["mr_iid"]),
+                        "sha": str(entry["head_sha"]),
+                    }
+                )
+                evidence_heading = "Review result" if severity == "SAFE" else "Finding evidence"
+                reviewed_at = str(entry["reviewed_at"])[:19].replace("T", " ") + " UTC"
+                rows.append(
+                    f"<tr class='expandable-row' data-details-id='{detail_id}' tabindex='0' role='button' aria-expanded='false'>"
+                    f"<td><span class='severity severity-{severity.lower()}'>{html.escape(severity)}</span></td>"
+                    f"<td>{html.escape(str(entry['title']))}</td><td>{mr_display}</td>"
+                    "<td><button class='row-toggle secondary' type='button'>View review</button></td></tr>"
+                    f"<tr class='expanded-review' id='{detail_id}' hidden><td colspan='4'><div class='review-details'>"
+                    "<div class='review-detail-grid'>"
+                    f"<section class='review-section'><h3>Review summary</h3><p class='review-copy'>{html.escape(str(entry['summary']))}</p></section>"
+                    f"<section class='review-section'><h3>Severity explanation</h3><p class='review-copy'>{html.escape(str(entry['severity_explanation']))}</p></section>"
+                    f"</div><section class='review-section'><h3>{evidence_heading}</h3><p class='review-copy'>{html.escape(str(entry['finding_details']))}</p></section>"
+                    f"<section class='review-section'><h3>Reviewed code diff</h3>{diff_display}</section>"
+                    f"<div class='review-meta'><span class='sub'>Reviewed {html.escape(reviewed_at)} · Commit <code>{html.escape(str(entry['head_sha'])[:12])}</code></span>"
+                    f"<a class='button secondary' href='/report?{report_query}'>Open full report</a></div>"
+                    "</div></td></tr>"
+                )
+            table_rows = "".join(rows) or (
+                "<tr><td class='empty-state' colspan='4'>No completed reviews match this severity.</td></tr>"
+            )
+            previous_page = (
+                f"<a class='button secondary' href='/completed?severity={selected_severity}&page={page_number - 1}'>Previous</a>"
+                if page_number > 1
+                else ""
+            )
+            next_page = (
+                f"<a class='button secondary' href='/completed?severity={selected_severity}&page={page_number + 1}'>Next</a>"
+                if page_number < page_count
+                else ""
+            )
+            if filtered_entries:
+                first = start + 1
+                last = min(start + COMPLETED_ROWS_PER_PAGE, len(filtered_entries))
+                result_range = f"Showing {first}–{last} of {len(filtered_entries)} review result(s)"
+            else:
+                result_range = "No review results to display"
+            pagination = f"<div class='pagination'><p class='sub'>{result_range}</p><div class='actions'>{previous_page}<span>Page {page_number} of {page_count}</span>{next_page}</div></div>"
+            body = f"""
+            <section class='card'><div class='section-heading'><div><h2>Completed review results</h2><p class='sub'>Latest completed revision of every reviewed MR, including reviews with no findings. Select a row to inspect the evidence.</p></div><span class='severity severity-safe'>{len(reviews)} MRs</span></div>
+            <nav class='severity-filter' aria-label='Filter completed reviews by severity'>{filter_links}</nav>
+            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>
+            <script src='/app.js' defer></script>"""
+            self.application_response(
+                "Completed MRs",
+                "Completed MRs",
+                "Review every completed merge-request assessment and its retained evidence.",
+                body,
+                user,
+                "completed",
             )
 
         def show_repositories(self, query: dict[str, list[str]]) -> None:

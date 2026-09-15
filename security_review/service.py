@@ -628,6 +628,7 @@ class ReviewState:
                 status TEXT NOT NULL,
                 report_path TEXT,
                 report_content TEXT,
+                diff_content TEXT,
                 metadata_json TEXT,
                 discovered_at TEXT NOT NULL,
                 mr_created_at TEXT NOT NULL,
@@ -641,6 +642,8 @@ class ReviewState:
         }
         if "report_content" not in review_columns:
             self.connection.execute("ALTER TABLE reviews ADD COLUMN report_content TEXT")
+        if "diff_content" not in review_columns:
+            self.connection.execute("ALTER TABLE reviews ADD COLUMN diff_content TEXT")
         if "metadata_json" not in review_columns:
             self.connection.execute("ALTER TABLE reviews ADD COLUMN metadata_json TEXT")
         if "discovered_at" not in review_columns:
@@ -740,6 +743,7 @@ class ReviewState:
         status: str,
         report_path: str = "",
         report_content: str = "",
+        diff_content: str = "",
         metadata_json: str = "",
     ) -> None:
         reviewed_at = utc_now()
@@ -747,13 +751,15 @@ class ReviewState:
             """
             INSERT INTO reviews
                 (project_id, mr_iid, head_sha, project_path, status, report_path,
-                 report_content, metadata_json, discovered_at, mr_created_at, reviewed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 report_content, diff_content, metadata_json, discovered_at,
+                 mr_created_at, reviewed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, mr_iid, head_sha) DO UPDATE SET
                 project_path = excluded.project_path,
                 status = excluded.status,
                 report_path = excluded.report_path,
                 report_content = excluded.report_content,
+                diff_content = excluded.diff_content,
                 metadata_json = excluded.metadata_json,
                 mr_created_at = excluded.mr_created_at,
                 reviewed_at = excluded.reviewed_at
@@ -766,6 +772,7 @@ class ReviewState:
                 status,
                 report_path,
                 report_content,
+                diff_content,
                 metadata_json,
                 reviewed_at,
                 target.created_at or reviewed_at,
@@ -1563,6 +1570,7 @@ def review_target(
             target,
             status,
             report_content=report.rstrip() + "\n",
+            diff_content=rendered_diffs,
             metadata_json=json.dumps(metadata, sort_keys=True),
         )
         return status

@@ -47,11 +47,13 @@ from security_review.web import (  # noqa: E402
     WebStore,
     application_page,
     collect_security_findings,
+    completed_review_entries,
     decrypt_credentials,
     encrypt_credentials,
     paginate_repositories,
     parse_security_findings,
     password_record,
+    report_section,
     handler_factory,
     validated_credentials,
     verify_password,
@@ -404,13 +406,15 @@ class StateTests(unittest.TestCase):
                 target,
                 "completed",
                 report_content="# Security review\n",
+                diff_content="## Changed file: app.py\n\n```diff\n+secure = True\n```",
                 metadata_json='{"status":"completed"}',
             )
             self.assertTrue(state.has(target))
             stored = state.connection.execute(
-                "SELECT report_content, metadata_json FROM reviews"
+                "SELECT report_content, diff_content, metadata_json FROM reviews"
             ).fetchone()
             self.assertEqual(stored[0], "# Security review\n")
+            self.assertIn("+secure = True", stored[1])
             state.close()
 
     def test_new_head_sha_is_a_new_review(self):
@@ -597,6 +601,55 @@ class DiscoveryInventoryTests(unittest.TestCase):
             [],
         )
 
+    def test_completed_entries_include_findings_and_safe_reviews(self):
+        reviews = [
+            {
+                "project_id": 1,
+                "project_path": "company/risky",
+                "project_web_url": "https://gitlab.example.com/company/risky",
+                "mr_iid": 7,
+                "head_sha": "risk-sha",
+                "reviewed_at": "2026-09-15T12:00:00+00:00",
+                "diff_content": "+dangerous_call(user_input)",
+                "report_content": (
+                    "# Security review\n\n## Summary\nA changed route passes user input to a shell.\n\n"
+                    "## Findings\n### [HIGH] Command injection\nFile: app.py:9\nUser input reaches the shell.\n\n"
+                    "## Overall severity rationale\nThe path enables remote command execution."
+                ),
+            },
+            {
+                "project_id": 2,
+                "project_path": "company/safe",
+                "project_web_url": "https://gitlab.example.com/company/safe",
+                "mr_iid": 8,
+                "head_sha": "safe-sha",
+                "reviewed_at": "2026-09-15T13:00:00+00:00",
+                "diff_content": "+query(parameterized_sql, user_id)",
+                "report_content": (
+                    "# Security review\n\n## Summary\nThe query remains parameterized.\n\n"
+                    "## Findings\nNo high-confidence security findings.\n\n"
+                    "## Overall severity rationale\nUser input remains data rather than executable SQL."
+                ),
+            },
+        ]
+
+        entries = completed_review_entries(reviews)
+
+        self.assertEqual([entry["severity"] for entry in entries], ["HIGH", "SAFE"])
+        self.assertEqual(entries[0]["title"], "Command injection")
+        self.assertIn("remote command execution", entries[0]["severity_explanation"])
+        self.assertEqual(entries[1]["title"], "No evidence-backed findings")
+        self.assertIn("parameterized", entries[1]["summary"])
+        self.assertIn("executable SQL", entries[1]["severity_explanation"])
+        self.assertEqual(
+            report_section(reviews[0]["report_content"], "Summary"),
+            "A changed route passes user input to a shell.",
+        )
+        self.assertNotIn(
+            "Overall severity rationale",
+            parse_security_findings(reviews[0]["report_content"])[0]["details"],
+        )
+
     def test_repository_activity_uses_mr_dates_and_project_health(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "state.sqlite3"
@@ -745,6 +798,67 @@ class WebAuthenticationTests(unittest.TestCase):
             session_token, _ = store.create_session(user_id)
             vault = MemoryVault()
             vault.set(Credentials("https://gitlab.example.com", "test-token", ""))
+            state = ReviewState(root / "state.sqlite3")
+            state.record_visible_projects(
+                [
+                    {
+                        "id": 1,
+                        "path_with_namespace": "company/app",
+                        "web_url": "https://gitlab.example.com/company/app",
+                    }
+                ]
+            )
+            state.record(
+                ReviewTarget(
+                    1,
+                    "company/app",
+                    7,
+                    "high-sha",
+                    "https://gitlab.example.com/company/app/-/merge_requests/7",
+                ),
+                "high_severity",
+                report_content=(
+                    "# Security review\n\n## Summary\nUntrusted input reaches a shell.\n\n"
+                    "## Findings\n### [HIGH] Command injection\n"
+                    "File: app.py:8\nAn attacker can execute commands.\n\n"
+                    "## Overall severity rationale\nRemote command execution can compromise the service."
+                ),
+                diff_content="@@ -7,0 +8 @@\n+run_shell(user_input)",
+            )
+            state.record(
+                ReviewTarget(
+                    1,
+                    "company/app",
+                    8,
+                    "medium-sha",
+                    "https://gitlab.example.com/company/app/-/merge_requests/8",
+                ),
+                "completed",
+                report_content=(
+                    "# Security review\n\n## Summary\nA verbose error is returned.\n\n"
+                    "## Findings\n### [MEDIUM] Information disclosure\n"
+                    "File: api.py:12\nInternal details may be exposed.\n\n"
+                    "## Overall severity rationale\nThe data is useful but not directly exploitable."
+                ),
+                diff_content="@@ -11,0 +12 @@\n+return internal_error",
+            )
+            state.record(
+                ReviewTarget(
+                    1,
+                    "company/app",
+                    9,
+                    "safe-sha",
+                    "https://gitlab.example.com/company/app/-/merge_requests/9",
+                ),
+                "completed",
+                report_content=(
+                    "# Security review\n\n## Summary\nInput remains parameterized.\n\n"
+                    "## Findings\nNo high-confidence security findings.\n\n"
+                    "## Overall severity rationale\nThe query uses bound parameters, so input cannot alter SQL structure."
+                ),
+                diff_content="@@ -5,0 +6 @@\n+cursor.execute(query, (user_input,))",
+            )
+            state.close()
             handler = handler_factory(store, root / "reports", False, vault)
             handler.log_message = lambda *_args: None
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -761,6 +875,10 @@ class WebAuthenticationTests(unittest.TestCase):
                     urllib.request.Request(base_url + "/repositories", headers=headers)
                 ) as response:
                     repositories = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(base_url + "/completed", headers=headers)
+                ) as response:
+                    completed = response.read().decode("utf-8")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -768,6 +886,10 @@ class WebAuthenticationTests(unittest.TestCase):
 
             self.assertIn("<h1>Review dashboard</h1>", dashboard)
             self.assertIn("<h2>Review status</h2>", dashboard)
+            self.assertIn("<h2>High-severity findings</h2>", dashboard)
+            self.assertIn("Command injection", dashboard)
+            self.assertNotIn("Information disclosure", dashboard)
+            self.assertNotIn("No evidence-backed findings", dashboard)
             self.assertNotIn("<h2>Repositories and MRs</h2>", dashboard)
             self.assertNotIn("Open MR revisions are queued", dashboard)
             self.assertNotIn("<h2>GitLab connection</h2>", dashboard)
@@ -781,6 +903,23 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn(
                 "href='/repositories' aria-current='page'", repositories
             )
+            self.assertIn("<h1>Completed MRs</h1>", completed)
+            self.assertIn("<h2>Completed review results</h2>", completed)
+            self.assertIn("Command injection", completed)
+            self.assertIn("Information disclosure", completed)
+            self.assertIn("No evidence-backed findings", completed)
+            self.assertIn("Reviewed code diff", completed)
+            self.assertIn("run_shell(user_input)", completed)
+            self.assertIn("Input remains parameterized.", completed)
+            self.assertIn("The query uses bound parameters", completed)
+            self.assertIn("class='expandable-row'", completed)
+            self.assertIn("href='/completed' aria-current='page'", completed)
+            expected_columns = (
+                "<th>Severity</th><th>Finding title</th><th>MR</th>"
+                "<th>Vulnerability details</th>"
+            )
+            self.assertIn(expected_columns, dashboard)
+            self.assertIn(expected_columns, completed)
 
     def test_application_shell_has_safe_navigation_and_active_page(self):
         rendered = application_page(
@@ -798,6 +937,7 @@ class WebAuthenticationTests(unittest.TestCase):
         )
 
         self.assertIn("href='/'", rendered)
+        self.assertIn("href='/completed'", rendered)
         self.assertIn("href='/repositories' aria-current='page'", rendered)
         self.assertIn("href='/settings'", rendered)
         self.assertEqual(rendered.count("aria-current='page'"), 1)
