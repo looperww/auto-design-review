@@ -999,19 +999,72 @@ class WebStore:
 
 
 STYLE = """
-:root{color-scheme:light;--ink:#14213d;--muted:#65758b;--line:#dbe3ed;--blue:#246bfd;--bg:#f5f8fc;--card:#fff;--red:#b42318;--green:#16803c}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.danger-zone{border-color:#f4b4ae}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.danger{background:var(--red)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.pagination{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:18px}.pagination .actions{margin-top:0}.page-selector{display:flex;align-items:center;gap:8px}.page-selector label{font-weight:700}.page-selector select{padding:10px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:800}.severity-critical,.severity-high{background:#fff0ef;color:var(--red)}.severity-medium{background:#fff7df;color:#8a5700}.severity-low{background:#eaf0f8;color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
+:root{color-scheme:light;--ink:#172033;--muted:#667085;--line:#e3e8ef;--blue:#2563eb;--blue-dark:#1746a2;--blue-soft:#edf4ff;--bg:#f5f7fb;--card:#fff;--sidebar:#111827;--sidebar-muted:#a8b3c5;--red:#b42318;--red-soft:#fff1f0;--green:#16803c;--green-soft:#ebf8ef;--amber:#9a6700;--amber-soft:#fff7df;--shadow:0 12px 32px rgba(17,24,39,.06)}
+*{box-sizing:border-box}html{min-height:100%}body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45}a{color:var(--blue);text-underline-offset:2px}.public-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}.app-shell{display:grid;grid-template-columns:252px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;background:var(--sidebar);color:#fff;padding:24px 16px 18px;display:flex;flex-direction:column}.brand{display:flex;align-items:center;gap:12px;color:#fff;text-decoration:none;padding:0 10px 24px;border-bottom:1px solid rgba(255,255,255,.1)}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:linear-gradient(145deg,#3b82f6,#1d4ed8);font-size:13px;font-weight:850;letter-spacing:.04em;box-shadow:0 8px 18px rgba(37,99,235,.3)}.brand strong{display:block;font-size:15px}.brand small{display:block;color:var(--sidebar-muted);font-size:11px;margin-top:1px}.side-nav{display:grid;gap:6px;padding:22px 0}.side-nav a{display:flex;align-items:center;gap:12px;padding:11px 12px;border-radius:9px;color:var(--sidebar-muted);font-weight:650;text-decoration:none}.side-nav a:hover{background:rgba(255,255,255,.07);color:#fff}.side-nav a[aria-current=page]{background:#243c66;color:#fff;box-shadow:inset 3px 0 #60a5fa}.nav-icon{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:rgba(255,255,255,.08);font-size:11px;font-weight:800}.sidebar-footer{margin-top:auto;border-top:1px solid rgba(255,255,255,.1);padding:18px 10px 0}.service-state{display:flex;align-items:flex-start;gap:9px;color:var(--sidebar-muted);font-size:12px;line-height:1.35;margin-bottom:17px}.service-dot{width:9px;height:9px;margin-top:3px;border-radius:50%;background:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.14);flex:0 0 auto}.service-dot.completed{background:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.14)}.service-dot.failed{background:#f87171;box-shadow:0 0 0 3px rgba(248,113,113,.14)}.user-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}.user-avatar{display:grid;place-items:center;width:32px;height:32px;border-radius:50%;background:#334155;color:#fff;font-size:12px;font-weight:800}.user-row span{font-size:13px;overflow:hidden;text-overflow:ellipsis}.signout{width:100%;background:transparent;border:1px solid rgba(255,255,255,.16);color:#d9e1ec;padding:9px 12px}.signout:hover{background:rgba(255,255,255,.07)}.app-main{min-width:0;padding:34px clamp(24px,4vw,56px) 72px}.content{width:100%;max-width:1440px;margin:0 auto}.page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:28px}.eyebrow{color:var(--blue);font-size:12px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;margin:0 0 7px}.page-header h1{font-size:32px;line-height:1.15;margin:0;letter-spacing:-.025em}.page-header .sub{max-width:720px}.header-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}h1{font-size:31px;margin:0}h2{font-size:20px;margin:0 0 8px;letter-spacing:-.01em}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px}.sub{color:var(--muted);margin:6px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:var(--shadow);margin-bottom:22px}.danger-zone{border-color:#f2b8b3}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{position:relative;padding:19px 20px;border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,#fff,#fbfcfe);color:var(--muted);font-size:13px;font-weight:650}.metric strong{display:block;color:var(--ink);font-size:29px;line-height:1.2;margin-top:7px;letter-spacing:-.03em}.metric.critical{border-color:#f2b8b3;background:linear-gradient(180deg,#fff,var(--red-soft))}.metric.success{border-color:#b9dfc4;background:linear-gradient(180deg,#fff,var(--green-soft))}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus,button:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid #bed4ff;outline-offset:2px;border-color:var(--blue)}[hidden]{display:none!important}button,.button{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:10px 15px;cursor:pointer;text-decoration:none;font:inherit}.button:hover,button:hover{filter:brightness(.97)}.secondary{background:var(--blue-soft);color:var(--blue-dark)}.danger{background:var(--red)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:20px;padding:16px;background:#f8fafc;border:1px solid var(--line);border-radius:12px}.filter-bar .actions{margin-top:0}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.pagination{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:18px}.pagination .actions{margin-top:0}.page-selector{display:flex;align-items:center;gap:8px}.page-selector label{font-weight:700}.page-selector select{padding:10px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.notice,.error{padding:13px 15px;border-radius:10px;margin-bottom:18px;border:1px solid transparent}.notice{background:var(--green-soft);border-color:#c9e8d2;color:#116329}.error{background:var(--red-soft);border-color:#f5c7c3;color:var(--red)}.connection-card{padding:18px 20px}.connection-card .notice,.connection-card .error{margin:0}.connection-card .sub{margin:0}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:13px 11px;border-bottom:1px solid var(--line);vertical-align:top}tbody tr:hover{background:#f8faff}tbody tr:last-child td{border-bottom:0}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.065em;white-space:nowrap}.status{font-weight:750}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:850;letter-spacing:.035em}.severity-critical,.severity-high{background:var(--red-soft);color:var(--red)}.severity-medium{background:var(--amber-soft);color:var(--amber)}.severity-low{background:var(--blue-soft);color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}.empty-state{text-align:center;color:var(--muted);padding:34px!important}.table-wrap{overflow:auto}.muted-link{color:var(--muted)}
+.grid+.table-wrap{margin-top:22px}
+@media(max-width:900px){.app-shell{grid-template-columns:1fr}.sidebar{position:relative;height:auto;padding:14px 18px}.brand{padding:0 4px 14px}.side-nav{display:flex;overflow:auto;padding:12px 0 0}.side-nav a{white-space:nowrap}.sidebar-footer{display:flex;align-items:center;gap:14px;margin:12px 0 0;padding:12px 4px 0}.service-state{margin:0;margin-right:auto}.user-row{margin:0}.signout{width:auto}.app-main{padding:26px 20px 56px}.page-header{margin-bottom:22px}}
+@media(max-width:680px){.grid,.form-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination,.page-header,.section-heading{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}.page-header h1{font-size:28px}.app-main{padding:22px 14px 48px}.card{padding:18px}.sidebar-footer{align-items:stretch;flex-wrap:wrap}.service-state{width:100%}.table-wrap{overflow:auto}}
 """
 
 
-def page(title: str, body: str) -> str:
+def document(title: str, body: str) -> str:
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<title>{html.escape(title)} · Security Review</title><style>{STYLE}</style>"
-        f"</head><body><main>{body}</main></body></html>"
+        f"</head><body>{body}</body></html>"
     )
+
+
+def page(title: str, body: str) -> str:
+    return document(title, f"<main class='public-main'>{body}</main>")
+
+
+def application_page(
+    title: str,
+    heading: str,
+    subtitle: str,
+    body: str,
+    username: str,
+    csrf_token: str,
+    active_page: str,
+    reviewer_label: str,
+    reviewer_class: str,
+    header_actions: str = "",
+) -> str:
+    navigation_items = []
+    for key, href, icon, label in (
+        ("dashboard", "/", "D", "Dashboard"),
+        ("repositories", "/repositories", "R", "Repositories"),
+        ("settings", "/settings", "S", "Settings"),
+    ):
+        current = " aria-current='page'" if key == active_page else ""
+        navigation_items.append(
+            f"<a href='{href}'{current}>"
+            f"<span class='nav-icon' aria-hidden='true'>{icon}</span>{label}</a>"
+        )
+    navigation = "".join(navigation_items)
+    safe_username = html.escape(username)
+    safe_initial = html.escape((username[:1] or "A").upper())
+    shell = f"""
+    <div class='app-shell'>
+      <aside class='sidebar'>
+        <a class='brand' href='/' aria-label='Security Review home'>
+          <span class='brand-mark'>SR</span><span><strong>Security Review</strong><small>Automated MR assurance</small></span>
+        </a>
+        <nav class='side-nav' aria-label='Primary navigation'>{navigation}</nav>
+        <div class='sidebar-footer'>
+          <div class='service-state'><span class='service-dot {html.escape(reviewer_class)}'></span><span>{html.escape(reviewer_label)}</span></div>
+          <div class='user-row'><span class='user-avatar'>{safe_initial}</span><span title='{safe_username}'>{safe_username}</span></div>
+          <form method='post' action='/logout'><input type='hidden' name='csrf' value='{html.escape(csrf_token)}'><button class='signout' type='submit'>Sign out</button></form>
+        </div>
+      </aside>
+      <main class='app-main'><div class='content'>
+        <header class='page-header'><div><p class='eyebrow'>Security operations</p><h1>{html.escape(heading)}</h1><p class='sub'>{html.escape(subtitle)}</p></div><div class='header-actions'>{header_actions}</div></header>
+        {body}
+      </div></main>
+    </div>"""
+    return document(title, shell)
 
 
 def form_field(key: str, value: str) -> str:
@@ -1175,6 +1228,8 @@ def handler_factory(
                 self.show_login()
             elif parsed.path == "/settings":
                 self.show_settings(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/repositories":
+                self.show_repositories(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/report":
                 self.show_report(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/repository":
@@ -1477,25 +1532,62 @@ def handler_factory(
                 return
             self.send_json(200, {"models": models})
 
-        def show_dashboard(self, query: dict[str, list[str]]) -> None:
-            if store.user_count() == 0:
-                self.redirect("/setup")
-                return
-            session = self.require_session()
-            if session is None:
-                return
-            _, user = session
+        def reviewer_status(self) -> tuple[str, str]:
+            active_credentials, _ = vault.snapshot()
+            heartbeat = Path(os.environ.get("HEARTBEAT_FILE", "/data/heartbeat"))
+            try:
+                running = heartbeat.is_file() and time.time() - heartbeat.stat().st_mtime < 180
+            except OSError:
+                running = False
+            if running and active_credentials is not None:
+                return (
+                    "Reviews active"
+                    if active_credentials.llm_api_key
+                    else "GitLab discovery active",
+                    "completed",
+                )
+            if running:
+                return "Reviewer locked", "failed"
+            return "Waiting for reviewer heartbeat", "failed"
+
+        def application_response(
+            self,
+            title: str,
+            heading: str,
+            subtitle: str,
+            body: str,
+            user: sqlite3.Row,
+            active_page: str,
+            header_actions: str = "",
+        ) -> None:
+            reviewer_label, reviewer_class = self.reviewer_status()
+            self.send_page(
+                200,
+                application_page(
+                    title,
+                    heading,
+                    subtitle,
+                    body,
+                    str(user["username"]),
+                    str(user["csrf_token"]),
+                    active_page,
+                    reviewer_label,
+                    reviewer_class,
+                    header_actions,
+                ),
+            )
+
+        def activity_window(self, query: dict[str, list[str]]) -> dict[str, Any]:
             period = query.get("period", ["week"])[0]
             if period not in {"day", "week", "month"}:
                 period = "week"
             start_date = query.get("start_date", [""])[0].strip()
             end_date = query.get("end_date", [""])[0].strip()
-            period_labels = {
+            labels = {
                 "day": "last 24 hours",
                 "week": "last 7 days",
                 "month": "last 30 days",
             }
-            counts, _ = store.dashboard()
             date_error = ""
             try:
                 projects, activity_start, activity_end = store.repository_activity(
@@ -1506,14 +1598,6 @@ def handler_factory(
                 start_date = ""
                 end_date = ""
                 projects, activity_start, activity_end = store.repository_activity(period)
-            findings, finding_counts = collect_security_findings(
-                store.latest_review_reports(activity_start, activity_end)
-            )
-            fetched_mrs = sum(int(project["mr_count"]) for project in projects)
-            total_repositories = len(projects)
-            paged_projects, repository_page, repository_page_count = (
-                paginate_repositories(projects, query.get("repo_page", ["1"])[0])
-            )
             filter_label = (
                 (
                     f"{start_date} UTC"
@@ -1521,108 +1605,42 @@ def handler_factory(
                     else f"{start_date} to {end_date} UTC"
                 )
                 if start_date and end_date
-                else period_labels[period]
-            )
-            scan_status = store.scan_status()
-            active_credentials, _ = vault.snapshot()
-            heartbeat = Path(os.environ.get("HEARTBEAT_FILE", "/data/heartbeat"))
-            try:
-                running = heartbeat.is_file() and time.time() - heartbeat.stat().st_mtime < 180
-            except OSError:
-                running = False
-            if running and active_credentials is not None:
-                reviewer_label = (
-                    "Reviews active"
-                    if active_credentials.llm_api_key
-                    else "GitLab discovery active"
-                )
-                reviewer_class = "completed"
-            elif running:
-                reviewer_label = "Reviewer locked"
-                reviewer_class = "failed"
-            else:
-                reviewer_label = "Waiting for reviewer heartbeat"
-                reviewer_class = "failed"
-            message = query.get("message", [""])[0]
-            notice_text = message or date_error
-            notice_class = "error" if date_error and not message else "notice"
-            notice = (
-                f"<p class='{notice_class}'>{html.escape(notice_text)}</p>"
-                if notice_text
-                else ""
-            )
-            check_state = scan_status.get("last_gitlab_check_status", "")
-            check_time = scan_status.get("last_gitlab_check_at", "")[:19].replace("T", " ")
-            if check_state == "success":
-                try:
-                    summary = json.loads(scan_status.get("last_gitlab_check_summary", "{}"))
-                except json.JSONDecodeError:
-                    summary = {}
-                scan_panel = (
-                    "<p class='notice'><strong>GitLab connection successful.</strong> "
-                    f"Last checked {html.escape(check_time + ' UTC' if check_time else 'recently')}; "
-                    f"found {int(summary.get('discovered', 0))} open MR revision(s), "
-                    f"with {int(summary.get('pending', 0))} awaiting review.</p>"
-                )
-            elif check_state == "failed":
-                scan_panel = (
-                    "<p class='error'><strong>GitLab connection failed.</strong> "
-                    f"Last checked {html.escape(check_time + ' UTC' if check_time else 'recently')}: "
-                    f"{html.escape(scan_status.get('last_gitlab_check_error', 'Unknown error'))}</p>"
-                )
-            else:
-                scan_panel = "<p class='sub'>No GitLab connection check has completed yet.</p>"
-            deployment_time = scan_status.get("deployment_started_at", "")[:19].replace("T", " ")
-            period_links = "".join(
-                f"<a class='button {'primary' if choice == period else 'secondary'}' "
-                f"href='/?period={choice}'>{label}</a>"
-                for choice, label in (("day", "Day"), ("week", "Week"), ("month", "Month"))
+                else labels[period]
             )
             activity_query = (
                 {"start_date": start_date, "end_date": end_date}
                 if start_date and end_date
                 else {"period": period}
             )
-            page_options = "".join(
-                f"<option value='{page_number}' "
-                f"{'selected' if page_number == repository_page else ''}>"
-                f"{page_number}</option>"
-                for page_number in range(1, repository_page_count + 1)
+            return {
+                "period": period,
+                "start_date": start_date,
+                "end_date": end_date,
+                "projects": projects,
+                "activity_start": activity_start,
+                "activity_end": activity_end,
+                "filter_label": filter_label,
+                "activity_query": activity_query,
+                "date_error": date_error,
+            }
+
+        def filter_controls(self, context: dict[str, Any], action: str) -> str:
+            period = str(context["period"])
+            period_links = "".join(
+                f"<a class='button {'primary' if choice == period else 'secondary'}' "
+                f"href='{action}?period={choice}'>{label}</a>"
+                for choice, label in (("day", "Day"), ("week", "Week"), ("month", "Month"))
             )
-            page_hidden_fields = "".join(
-                f"<input type='hidden' name='{html.escape(key)}' "
-                f"value='{html.escape(value)}'>"
-                for key, value in activity_query.items()
-            )
-            previous_page = (
-                f"<a class='button secondary' href='/?{urllib.parse.urlencode({**activity_query, 'repo_page': repository_page - 1})}'>Previous</a>"
-                if repository_page > 1
-                else ""
-            )
-            next_page = (
-                f"<a class='button secondary' href='/?{urllib.parse.urlencode({**activity_query, 'repo_page': repository_page + 1})}'>Next</a>"
-                if repository_page < repository_page_count
-                else ""
-            )
-            if total_repositories:
-                first_repository = (repository_page - 1) * REPOSITORIES_PER_PAGE + 1
-                last_repository = min(
-                    repository_page * REPOSITORIES_PER_PAGE, total_repositories
-                )
-                repository_range = (
-                    f"Showing {first_repository}–{last_repository} of "
-                    f"{total_repositories} repositories"
-                )
-            else:
-                repository_range = "No repositories to display"
-            repository_pagination = f"""
-            <div class='pagination'><p class='sub'>{repository_range}</p>
-            <div class='actions'>{previous_page}<form class='page-selector' method='get' action='/'>
-            {page_hidden_fields}<label for='repo_page'>Page</label>
-            <select id='repo_page' name='repo_page'>{page_options}</select>
-            <span>of {repository_page_count}</span><button class='secondary' type='submit'>Go</button>
-            </form>{next_page}</div></div>"""
-            finding_rows = []
+            maximum_date = datetime.now(timezone.utc).date().isoformat()
+            return f"""
+            <div class='filter-bar'><div class='actions'>{period_links}</div>
+            <form class='date-filter' method='get' action='{action}'>
+            <div><label for='activity_start_date'>Start date (UTC)</label><input id='activity_start_date' name='start_date' type='date' value='{html.escape(str(context['start_date']))}' max='{maximum_date}' required></div>
+            <div><label for='activity_end_date'>End date (UTC)</label><input id='activity_end_date' name='end_date' type='date' value='{html.escape(str(context['end_date']))}' max='{maximum_date}' required></div>
+            <button class='secondary' type='submit'>Apply range</button></form></div>"""
+
+        def findings_rows(self, findings: list[dict[str, Any]]) -> str:
+            rows = []
             for finding in findings:
                 severity = str(finding["severity"])
                 mr_label = (
@@ -1635,7 +1653,7 @@ def handler_factory(
                     if mr_url
                     else mr_label
                 )
-                finding_rows.append(
+                rows.append(
                     "<tr>"
                     f"<td><span class='severity severity-{severity.lower()}'>{html.escape(severity)}</span></td>"
                     f"<td>{html.escape(str(finding['title']))}</td>"
@@ -1644,21 +1662,156 @@ def handler_factory(
                     f"<pre class='finding-details'>{html.escape(str(finding['details']))}</pre>"
                     "</details></td></tr>"
                 )
-            visible_finding_rows = "".join(finding_rows) or (
-                "<tr><td colspan='4'>No security findings in this period.</td></tr>"
+            return "".join(rows) or (
+                "<tr><td class='empty-state' colspan='4'>No security findings in this period.</td></tr>"
             )
-            project_rows = []
+
+        def vault_notice(self) -> str:
+            active_credentials, _ = vault.snapshot()
+            if active_credentials is None and store.credentials_configured():
+                return (
+                    "<p class='error'>The reviewer is locked after a restart. "
+                    "<a href='/settings'>Open Settings</a> to unlock it.</p>"
+                )
+            if active_credentials is None:
+                return (
+                    "<p class='error'>GitLab access is not configured. "
+                    "<a href='/settings'>Open Settings</a> to start MR discovery.</p>"
+                )
+            if not active_credentials.llm_api_key:
+                return (
+                    "<p class='notice'>GitLab discovery is active. Open MR revisions are queued without downloading code. "
+                    "<a href='/settings'>Add an LLM API key</a> to start reviewing the queue.</p>"
+                )
+            provider = html.escape(LLM_PROVIDER_LABELS[active_credentials.llm_provider])
+            return f"<p class='notice'>GitLab discovery and {provider} security reviews are active.</p>"
+
+        def gitlab_connection_panel(self) -> str:
+            scan_status = store.scan_status()
+            state = scan_status.get("last_gitlab_check_status", "")
+            check_time = scan_status.get("last_gitlab_check_at", "")[:19].replace("T", " ")
+            if state == "success":
+                try:
+                    summary = json.loads(scan_status.get("last_gitlab_check_summary", "{}"))
+                except json.JSONDecodeError:
+                    summary = {}
+                return (
+                    "<p class='notice'><strong>GitLab connection healthy.</strong> "
+                    f"Last checked {html.escape(check_time + ' UTC' if check_time else 'recently')}; "
+                    f"found {int(summary.get('discovered', 0))} open MR revision(s), "
+                    f"with {int(summary.get('pending', 0))} awaiting review.</p>"
+                )
+            if state == "failed":
+                return (
+                    "<p class='error'><strong>GitLab connection failed.</strong> "
+                    f"Last checked {html.escape(check_time + ' UTC' if check_time else 'recently')}: "
+                    f"{html.escape(scan_status.get('last_gitlab_check_error', 'Unknown error'))}</p>"
+                )
+            return "<p class='sub'>No GitLab connection check has completed yet.</p>"
+
+        def show_dashboard(self, query: dict[str, list[str]]) -> None:
+            if store.user_count() == 0:
+                self.redirect("/setup")
+                return
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            context = self.activity_window(query)
+            counts, _ = store.dashboard()
+            findings, _ = collect_security_findings(
+                store.latest_review_reports(
+                    context["activity_start"], context["activity_end"]
+                )
+            )
+            date_notice = (
+                f"<p class='error'>{html.escape(str(context['date_error']))}</p>"
+                if context["date_error"]
+                else ""
+            )
+            body = f"""
+            {date_notice}{self.vault_notice()}
+            <section class='card'><div class='section-heading'><div><h2>Review status</h2><p class='sub'>Current outcome across all recorded merge-request revisions.</p></div></div>
+            <div class='grid'>
+              <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
+              <div class='metric success'>Completed<strong>{counts.get('completed', 0)}</strong></div>
+              <div class='metric critical'>High severity<strong>{counts.get('high_severity', 0)}</strong></div>
+              <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
+              <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div>
+            </div></section>
+            <section class='card'><div class='section-heading'><div><h2>Security findings</h2><p class='sub'>Latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}; ordered from Critical to Low.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
+            {self.filter_controls(context, '/')}
+            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th></tr></thead><tbody>{self.findings_rows(findings)}</tbody></table></div></section>
+            <section class='card connection-card'><div class='section-heading'><div><h2>GitLab connection</h2><p class='sub'>Discovery health for the configured GitLab scope.</p></div><a class='button secondary' href='/settings'>Manage connection</a></div>{self.gitlab_connection_panel()}</section>"""
+            self.application_response(
+                "Dashboard",
+                "Review dashboard",
+                "Prioritize security findings and monitor automated review outcomes.",
+                body,
+                user,
+                "dashboard",
+                "<a class='button secondary' href='/repositories'>View repositories</a>",
+            )
+
+        def show_repositories(self, query: dict[str, list[str]]) -> None:
+            if store.user_count() == 0:
+                self.redirect("/setup")
+                return
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            context = self.activity_window(query)
+            projects = context["projects"]
+            findings, finding_counts = collect_security_findings(
+                store.latest_review_reports(
+                    context["activity_start"], context["activity_end"]
+                )
+            )
+            fetched_mrs = sum(int(project["mr_count"]) for project in projects)
+            total_repositories = len(projects)
+            paged_projects, page_number, page_count = paginate_repositories(
+                projects, query.get("repo_page", ["1"])[0]
+            )
+            activity_query = context["activity_query"]
+            page_options = "".join(
+                f"<option value='{number}' {'selected' if number == page_number else ''}>{number}</option>"
+                for number in range(1, page_count + 1)
+            )
+            hidden_fields = "".join(
+                f"<input type='hidden' name='{html.escape(str(key))}' value='{html.escape(str(value))}'>"
+                for key, value in activity_query.items()
+            )
+            previous_page = (
+                f"<a class='button secondary' href='/repositories?{urllib.parse.urlencode({**activity_query, 'repo_page': page_number - 1})}'>Previous</a>"
+                if page_number > 1
+                else ""
+            )
+            next_page = (
+                f"<a class='button secondary' href='/repositories?{urllib.parse.urlencode({**activity_query, 'repo_page': page_number + 1})}'>Next</a>"
+                if page_number < page_count
+                else ""
+            )
+            if total_repositories:
+                first = (page_number - 1) * REPOSITORIES_PER_PAGE + 1
+                last = min(page_number * REPOSITORIES_PER_PAGE, total_repositories)
+                repository_range = f"Showing {first}–{last} of {total_repositories} repositories"
+            else:
+                repository_range = "No repositories to display"
+            pagination = f"""
+            <div class='pagination'><p class='sub'>{repository_range}</p><div class='actions'>{previous_page}
+            <form class='page-selector' method='get' action='/repositories'>{hidden_fields}<label for='repo_page'>Page</label>
+            <select id='repo_page' name='repo_page'>{page_options}</select><span>of {page_count}</span><button class='secondary' type='submit'>Go</button></form>{next_page}</div></div>"""
+            rows = []
             for project in paged_projects:
                 project_path = html.escape(str(project["project_path"]))
                 raw_url = str(project["web_url"])
                 parsed_url = urllib.parse.urlparse(raw_url)
-                if parsed_url.scheme == "https" and parsed_url.netloc:
-                    project_name = (
-                        f"<a href='{html.escape(raw_url)}' target='_blank' "
-                        f"rel='noopener noreferrer'>{project_path}</a>"
-                    )
-                else:
-                    project_name = project_path
+                project_name = (
+                    f"<a href='{html.escape(raw_url)}' target='_blank' rel='noopener noreferrer'>{project_path}</a>"
+                    if parsed_url.scheme == "https" and parsed_url.netloc
+                    else project_path
+                )
                 project_status = str(project["last_check_status"])
                 if project_status not in {"up", "down"}:
                     project_status = "unknown"
@@ -1680,71 +1833,43 @@ def handler_factory(
                 detail_query = urllib.parse.urlencode(
                     {"project_id": int(project["project_id"]), **activity_query}
                 )
-                mr_count_display = (
+                mr_display = (
                     f"<a href='/repository?{detail_query}'>{mr_count}</a>"
                     if mr_count
                     else "0"
                 )
-                project_findings = finding_counts.get(int(project["project_id"]), 0)
-                project_rows.append(
+                rows.append(
                     "<tr>"
-                    f"<td>{project_name}</td>"
-                    f"<td>{int(project['project_id'])}</td>"
-                    f"<td><span class='status {html.escape(project_status)}' "
-                    f"title='{html.escape(status_title)}'>{html.escape(project_status.title())}</span></td>"
-                    f"<td>{mr_count_display}</td>"
-                    f"<td>{project_findings}</td>"
-                    f"<td>{html.escape(latest_mr)}</td>"
-                    "</tr>"
+                    f"<td>{project_name}</td><td>{int(project['project_id'])}</td>"
+                    f"<td><span class='status {html.escape(project_status)}' title='{html.escape(status_title)}'>{html.escape(project_status.title())}</span></td>"
+                    f"<td>{mr_display}</td><td>{finding_counts.get(int(project['project_id']), 0)}</td>"
+                    f"<td>{html.escape(latest_mr)}</td></tr>"
                 )
-            visible_project_rows = "".join(project_rows) or (
-                "<tr><td colspan='6'>No repositories discovered yet.</td></tr>"
+            table_rows = "".join(rows) or (
+                "<tr><td class='empty-state' colspan='6'>No repositories discovered yet.</td></tr>"
             )
-            credentials_configured = store.credentials_configured()
-            if active_credentials is None and credentials_configured:
-                vault_panel = (
-                    "<p class='error'>The reviewer is locked after a restart. "
-                    "<a href='/settings'>Open Settings</a> to unlock it.</p>"
-                )
-            elif active_credentials is None:
-                vault_panel = (
-                    "<p class='error'>GitLab access is not configured. "
-                    "<a href='/settings'>Open Settings</a> to start MR discovery.</p>"
-                )
-            elif not active_credentials.llm_api_key:
-                vault_panel = (
-                    "<p class='notice'>GitLab discovery is unlocked. Open MR revisions are queued without downloading code. "
-                    "<a href='/settings'>Add an LLM API key</a> to start reviewing the queue.</p>"
-                )
-            else:
-                provider_label = html.escape(LLM_PROVIDER_LABELS[active_credentials.llm_provider])
-                vault_panel = f"<p class='notice'>GitLab discovery and {provider_label} security reviews are unlocked.</p>"
-            maximum_filter_date = datetime.now(timezone.utc).date().isoformat()
+            scan_status = store.scan_status()
+            deployment_time = scan_status.get("deployment_started_at", "")[:19].replace("T", " ")
+            date_notice = (
+                f"<p class='error'>{html.escape(str(context['date_error']))}</p>"
+                if context["date_error"]
+                else ""
+            )
             body = f"""
-            <header><div><h1>Security Review</h1><p class='sub'>Signed in as {html.escape(str(user['username']))}</p></div>
-            <div class='top-actions'><span class='status {reviewer_class}'>{reviewer_label}</span>
-            <a class='button secondary' href='/settings'>Settings</a>
-            <form method='post' action='/logout'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><button class='secondary'>Sign out</button></form></div></header>
-            {notice}{vault_panel}<section class='card'><h2>GitLab connection</h2>{scan_panel}</section>
-            <section class='card'><h2>Repositories and MRs</h2>
-            <p class='sub'>Shows every currently visible repository and distinct MRs first discovered after this deployment ({html.escape(deployment_time + ' UTC' if deployment_time else 'initializing')}). Current filter: {html.escape(filter_label)}.</p>
-            <div class='filter-bar'><div class='actions'>{period_links}</div>
-            <form class='date-filter' method='get' action='/'>
-            <div><label for='activity_start_date'>Start date (UTC)</label><input id='activity_start_date' name='start_date' type='date' value='{html.escape(start_date)}' max='{maximum_filter_date}' required></div>
-            <div><label for='activity_end_date'>End date (UTC)</label><input id='activity_end_date' name='end_date' type='date' value='{html.escape(end_date)}' max='{maximum_filter_date}' required></div>
-            <button class='secondary' type='submit'>Apply range</button></form></div>
-            <div class='grid activity-grid'><div class='metric'>Fetched MRs in {html.escape(filter_label)}<strong>{fetched_mrs}</strong></div><div class='metric'>Visible repositories<strong>{total_repositories}</strong></div><div class='metric'>Findings<strong>{len(findings)}</strong></div></div>
-            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>ID</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div>{repository_pagination}</section>
-            <section class='card'><h2>Review status</h2><div class='grid'>
-            <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
-            <div class='metric'>Completed<strong>{counts.get('completed', 0)}</strong></div>
-            <div class='metric'>High severity<strong>{counts.get('high_severity', 0)}</strong></div>
-            <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
-            <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div></div>
-            <h2 style='margin-top:28px'>Security findings</h2>
-            <p class='sub'>Latest reviewed revision of each MR in {html.escape(filter_label)}; ordered from Critical to Low.</p>
-            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th></tr></thead><tbody>{visible_finding_rows}</tbody></table></div></section>"""
-            self.send_page(200, page("Dashboard", body))
+            {date_notice}{self.vault_notice()}
+            <section class='card connection-card'><div class='section-heading'><div><h2>GitLab connection</h2><p class='sub'>Repository discovery and access status.</p></div><a class='button secondary' href='/settings'>Manage connection</a></div>{self.gitlab_connection_panel()}</section>
+            <section class='card'><div class='section-heading'><div><h2>Repositories and MRs</h2><p class='sub'>Visible repositories and MRs first discovered after {html.escape(deployment_time + ' UTC' if deployment_time else 'initialization')}. Current filter: {html.escape(str(context['filter_label']))}.</p></div></div>
+            {self.filter_controls(context, '/repositories')}
+            <div class='grid'><div class='metric'>Visible repositories<strong>{total_repositories}</strong></div><div class='metric'>Fetched MRs<strong>{fetched_mrs}</strong></div><div class='metric'>Findings<strong>{len(findings)}</strong></div></div>
+            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>ID</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>"""
+            self.application_response(
+                "Repositories",
+                "Repositories",
+                "Monitor GitLab coverage, repository access, and merge-request activity.",
+                body,
+                user,
+                "repositories",
+            )
 
         def show_settings(self, query: dict[str, list[str]]) -> None:
             if store.user_count() == 0:
@@ -1822,9 +1947,6 @@ def handler_factory(
                 <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test LLM connection</button></div>
                 <p class='sub'>Tests do not save the entered values. The LLM test sends one minimal request using the selected provider and model and may incur a very small API charge.</p></form></section>"""
             body = f"""
-            <header><div><h1>Settings</h1><p class='sub'>Runtime controls and encrypted service credentials</p></div>
-            <div class='top-actions'><a class='button secondary' href='/'>Dashboard</a>
-            <form method='post' action='/logout'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><button class='secondary'>Sign out</button></form></div></header>
             {notice}<section class='card'><h2>Runtime settings</h2><p class='sub'>Saved in SQLite and applied automatically at the next polling cycle.</p>
             <form method='post' action='/settings'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>{fields}</div><div class='actions'><button type='submit'>Save settings</button></div></form></section>
             {credential_panel}
@@ -1835,7 +1957,14 @@ def handler_factory(
             <div class='field'><label for='reset_confirmation'>Type RESET to confirm</label><input id='reset_confirmation' name='confirmation' autocomplete='off' pattern='RESET' required></div>
             <div class='actions'><button class='danger' type='submit'>Clear repositories and MRs</button></div></form></section>
             <script src='/app.js' defer></script>"""
-            self.send_page(200, page("Settings", body))
+            self.application_response(
+                "Settings",
+                "Settings",
+                "Manage review behavior, GitLab access, and encrypted LLM credentials.",
+                body,
+                user,
+                "settings",
+            )
 
         def update_settings(self, form: dict[str, str]) -> None:
             session = self.require_session()
@@ -1877,8 +2006,10 @@ def handler_factory(
             self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def show_repository(self, query: dict[str, list[str]]) -> None:
-            if self.require_session() is None:
+            session = self.require_session()
+            if session is None:
                 return
+            _, user = session
             try:
                 project_id = int(query.get("project_id", [""])[0])
             except ValueError:
@@ -1887,7 +2018,7 @@ def handler_factory(
                     page(
                         "Invalid repository",
                         "<div class='card'><h1>Invalid repository reference</h1>"
-                        "<a class='button secondary' href='/'>Return</a></div>",
+                        "<a class='button secondary' href='/repositories'>Return</a></div>",
                     ),
                 )
                 return
@@ -1906,7 +2037,7 @@ def handler_factory(
                     page(
                         "Invalid date",
                         f"<div class='card'><h1>Invalid date</h1><p class='error'>{html.escape(str(exc))}</p>"
-                        "<a class='button secondary' href='/'>Return</a></div>",
+                        "<a class='button secondary' href='/repositories'>Return</a></div>",
                     ),
                 )
                 return
@@ -1920,7 +2051,7 @@ def handler_factory(
                     page(
                         "Repository not found",
                         "<div class='card'><h1>Repository not found</h1>"
-                        "<a class='button secondary' href='/'>Return</a></div>",
+                        "<a class='button secondary' href='/repositories'>Return</a></div>",
                     ),
                 )
                 return
@@ -1964,17 +2095,24 @@ def handler_factory(
                 else {"period": period}
             )
             body = f"""
-            <header><div><h1>{html.escape(str(project['project_path']))}</h1>
-            <p class='sub'>Latest revision of each MR in {html.escape(filter_label)}</p></div>
-            <a class='button secondary' href='/?{back_query}'>Back to repositories</a></header>
             <section class='card'><div class='table-wrap'><table><thead><tr>
             <th>MR</th><th>Latest commit</th><th>Review status</th><th>MR created</th><th>Report</th>
             </tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
-            self.send_page(200, page("Repository MRs", body))
+            self.application_response(
+                "Repository MRs",
+                str(project["project_path"]),
+                f"Latest revision of each MR in {filter_label}.",
+                body,
+                user,
+                "repositories",
+                f"<a class='button secondary' href='/repositories?{back_query}'>Back to repositories</a>",
+            )
 
         def show_report(self, query: dict[str, list[str]]) -> None:
-            if self.require_session() is None:
+            session = self.require_session()
+            if session is None:
                 return
+            _, user = session
             try:
                 project_id = int(query.get("project_id", [""])[0])
                 mr_iid = int(query.get("mr_iid", [""])[0])
@@ -2001,13 +2139,16 @@ def handler_factory(
                 except OSError:
                     self.send_page(404, page("Report not found", "<div class='card'><h1>Report file not found</h1></div>"))
                     return
-            body = (
-                "<header><div><h1>Security report</h1>"
-                f"<p class='sub'>{html.escape(str(row['project_path']))} !{int(row['mr_iid'])} · "
-                f"{html.escape(str(row['head_sha'])[:12])}</p></div><a class='button secondary' href='/'>Back</a></header>"
-                f"<section class='card'><pre>{html.escape(content)}</pre></section>"
+            body = f"<section class='card'><pre>{html.escape(content)}</pre></section>"
+            self.application_response(
+                "Security report",
+                "Security report",
+                f"{row['project_path']} !{int(row['mr_iid'])} · {str(row['head_sha'])[:12]}",
+                body,
+                user,
+                "dashboard",
+                "<a class='button secondary' href='/'>Back to dashboard</a>",
             )
-            self.send_page(200, page("Security report", body))
 
     return Handler
 

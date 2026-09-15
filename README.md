@@ -240,10 +240,17 @@ host interface permitted by the firewall. Do not expose this port directly to
 the internet. An SSH tunnel remains an option if direct network access is later
 disabled.
 
-The home page is a dedicated dashboard for GitLab health, repository and MR
-activity, review status, and security findings. Runtime controls and credential
-rotation are kept on the separate authenticated **Settings** page. Stored
-secrets are never displayed again.
+The authenticated console uses a responsive sidebar with three primary pages:
+
+- **Dashboard** is the main operational view. It shows review outcomes, the
+  prioritized security-finding queue, and GitLab connection health.
+- **Repositories** shows repository coverage, per-repository access status, MR
+  activity, finding totals, date filters, and pagination.
+- **Settings** contains runtime controls, credential tests and rotation, and the
+  protected data-reset action.
+
+The sidebar also shows the current reviewer state and signed-in administrator.
+Stored secrets are never displayed again.
 
 The Settings page also provides a protected **Reset repository and MR data**
 action. The administrator must type `RESET` exactly before it runs. The reset
@@ -290,7 +297,7 @@ SQLite table only as authenticated ciphertext.
 MR revisions discovered before the LLM key is configured appear with a `pending`
 status and have no report until the selected LLM reviews them.
 
-The dashboard combines visible repositories and fetched-MR activity in one
+The Repositories page combines visible repositories and fetched-MR activity in one
 **Repositories and MRs** table. For each repository it shows:
 
 - the numeric GitLab ID;
@@ -310,16 +317,16 @@ repositories, not only the current page.
 Click a non-zero MR count to open that repository's filtered MR list and its
 available security reports.
 
-The **Review status** section lists all parsed findings for the active period,
+The Dashboard **Security findings** section lists all parsed findings for the active period,
 ordered Critical, High, Medium, then Low. Each row shows the finding title, a
 direct link to the corresponding GitLab MR, and an expandable vulnerability
 details panel. A report containing the required `No high-confidence security
 findings.` result adds no finding rows.
 
-Day, Week, and Month select rolling windows of 24 hours, 7 days, and 30 days.
-The administrator can also select an inclusive UTC start-date and end-date
-range; choosing the same date in both fields filters one calendar day. MRs
-created before the deployment cutoff remain excluded.
+On both Dashboard and Repositories, Day, Week, and Month select rolling windows
+of 24 hours, 7 days, and 30 days. The administrator can also select an inclusive
+UTC start-date and end-date range; choosing the same date in both fields filters
+one calendar day. MRs created before the deployment cutoff remain excluded.
 
 ## Automatic discovery
 

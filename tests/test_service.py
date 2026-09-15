@@ -5,10 +5,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -39,13 +42,16 @@ from security_review.service import (  # noqa: E402
 )
 from security_review.web import (  # noqa: E402
     Credentials,
+    MemoryVault,
     WebStore,
+    application_page,
     collect_security_findings,
     decrypt_credentials,
     encrypt_credentials,
     paginate_repositories,
     parse_security_findings,
     password_record,
+    handler_factory,
     validated_credentials,
     verify_password,
 )
@@ -686,6 +692,69 @@ class DiscoveryInventoryTests(unittest.TestCase):
 
 
 class WebAuthenticationTests(unittest.TestCase):
+    def test_authenticated_dashboard_and_repository_routes_are_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WebStore(root / "state.sqlite3")
+            user_id = store.create_first_user(
+                "security-admin", "a secure test password"
+            )
+            session_token, _ = store.create_session(user_id)
+            handler = handler_factory(store, root / "reports", False, MemoryVault())
+            handler.log_message = lambda *_args: None
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                headers = {"Cookie": f"reviewer_session={session_token}"}
+                with urllib.request.urlopen(
+                    urllib.request.Request(base_url + "/", headers=headers)
+                ) as response:
+                    dashboard = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(base_url + "/repositories", headers=headers)
+                ) as response:
+                    repositories = response.read().decode("utf-8")
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+
+            self.assertIn("<h1>Review dashboard</h1>", dashboard)
+            self.assertIn("<h2>Review status</h2>", dashboard)
+            self.assertNotIn("<h2>Repositories and MRs</h2>", dashboard)
+            self.assertIn("href='/' aria-current='page'", dashboard)
+            self.assertIn("<h1>Repositories</h1>", repositories)
+            self.assertIn("<h2>Repositories and MRs</h2>", repositories)
+            self.assertNotIn("<h2>Review status</h2>", repositories)
+            self.assertIn(
+                "href='/repositories' aria-current='page'", repositories
+            )
+
+    def test_application_shell_has_safe_navigation_and_active_page(self):
+        rendered = application_page(
+            "Repositories",
+            "Repositories <all>",
+            "Repository coverage",
+            "<section>Trusted application content</section>",
+            "<admin>",
+            "'csrf-token",
+            "repositories",
+            "Reviews active",
+            "completed",
+        )
+
+        self.assertIn("href='/'", rendered)
+        self.assertIn("href='/repositories' aria-current='page'", rendered)
+        self.assertIn("href='/settings'", rendered)
+        self.assertEqual(rendered.count("aria-current='page'"), 1)
+        self.assertIn("Repositories &lt;all&gt;", rendered)
+        self.assertIn("&lt;admin&gt;", rendered)
+        self.assertNotIn("<admin>", rendered)
+        self.assertIn("value='&#x27;csrf-token'", rendered)
+        self.assertIn("Reviews active", rendered)
+
     def test_password_hash_round_trip(self):
         salt, digest, iterations = password_record("a sufficiently long password")
         self.assertTrue(
