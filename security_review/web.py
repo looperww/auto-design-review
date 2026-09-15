@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import cookies
@@ -21,10 +22,12 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 
 from .service import (
+    GitLabClient,
     RUNTIME_SETTINGS,
     ReviewError,
     effective_runtime_settings,
     normalize_runtime_setting,
+    test_claude_api_key,
 )
 
 
@@ -167,12 +170,20 @@ class WebStore:
         self.path = path
         self.initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self):
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
-        return connection
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def initialize(self) -> None:
         with self.connect() as connection:
@@ -713,6 +724,10 @@ def handler_factory(
                     self.unlock(form)
                 elif parsed.path == "/credentials":
                     self.update_credentials(form)
+                elif parsed.path == "/credentials/test-gitlab":
+                    self.test_gitlab_credentials(form)
+                elif parsed.path == "/credentials/test-anthropic":
+                    self.test_anthropic_credentials(form)
                 elif parsed.path == "/settings":
                     self.update_settings(form)
                 else:
@@ -849,22 +864,8 @@ def handler_factory(
             _, user = session
             if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
                 raise ReviewError("Invalid form token.")
-            password = form.get("password", "")
-            if store.authenticate(str(user["username"]), password) is None:
-                raise ReviewError("The administrator password was not accepted.")
-            existing = (
-                store.unlock_credentials(password)
-                if store.credentials_configured()
-                else Credentials("", "", "")
-            )
-            submitted_gitlab_url = form.get("gitlab_url", "").strip()
-            submitted_gitlab_token = form.get("gitlab_token", "").strip()
-            submitted_anthropic_key = form.get("anthropic_api_key", "").strip()
-            credentials = validated_credentials(
-                submitted_gitlab_url or existing.gitlab_url,
-                submitted_gitlab_token or existing.gitlab_token,
-                submitted_anthropic_key or existing.anthropic_api_key,
-            )
+            password, existing = self.credential_context(form, user)
+            credentials = self.merged_credentials(form, existing)
             store.save_credentials(credentials, password)
             vault.set(credentials)
             message = (
@@ -873,6 +874,68 @@ def handler_factory(
                 else "GitLab access saved; MR discovery is active. Add an Anthropic API key later to review queued MRs."
             )
             self.redirect("/?message=" + urllib.parse.quote(message))
+
+        def credential_context(
+            self, form: dict[str, str], user: sqlite3.Row
+        ) -> tuple[str, Credentials]:
+            password = form.get("password", "")
+            if store.authenticate(str(user["username"]), password) is None:
+                raise ReviewError("The administrator password was not accepted.")
+            existing = (
+                store.unlock_credentials(password)
+                if store.credentials_configured()
+                else Credentials("", "", "")
+            )
+            return password, existing
+
+        def merged_credentials(
+            self, form: dict[str, str], existing: Credentials
+        ) -> Credentials:
+            submitted_gitlab_url = form.get("gitlab_url", "").strip()
+            submitted_gitlab_token = form.get("gitlab_token", "").strip()
+            submitted_anthropic_key = form.get("anthropic_api_key", "").strip()
+            return validated_credentials(
+                submitted_gitlab_url or existing.gitlab_url,
+                submitted_gitlab_token or existing.gitlab_token,
+                submitted_anthropic_key or existing.anthropic_api_key,
+            )
+
+        def test_gitlab_credentials(self, form: dict[str, str]) -> None:
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
+                raise ReviewError("Invalid form token.")
+            _, existing = self.credential_context(form, user)
+            credentials = self.merged_credentials(form, existing)
+            projects = GitLabClient(
+                credentials.gitlab_url, credentials.gitlab_token
+            ).list_projects()
+            self.redirect(
+                "/?message="
+                + urllib.parse.quote(
+                    f"GitLab access test succeeded: {len(projects)} repositories are visible to this token."
+                )
+            )
+
+        def test_anthropic_credentials(self, form: dict[str, str]) -> None:
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
+                raise ReviewError("Invalid form token.")
+            _, existing = self.credential_context(form, user)
+            api_key = form.get("anthropic_api_key", "").strip() or existing.anthropic_api_key
+            model = effective_runtime_settings(store.settings())["CLAUDE_MODEL"]
+            test_claude_api_key(api_key, model)
+            self.redirect(
+                "/?message="
+                + urllib.parse.quote(
+                    f"Anthropic API key test succeeded with Claude Code using the {model} model."
+                )
+            )
 
         def show_dashboard(self, query: dict[str, list[str]]) -> None:
             if store.user_count() == 0:
@@ -1039,7 +1102,10 @@ def handler_factory(
             <div class='field'><label for='rotate_password'>Administrator password</label><input id='rotate_password' name='password' type='password' autocomplete='current-password' required></div>
             <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off'><small>Required the first time; leave blank later to keep the stored token.</small></div>
             <div class='field'><label for='rotate_anthropic_key'>Anthropic API key (optional)</label><input id='rotate_anthropic_key' name='anthropic_api_key' type='password' autocomplete='off'><small>Leave blank initially for discovery only; later, a blank field keeps the stored key.</small></div>
-            </div><div class='actions'><button type='submit'>Save encrypted credentials</button></div></form></section>
+            </div><div class='actions'><button type='submit'>Save encrypted credentials</button>
+            <button class='secondary' type='submit' formaction='/credentials/test-gitlab'>Test GitLab access</button>
+            <button class='secondary' type='submit' formaction='/credentials/test-anthropic'>Test Anthropic API key</button></div>
+            <p class='sub'>Tests do not save the entered values. The Anthropic test sends one minimal request through Claude Code using the configured model and may incur a very small API charge.</p></form></section>
             <section class='card'><h2>MR revisions discovered in the {period_labels[period]}</h2><div class='table-wrap'><table><thead><tr><th>Project</th><th>MR</th><th>Commit</th><th>Status</th><th>Discovered</th><th>Report</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
             self.send_page(200, page("Dashboard", body))
 

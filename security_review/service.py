@@ -568,6 +568,9 @@ class ReviewState:
         )
         self.connection.commit()
 
+    def close(self) -> None:
+        self.connection.close()
+
     def has(self, target: ReviewTarget) -> bool:
         row = self.connection.execute(
             "SELECT status FROM reviews WHERE project_id = ? AND mr_iid = ? AND head_sha = ?",
@@ -997,6 +1000,68 @@ def run_claude(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
     if not isinstance(result, dict) or not isinstance(result.get("result"), str):
         raise ReviewError("Claude output did not contain a Markdown report.")
     return str(result["result"]).strip(), result
+
+
+def test_claude_api_key(api_key: str, model: str = "opus") -> None:
+    if not api_key.strip():
+        raise ReviewError("Enter an Anthropic API key to test.")
+    command = [
+        "claude",
+        "--bare",
+        "-p",
+        "Reply with exactly OK.",
+        "--permission-mode",
+        "plan",
+        "--tools",
+        "",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--output-format",
+        "json",
+        "--model",
+        model,
+        "--max-budget-usd",
+        "0.05",
+        "--max-turns",
+        "1",
+    ]
+    claude_env = dict(os.environ)
+    for name in list(claude_env):
+        if name.startswith("GITLAB_"):
+            claude_env.pop(name, None)
+    claude_env["ANTHROPIC_API_KEY"] = api_key.strip()
+    claude_env.update(
+        {
+            "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1",
+            "DISABLE_AUTOUPDATER": "1",
+            "CLAUDE_CONFIG_DIR": "/tmp/claude-key-test",
+        }
+    )
+    Path("/tmp/claude-key-test").mkdir(parents=True, exist_ok=True)
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=90,
+            env=claude_env,
+            cwd="/tmp",
+        )
+    except FileNotFoundError as exc:
+        raise ReviewError("Claude Code is not installed in the reviewer image.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewError("The Anthropic API key test timed out.") from exc
+    if completed.returncode != 0:
+        raise ReviewError(
+            "Anthropic API key test failed. Check the key, billing, model access, and network connection."
+        )
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReviewError("Claude Code returned an invalid response during the key test.") from exc
+    if not isinstance(result, dict) or not isinstance(result.get("result"), str):
+        raise ReviewError("Claude Code did not return a valid result during the key test.")
 
 
 def review_target(

@@ -1,6 +1,7 @@
 import io
 import os
 import sqlite3
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -25,6 +26,7 @@ from security_review.service import (  # noqa: E402
     normalized_archive_path,
     parse_mr_url,
     scan_once,
+    test_claude_api_key as verify_claude_api_key,
 )
 from security_review.web import (  # noqa: E402
     Credentials,
@@ -109,6 +111,23 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(config.anthropic_api_key, "")
 
+    def test_anthropic_key_test_uses_claude_code_with_a_bounded_request(self):
+        completed = subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stdout='{"result":"OK"}', stderr=""
+        )
+        with patch("security_review.service.subprocess.run", return_value=completed) as run:
+            verify_claude_api_key("anthropic-test-key", "opus")
+        command = run.call_args.args[0]
+        self.assertIn("--bare", command)
+        self.assertIn("--max-budget-usd", command)
+        self.assertEqual(run.call_args.kwargs["env"]["ANTHROPIC_API_KEY"], "anthropic-test-key")
+
+    def test_anthropic_key_test_rejects_an_empty_key_without_a_request(self):
+        with patch("security_review.service.subprocess.run") as run:
+            with self.assertRaises(ReviewError):
+                verify_claude_api_key("")
+        run.assert_not_called()
+
 
 class PathTests(unittest.TestCase):
     def test_project_path_is_encoded(self):
@@ -188,6 +207,7 @@ class StateTests(unittest.TestCase):
                 "SELECT report_content, metadata_json FROM reviews"
             ).fetchone()
             self.assertEqual(stored[0], "# Security review\n")
+            state.close()
 
     def test_new_head_sha_is_a_new_review(self):
         first = ReviewTarget(1, "company/app", 3, "abc123", "https://example/mr/3")
@@ -196,6 +216,7 @@ class StateTests(unittest.TestCase):
             state = ReviewState(Path(directory) / "state.sqlite3")
             state.record(first, "completed")
             self.assertFalse(state.has(second))
+            state.close()
 
 
 class CycleLimitTests(unittest.TestCase):
@@ -266,6 +287,7 @@ class CycleLimitTests(unittest.TestCase):
             self.assertEqual(review.call_count, 3)
             self.assertEqual(reviewed["completed"], 3)
             self.assertTrue(all(state.has(target) for target in targets))
+            state.close()
 
 
 class DiscoveryInventoryTests(unittest.TestCase):
@@ -320,6 +342,7 @@ class DiscoveryInventoryTests(unittest.TestCase):
             ]
             self.assertEqual(stored_shas, ["after-deployment"])
             self.assertEqual(len(WebStore(database).visible_projects()), 2)
+            state.close()
 
     def test_mr_activity_filters_distinct_mrs_by_period(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -347,6 +370,7 @@ class DiscoveryInventoryTests(unittest.TestCase):
             self.assertEqual(store.mr_activity("day")[0], 1)
             self.assertEqual(store.mr_activity("week")[0], 2)
             self.assertEqual(store.mr_activity("month")[0], 3)
+            state.close()
 
 
 class WebAuthenticationTests(unittest.TestCase):
@@ -409,6 +433,30 @@ class WebAuthenticationTests(unittest.TestCase):
             state.set_metadata("last_gitlab_check_status", "success")
             self.assertEqual(
                 store.scan_status()["last_gitlab_check_status"], "success"
+            )
+            state.close()
+
+    def test_each_fresh_data_folder_gets_its_own_deployment_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_database = Path(directory) / "first.sqlite3"
+            second_database = Path(directory) / "second.sqlite3"
+            with patch("security_review.web.now_iso", return_value="2026-09-15T10:00:00+00:00"):
+                first = WebStore(first_database)
+            with patch("security_review.web.now_iso", return_value="2026-09-16T10:00:00+00:00"):
+                second = WebStore(second_database)
+            self.assertEqual(
+                first.scan_status()["deployment_started_at"],
+                "2026-09-15T10:00:00+00:00",
+            )
+            self.assertEqual(
+                second.scan_status()["deployment_started_at"],
+                "2026-09-16T10:00:00+00:00",
+            )
+            with patch("security_review.web.now_iso", return_value="2026-09-17T10:00:00+00:00"):
+                WebStore(first_database)
+            self.assertEqual(
+                first.scan_status()["deployment_started_at"],
+                "2026-09-15T10:00:00+00:00",
             )
 
 

@@ -150,6 +150,17 @@ token. Once it is saved, queued open MR revisions are reviewed in order, subject
 to the configured maximum reviews per cycle. Leaving either secret field blank
 during a later update preserves its stored value.
 
+Before saving, use the two credential-test buttons in the web console:
+
+- **Test GitLab access** calls the GitLab Projects API and reports how many
+  repositories are visible to the submitted or stored token.
+- **Test Anthropic API key** sends one minimal, tool-disabled request through
+  Claude Code using the configured review model. It has a USD 0.05 hard budget
+  and may incur a very small API charge.
+
+Testing does not save or replace either credential. The administrator password
+is still required so a blank input can securely reuse an encrypted stored value.
+
 The two API credentials and GitLab URL are encrypted with AES-GCM using a key
 derived from the administrator password. Password hashes, encrypted credentials,
 operational settings, review state, report content, and report metadata are
@@ -233,6 +244,11 @@ deployed, but those MRs are not queued, counted, or reviewed. Only MRs whose
 GitLab `created_at` timestamp is on or after the cutoff are included. Rebuilding
 or replacing the container does not reset the cutoff because it is stored in the
 host `data/` folder.
+
+A deployment on another server with a newly created, empty `data/` folder gets a
+new cutoff based on that server deployment's start time. Intentionally copying
+or restoring an existing `data/` folder is treated as moving the same deployment
+and therefore retains its original cutoff and review history.
 
 Each successful GitLab scan refreshes a persistent inventory of all repositories
 currently visible to the token, including repositories with no open MRs. The web
