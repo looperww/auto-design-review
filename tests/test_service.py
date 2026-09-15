@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +28,7 @@ from security_review.service import (  # noqa: E402
     effective_runtime_settings,
     is_context_candidate,
     list_llm_models,
+    normalize_gitlab_group_path,
     normalized_archive_path,
     run_custom_llm,
     run_gemini,
@@ -96,6 +98,22 @@ class ConfigurationTests(unittest.TestCase):
             config = Config.from_env()
         self.assertEqual(config.gitlab_url, "https://gitlab.com")
         self.assertEqual(config.llm_model, "opus")
+
+    def test_group_path_is_loaded_and_validated(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GITLAB_REVIEW_TOKEN": "gitlab-secret",
+                "ANTHROPIC_API_KEY": "api-secret",
+                "GITLAB_GROUP_PATH": "/company/platform/",
+            },
+            clear=True,
+        ):
+            config = Config.from_env()
+        self.assertEqual(config.gitlab_group_path, "company/platform")
+        self.assertEqual(normalize_gitlab_group_path(" maas "), "maas")
+        with self.assertRaisesRegex(ReviewError, "Do not enter a URL"):
+            normalize_gitlab_group_path("https://gitlab.example.com/maas")
 
     def test_placeholder_secret_is_rejected(self):
         with patch.dict(
@@ -267,6 +285,30 @@ class ConfigurationTests(unittest.TestCase):
                 GitLabClient(
                     "https://gitlab.example.com", "gitlab-test-token"
                 ).list_projects()
+
+    def test_group_project_discovery_uses_group_endpoint_and_subgroups(self):
+        class Response(io.BytesIO):
+            headers = {"X-Next-Page": ""}
+
+        with patch(
+            "security_review.service.urllib.request.urlopen",
+            return_value=Response(b"[]"),
+        ) as request:
+            projects = GitLabClient(
+                "https://gitlab.example.com",
+                "gitlab-test-token",
+                "company/platform",
+            ).list_projects()
+        self.assertEqual(projects, [])
+        url = request.call_args.args[0].full_url
+        parsed = urllib.parse.urlparse(url)
+        self.assertEqual(
+            parsed.path,
+            "/api/v4/groups/company%2Fplatform/projects",
+        )
+        query = urllib.parse.parse_qs(parsed.query)
+        self.assertEqual(query["include_subgroups"], ["true"])
+        self.assertEqual(query["with_shared"], ["false"])
 
     def test_gitlab_401_explains_invalid_or_expired_token(self):
         denied = urllib.error.HTTPError(
@@ -691,12 +733,15 @@ class WebAuthenticationTests(unittest.TestCase):
 
     def test_gitlab_credentials_can_be_saved_without_anthropic_key(self):
         credentials = validated_credentials(
-            "https://gitlab.example.com", "gitlab-test-token", ""
+            "https://gitlab.example.com",
+            "gitlab-test-token",
+            "",
+            gitlab_group_path="maas",
         )
         salt, nonce, ciphertext = encrypt_credentials(credentials, "correct password")
-        self.assertEqual(
-            decrypt_credentials(salt, nonce, ciphertext, "correct password"), credentials
-        )
+        restored = decrypt_credentials(salt, nonce, ciphertext, "correct password")
+        self.assertEqual(restored, credentials)
+        self.assertEqual(restored.gitlab_group_path, "maas")
 
     def test_non_anthropic_provider_configuration_is_encrypted(self):
         credentials = validated_credentials(

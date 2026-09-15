@@ -295,6 +295,7 @@ class Config:
     claude_max_turns: str
     llm_provider: str = "anthropic"
     llm_api_url: str = ""
+    gitlab_group_path: str = ""
 
     @classmethod
     def from_env(cls, overrides: Mapping[str, str] | None = None) -> "Config":
@@ -305,6 +306,7 @@ class Config:
             gitlab_token,
             llm_api_key,
             overrides,
+            gitlab_group_path=os.environ.get("GITLAB_GROUP_PATH", ""),
         )
 
     @classmethod
@@ -318,6 +320,7 @@ class Config:
         llm_provider: str = "anthropic",
         llm_api_url: str = "",
         llm_model: str = "",
+        gitlab_group_path: str = "",
     ) -> "Config":
         if not gitlab_url.strip() or not gitlab_token.strip():
             raise ReviewError("GitLab credentials are not configured.")
@@ -369,6 +372,7 @@ class Config:
             claude_max_turns=settings["CLAUDE_MAX_TURNS"],
             llm_provider=llm_provider,
             llm_api_url=llm_api_url.strip(),
+            gitlab_group_path=normalize_gitlab_group_path(gitlab_group_path),
         )
 
 
@@ -437,10 +441,27 @@ def api_project(project_path: str) -> str:
     return urllib.parse.quote(project_path, safe="")
 
 
+def normalize_gitlab_group_path(group_path: str) -> str:
+    normalized = group_path.strip().strip("/")
+    if not normalized:
+        return ""
+    if len(normalized) > 512 or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", normalized
+    ):
+        raise ReviewError(
+            "GitLab group path must contain only namespace segments, such as "
+            "maas or company/platform. Do not enter a URL."
+        )
+    if any(segment in {".", ".."} for segment in normalized.split("/")):
+        raise ReviewError("GitLab group path contains an invalid namespace segment.")
+    return normalized
+
+
 class GitLabClient:
-    def __init__(self, base_url: str, token: str):
+    def __init__(self, base_url: str, token: str, group_path: str = ""):
         self.base_url = base_url.rstrip("/")
         self.token = token
+        self.group_path = normalize_gitlab_group_path(group_path)
 
     def _url(self, path: str, query: dict[str, Any] | None = None) -> str:
         url = f"{self.base_url}/api/v4/{path.lstrip('/')}"
@@ -470,6 +491,16 @@ class GitLabClient:
                     "the token owner can access the target projects. For a legacy "
                     "token, grant read_api. A GitLab administrator may also need to "
                     "check token, IP, or external-authorization policies."
+                ) from exc
+            if (
+                exc.code == 403
+                and path.strip("/").startswith("groups/")
+                and path.strip("/").endswith("/projects")
+            ):
+                raise ReviewError(
+                    "GitLab denied group project discovery. Check that the group "
+                    "path matches the token's group, the token has API read access, "
+                    "and the token role can read the group's projects."
                 ) from exc
             if exc.code == 403:
                 raise ReviewError(
@@ -512,17 +543,30 @@ class GitLabClient:
         return results
 
     def list_projects(self) -> list[dict[str, Any]]:
-        projects = self.get_all(
-            "projects",
-            {
-                "membership": "true",
-                "active": "true",
-                "min_access_level": 20,
-                "simple": "true",
-                "order_by": "id",
-                "sort": "asc",
-            },
-        )
+        if self.group_path:
+            projects = self.get_all(
+                f"groups/{api_project(self.group_path)}/projects",
+                {
+                    "include_subgroups": "true",
+                    "with_shared": "false",
+                    "archived": "false",
+                    "simple": "true",
+                    "order_by": "id",
+                    "sort": "asc",
+                },
+            )
+        else:
+            projects = self.get_all(
+                "projects",
+                {
+                    "membership": "true",
+                    "active": "true",
+                    "min_access_level": 20,
+                    "simple": "true",
+                    "order_by": "id",
+                    "sort": "asc",
+                },
+            )
         return [item for item in projects if isinstance(item, dict)]
 
     def list_open_merge_requests(self, project_path: str) -> list[dict[str, Any]]:
@@ -1660,7 +1704,9 @@ def heartbeat_loop() -> None:
 
 
 def run_poll(config: Config) -> int:
-    client = GitLabClient(config.gitlab_url, config.gitlab_token)
+    client = GitLabClient(
+        config.gitlab_url, config.gitlab_token, config.gitlab_group_path
+    )
     state = ReviewState(config.state_db)
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     print(
@@ -1698,9 +1744,12 @@ def run_managed_poll(
                 llm_provider=credentials.llm_provider,
                 llm_api_url=credentials.llm_api_url,
                 llm_model=credentials.llm_model,
+                gitlab_group_path=credentials.gitlab_group_path,
             )
             sleep_seconds = config.poll_interval_seconds
-            client = GitLabClient(config.gitlab_url, config.gitlab_token)
+            client = GitLabClient(
+                config.gitlab_url, config.gitlab_token, config.gitlab_group_path
+            )
             with lock:
                 counters = scan_once(client, state, config)
                 state.set_metadata("last_gitlab_check_at", utc_now())
@@ -1733,7 +1782,9 @@ def parse_mr_url(url: str) -> tuple[str, int]:
 
 
 def run_one(config: Config, project_path: str, mr_iid: int, force: bool) -> int:
-    client = GitLabClient(config.gitlab_url, config.gitlab_token)
+    client = GitLabClient(
+        config.gitlab_url, config.gitlab_token, config.gitlab_group_path
+    )
     state = ReviewState(config.state_db)
     mr = client.get_merge_request(project_path, mr_iid)
     project_id = int(mr.get("target_project_id") or mr.get("project_id"))

@@ -33,6 +33,7 @@ from .service import (
     ReviewError,
     effective_runtime_settings,
     list_llm_models,
+    normalize_gitlab_group_path,
     normalize_runtime_setting,
     test_llm_connection,
 )
@@ -173,6 +174,7 @@ class Credentials:
     llm_provider: str = "anthropic"
     llm_api_url: str = ""
     llm_model: str = ""
+    gitlab_group_path: str = ""
 
 
 def credential_key(password: str, salt: bytes) -> bytes:
@@ -190,6 +192,7 @@ def credential_payload(credentials: Credentials) -> bytes:
             "llm_provider": credentials.llm_provider,
             "llm_api_url": credentials.llm_api_url,
             "llm_model": credentials.llm_model,
+            "gitlab_group_path": credentials.gitlab_group_path,
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -229,6 +232,9 @@ def decrypt_credentials_with_key(
             llm_provider=str(payload.get("llm_provider", "anthropic")),
             llm_api_url=str(payload.get("llm_api_url", "")),
             llm_model=str(payload.get("llm_model", "")),
+            gitlab_group_path=normalize_gitlab_group_path(
+                str(payload.get("gitlab_group_path", ""))
+            ),
         )
     except (ValueError, KeyError, TypeError, json.JSONDecodeError, InvalidTag) as exc:
         raise ReviewError("The credential vault could not be unlocked.") from exc
@@ -350,6 +356,7 @@ def validated_credentials(
     llm_provider: str = "anthropic",
     llm_api_url: str = "",
     llm_model: str = "",
+    gitlab_group_path: str = "",
 ) -> Credentials:
     url = gitlab_url.strip().rstrip("/")
     parsed = urllib.parse.urlparse(url)
@@ -387,7 +394,13 @@ def validated_credentials(
     if len(llm_api_url) > 2048:
         raise ReviewError("Custom LLM API URL is too long.")
     return Credentials(
-        url, gitlab_token, llm_api_key, llm_provider, llm_api_url, llm_model
+        gitlab_url=url,
+        gitlab_token=gitlab_token,
+        llm_api_key=llm_api_key,
+        llm_provider=llm_provider,
+        llm_api_url=llm_api_url,
+        llm_model=llm_model,
+        gitlab_group_path=normalize_gitlab_group_path(gitlab_group_path),
     )
 
 
@@ -1352,6 +1365,7 @@ def handler_factory(
                 submitted_provider,
                 form.get("llm_api_url", "").strip(),
                 form.get("llm_model", "").strip(),
+                gitlab_group_path=form.get("gitlab_group_path", "").strip(),
             )
 
         def test_gitlab_credentials(self, form: dict[str, str]) -> None:
@@ -1364,7 +1378,9 @@ def handler_factory(
             existing, _, _ = self.credential_context()
             credentials = self.merged_credentials(form, existing)
             projects = GitLabClient(
-                credentials.gitlab_url, credentials.gitlab_token
+                credentials.gitlab_url,
+                credentials.gitlab_token,
+                credentials.gitlab_group_path,
             ).list_projects()
             self.redirect(
                 "/settings?message="
@@ -1390,6 +1406,7 @@ def handler_factory(
                 llm_provider=credentials.llm_provider,
                 llm_api_url=credentials.llm_api_url,
                 llm_model=credentials.llm_model,
+                gitlab_group_path=credentials.gitlab_group_path,
             )
             test_llm_connection(config)
             provider_label = LLM_PROVIDER_LABELS[credentials.llm_provider]
@@ -1701,6 +1718,7 @@ def handler_factory(
             else:
                 displayed_credentials = active_credentials or Credentials("", "", "")
                 gitlab_url = displayed_credentials.gitlab_url or "https://gitlab.com"
+                gitlab_group_path = displayed_credentials.gitlab_group_path
                 gitlab_token_placeholder = (
                     "•••••••••••• (stored)"
                     if displayed_credentials.gitlab_token
@@ -1727,6 +1745,7 @@ def handler_factory(
                 <p class='sub'>Save GitLab access first to test discovery. The LLM API key is optional and can be added later. Existing secrets are kept when their fields are left blank and the provider is unchanged.</p>
                 <form id='credential_form' method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
                 <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
+                <div class='field'><label for='gitlab_group_path'>GitLab group path (optional)</label><input id='gitlab_group_path' name='gitlab_group_path' value='{html.escape(gitlab_group_path)}' placeholder='maas' maxlength='512'><small>Enter a namespace path such as maas or company/platform, not a URL. Subgroups are included automatically. Leave blank for user-wide discovery.</small></div>
                 <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off' placeholder='{html.escape(gitlab_token_placeholder)}'><small>Required the first time; leave blank later to keep the stored token.</small></div>
                 <div class='field'><label for='llm_provider'>LLM provider</label><select id='llm_provider' name='llm_provider'>{provider_options}</select><small>Anthropic is the default. Custom means an OpenAI-compatible Chat Completions endpoint.</small></div>
                 <div class='field'><label for='llm_model'>Model</label><div class='inline-control'><input id='llm_model' name='llm_model' value='{html.escape(llm_model)}' maxlength='256'><button class='secondary' id='fetch_models' type='button'>Fetch models</button></div><select class='model-picker' id='available_models' aria-label='Available models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='model_status' aria-live='polite'>Use a model available to the selected provider account.</small></div>

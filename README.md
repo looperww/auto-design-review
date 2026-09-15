@@ -3,9 +3,10 @@
 This repository is a self-contained, read-only security checkpoint for GitLab.
 Clone it onto any Docker host and start it with Docker Compose. The authenticated
 setup page stores the GitLab token, selected LLM provider, model, API key,
-optional custom endpoint, GitLab URL, and all review settings in SQLite. It
-automatically discovers all projects visible to the GitLab token, reviews new
-merge requests and new MR revisions, and keeps reports locally.
+optional custom endpoint, GitLab URL, optional GitLab group path, and all review
+settings in SQLite. It automatically discovers the selected group's projects
+or all projects visible to the GitLab token, reviews new merge requests and new
+MR revisions, and keeps reports locally.
 
 No GitLab Runner, webhook listener, pipeline trigger, or `.gitlab-ci.yml` change
 is required in product repositories.
@@ -75,6 +76,13 @@ Read** is missing from a fine-grained token, the selected resource boundary does
 not contain the projects, or a GitLab access policy is denying the request. A
 401 normally means the token is invalid, expired, revoked, incomplete, or was
 created for a different GitLab instance.
+
+For a group-scoped access token, enter its namespace in **GitLab group path**,
+for example `maas`. The service then uses the group-projects API instead of the
+user-wide projects API and includes projects in nested subgroups automatically.
+For a nested group, enter the full namespace such as `company/platform`; do not
+enter a browser URL or an `/api/v4` endpoint. Leave the field blank when using a
+user or service-account token that supports user-wide project discovery.
 
 Do not grant create, update, approve, merge, push, administration, runner, or
 deployment permissions. The token-owning account should have only Reporter
@@ -153,6 +161,7 @@ account is created, the setup page is disabled and you are directed to sign in.
 After signing in, select **Settings** in the dashboard header, then configure:
 
 - the GitLab URL;
+- optionally, the GitLab group path associated with a group-scoped token;
 - the read-only GitLab token; and
 - an LLM provider and model (Anthropic, OpenAI, Gemini, or Custom);
 - optionally, the selected provider's API key; and
@@ -308,11 +317,12 @@ created before the deployment cutoff remain excluded.
 
 ## Automatic discovery
 
-The service does not maintain a repository allowlist. The GitLab token itself
-defines the boundary. Every polling cycle:
+The service does not maintain a repository allowlist. The GitLab token and
+optional group path define the boundary. Every polling cycle:
 
-1. GitLab returns all active projects in which the token owner has at least
-   Reporter access.
+1. GitLab returns projects from the configured group and its subgroups, or all
+   active projects in which the token owner has at least Reporter access when
+   the group path is blank.
 2. The service lists open MRs in those projects.
 3. The local SQLite database identifies MR commit SHAs not seen before.
 4. Unseen revisions are queued and reviewed in order.
