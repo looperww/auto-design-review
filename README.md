@@ -141,8 +141,9 @@ The GitLab token can be saved without an Anthropic API key. The service then
 checks the GitLab connection, discovers open MR revisions, and records them as
 `pending` in SQLite. It does not download repository archives or diffs and does
 not invoke Claude in this mode. The dashboard shows the last GitLab connection
-result and the queued MR count, allowing the administrator to verify the GitLab
-URL, token, scope, and permissions without incurring Claude cost.
+result, every repository visible to the token, and the queued MR count. This
+allows the administrator to verify the GitLab URL, token, scope, and permissions
+without incurring Claude cost.
 
 The Anthropic API key can be added later without re-entering the stored GitLab
 token. Once it is saved, queued open MR revisions are reviewed in order, subject
@@ -207,6 +208,10 @@ SQLite table only as authenticated ciphertext.
 MR revisions discovered before the Anthropic key is configured appear with a
 `pending` status and have no report until Claude reviews them.
 
+The dashboard includes Day, Week, and Month filters. These show the number of
+distinct MRs first discovered during the last 24 hours, 7 days, or 30 days and
+filter the MR-revision table to the same period.
+
 ## Automatic discovery
 
 The service does not maintain a repository allowlist. The GitLab token itself
@@ -221,6 +226,18 @@ defines the boundary. Every polling cycle:
 New projects are therefore included automatically when the service account
 inherits access to them. To exclude a project, remove that service account's
 access to the project or place the project outside the token's resource boundary.
+
+The first application start creates a persistent `deployment_started_at` cutoff
+in SQLite. GitLab may return open MRs that were created before the reviewer was
+deployed, but those MRs are not queued, counted, or reviewed. Only MRs whose
+GitLab `created_at` timestamp is on or after the cutoff are included. Rebuilding
+or replacing the container does not reset the cutoff because it is stored in the
+host `data/` folder.
+
+Each successful GitLab scan refreshes a persistent inventory of all repositories
+currently visible to the token, including repositories with no open MRs. The web
+console lists the full inventory and each repository's latest successful
+observation time.
 
 ## Review-cycle limit
 

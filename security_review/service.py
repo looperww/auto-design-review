@@ -333,6 +333,7 @@ class ReviewTarget:
     mr_iid: int
     head_sha: str
     web_url: str
+    created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -374,6 +375,16 @@ def env_bool(name: str, default: bool) -> bool:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_gitlab_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ReviewError("GitLab returned an invalid MR creation time.") from exc
+    if parsed.tzinfo is None:
+        raise ReviewError("GitLab returned an MR creation time without a timezone.")
+    return parsed.astimezone(timezone.utc)
 
 
 def api_project(project_path: str) -> str:
@@ -509,6 +520,7 @@ class ReviewState:
                 report_path TEXT,
                 report_content TEXT,
                 metadata_json TEXT,
+                discovered_at TEXT NOT NULL,
                 reviewed_at TEXT NOT NULL,
                 PRIMARY KEY (project_id, mr_iid, head_sha)
             )
@@ -521,8 +533,29 @@ class ReviewState:
             self.connection.execute("ALTER TABLE reviews ADD COLUMN report_content TEXT")
         if "metadata_json" not in review_columns:
             self.connection.execute("ALTER TABLE reviews ADD COLUMN metadata_json TEXT")
+        if "discovered_at" not in review_columns:
+            self.connection.execute("ALTER TABLE reviews ADD COLUMN discovered_at TEXT")
+            self.connection.execute(
+                "UPDATE reviews SET discovered_at = reviewed_at WHERE discovered_at IS NULL"
+            )
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO metadata (key, value) VALUES ('deployment_started_at', ?)",
+            (utc_now(),),
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS visible_projects (
+                project_id INTEGER PRIMARY KEY,
+                project_path TEXT NOT NULL,
+                web_url TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                is_visible INTEGER NOT NULL DEFAULT 1
+            )
+            """
         )
         self.connection.execute(
             """
@@ -543,19 +576,21 @@ class ReviewState:
         return row is not None and str(row[0]) != "pending"
 
     def queue(self, target: ReviewTarget) -> bool:
+        discovered_at = utc_now()
         cursor = self.connection.execute(
             """
             INSERT OR IGNORE INTO reviews
                 (project_id, mr_iid, head_sha, project_path, status, report_path,
-                 report_content, metadata_json, reviewed_at)
-            VALUES (?, ?, ?, ?, 'pending', '', '', '', ?)
+                 report_content, metadata_json, discovered_at, reviewed_at)
+            VALUES (?, ?, ?, ?, 'pending', '', '', '', ?, ?)
             """,
             (
                 target.project_id,
                 target.mr_iid,
                 target.head_sha,
                 target.project_path,
-                utc_now(),
+                discovered_at,
+                discovered_at,
             ),
         )
         self.connection.commit()
@@ -569,12 +604,20 @@ class ReviewState:
         report_content: str = "",
         metadata_json: str = "",
     ) -> None:
+        reviewed_at = utc_now()
         self.connection.execute(
             """
-            INSERT OR REPLACE INTO reviews
+            INSERT INTO reviews
                 (project_id, mr_iid, head_sha, project_path, status, report_path,
-                 report_content, metadata_json, reviewed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 report_content, metadata_json, discovered_at, reviewed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, mr_iid, head_sha) DO UPDATE SET
+                project_path = excluded.project_path,
+                status = excluded.status,
+                report_path = excluded.report_path,
+                report_content = excluded.report_content,
+                metadata_json = excluded.metadata_json,
+                reviewed_at = excluded.reviewed_at
             """,
             (
                 target.project_id,
@@ -585,7 +628,8 @@ class ReviewState:
                 report_path,
                 report_content,
                 metadata_json,
-                utc_now(),
+                reviewed_at,
+                reviewed_at,
             ),
         )
         self.connection.commit()
@@ -610,6 +654,41 @@ class ReviewState:
         )
         self.connection.commit()
 
+    def deployment_started_at(self) -> datetime:
+        row = self.connection.execute(
+            "SELECT value FROM metadata WHERE key = 'deployment_started_at'"
+        ).fetchone()
+        if row is None:
+            return datetime.now(timezone.utc)
+        return parse_gitlab_timestamp(str(row[0]))
+
+    def record_visible_projects(self, projects: list[dict[str, Any]]) -> None:
+        observed_at = utc_now()
+        self.connection.execute("UPDATE visible_projects SET is_visible = 0")
+        for project in projects:
+            try:
+                project_id = int(project["id"])
+                project_path = str(project["path_with_namespace"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not project_path:
+                continue
+            web_url = str(project.get("web_url", ""))
+            self.connection.execute(
+                """
+                INSERT INTO visible_projects
+                    (project_id, project_path, web_url, first_seen_at, last_seen_at, is_visible)
+                VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    project_path = excluded.project_path,
+                    web_url = excluded.web_url,
+                    last_seen_at = excluded.last_seen_at,
+                    is_visible = 1
+                """,
+                (project_id, project_path, web_url, observed_at, observed_at),
+            )
+        self.connection.commit()
+
     def runtime_settings(self) -> dict[str, str]:
         rows = self.connection.execute("SELECT key, value FROM settings").fetchall()
         return {
@@ -627,6 +706,7 @@ def target_from(project: dict[str, Any], mr: dict[str, Any]) -> ReviewTarget:
             mr_iid=int(mr["iid"]),
             head_sha=str(mr["sha"]),
             web_url=str(mr.get("web_url", "")),
+            created_at=str(mr.get("created_at", "")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ReviewError("GitLab returned an incomplete project or MR record.") from exc
@@ -989,9 +1069,15 @@ def review_target(
         return "failed"
 
 
-def discover_targets(client: GitLabClient) -> list[ReviewTarget]:
+def discover_targets(
+    client: GitLabClient, state: ReviewState | None = None
+) -> list[ReviewTarget]:
     targets: list[ReviewTarget] = []
-    for project in client.list_projects():
+    projects = client.list_projects()
+    if state is not None:
+        state.record_visible_projects(projects)
+    deployment_started_at = state.deployment_started_at() if state is not None else None
+    for project in projects:
         project_path = project.get("path_with_namespace")
         if not isinstance(project_path, str) or not project_path:
             continue
@@ -1001,12 +1087,25 @@ def discover_targets(client: GitLabClient) -> list[ReviewTarget]:
             print(f"Could not inspect {project_path}: {exc}", file=sys.stderr, flush=True)
             continue
         for mr in merge_requests:
-            targets.append(target_from(project, mr))
+            target = target_from(project, mr)
+            if deployment_started_at is not None:
+                try:
+                    created_at = parse_gitlab_timestamp(target.created_at)
+                except ReviewError as exc:
+                    print(
+                        f"Could not determine creation time for {project_path}!{target.mr_iid}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                if created_at < deployment_started_at:
+                    continue
+            targets.append(target)
     return targets
 
 
 def scan_once(client: GitLabClient, state: ReviewState, config: Config) -> dict[str, int]:
-    targets = discover_targets(client)
+    targets = discover_targets(client, state)
     if not config.anthropic_api_key:
         if not state.initialized():
             state.mark_initialized()

@@ -12,7 +12,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -243,6 +243,7 @@ class WebStore:
                     report_path TEXT,
                     report_content TEXT,
                     metadata_json TEXT,
+                    discovered_at TEXT NOT NULL,
                     reviewed_at TEXT NOT NULL,
                     PRIMARY KEY (project_id, mr_iid, head_sha)
                 )
@@ -255,8 +256,29 @@ class WebStore:
                 connection.execute("ALTER TABLE reviews ADD COLUMN report_content TEXT")
             if "metadata_json" not in review_columns:
                 connection.execute("ALTER TABLE reviews ADD COLUMN metadata_json TEXT")
+            if "discovered_at" not in review_columns:
+                connection.execute("ALTER TABLE reviews ADD COLUMN discovered_at TEXT")
+                connection.execute(
+                    "UPDATE reviews SET discovered_at = reviewed_at WHERE discovered_at IS NULL"
+                )
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO metadata (key, value) VALUES ('deployment_started_at', ?)",
+                (now_iso(),),
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS visible_projects (
+                    project_id INTEGER PRIMARY KEY,
+                    project_path TEXT NOT NULL,
+                    web_url TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    is_visible INTEGER NOT NULL DEFAULT 1
+                )
+                """
             )
 
     def user_count(self) -> int:
@@ -458,9 +480,49 @@ class WebStore:
     def scan_status(self) -> dict[str, str]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT key, value FROM metadata WHERE key LIKE 'last_gitlab_check_%'"
+                "SELECT key, value FROM metadata "
+                "WHERE key LIKE 'last_gitlab_check_%' OR key = 'deployment_started_at'"
             ).fetchall()
         return {str(row["key"]): str(row["value"]) for row in rows}
+
+    def visible_projects(self) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT project_id, project_path, web_url, first_seen_at, last_seen_at
+                FROM visible_projects WHERE is_visible = 1
+                ORDER BY project_path COLLATE NOCASE
+                """
+            ).fetchall()
+
+    def mr_activity(self, period: str) -> tuple[int, list[sqlite3.Row]]:
+        durations = {
+            "day": timedelta(days=1),
+            "week": timedelta(days=7),
+            "month": timedelta(days=30),
+        }
+        cutoff = (datetime.now(timezone.utc) - durations.get(period, durations["week"])).isoformat()
+        with self.connect() as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT project_id, mr_iid FROM reviews
+                    WHERE discovered_at >= ?
+                    GROUP BY project_id, mr_iid
+                )
+                """,
+                (cutoff,),
+            ).fetchone()[0]
+            recent = connection.execute(
+                """
+                SELECT project_id, project_path, mr_iid, head_sha, status,
+                       report_path, report_content, discovered_at, reviewed_at
+                FROM reviews WHERE discovered_at >= ?
+                ORDER BY discovered_at DESC LIMIT 100
+                """,
+                (cutoff,),
+            ).fetchall()
+        return int(count), recent
 
     def report(self, project_id: int, mr_iid: int, head_sha: str) -> sqlite3.Row | None:
         with self.connect() as connection:
@@ -825,7 +887,17 @@ def handler_factory(
                 settings = effective_runtime_settings(saved)
             except ReviewError:
                 settings = effective_runtime_settings({})
-            counts, recent = store.dashboard()
+            period = query.get("period", ["week"])[0]
+            if period not in {"day", "week", "month"}:
+                period = "week"
+            period_labels = {
+                "day": "last 24 hours",
+                "week": "last 7 days",
+                "month": "last 30 days",
+            }
+            counts, _ = store.dashboard()
+            fetched_mrs, recent = store.mr_activity(period)
+            projects = store.visible_projects()
             scan_status = store.scan_status()
             active_credentials, _ = vault.snapshot()
             heartbeat = Path(os.environ.get("HEARTBEAT_FILE", "/data/heartbeat"))
@@ -849,7 +921,7 @@ def handler_factory(
             message = query.get("message", [""])[0]
             notice = f"<p class='notice'>{html.escape(message)}</p>" if message else ""
             check_state = scan_status.get("last_gitlab_check_status", "")
-            check_time = scan_status.get("last_gitlab_check_at", "")[:19]
+            check_time = scan_status.get("last_gitlab_check_at", "")[:19].replace("T", " ")
             if check_state == "success":
                 try:
                     summary = json.loads(scan_status.get("last_gitlab_check_summary", "{}"))
@@ -857,18 +929,45 @@ def handler_factory(
                     summary = {}
                 scan_panel = (
                     "<p class='notice'><strong>GitLab connection successful.</strong> "
-                    f"Last checked {html.escape(check_time or 'recently')}; "
+                    f"Last checked {html.escape(check_time + ' UTC' if check_time else 'recently')}; "
                     f"found {int(summary.get('discovered', 0))} open MR revision(s), "
                     f"with {int(summary.get('pending', 0))} awaiting review.</p>"
                 )
             elif check_state == "failed":
                 scan_panel = (
                     "<p class='error'><strong>GitLab connection failed.</strong> "
-                    f"Last checked {html.escape(check_time or 'recently')}: "
+                    f"Last checked {html.escape(check_time + ' UTC' if check_time else 'recently')}: "
                     f"{html.escape(scan_status.get('last_gitlab_check_error', 'Unknown error'))}</p>"
                 )
             else:
                 scan_panel = "<p class='sub'>No GitLab connection check has completed yet.</p>"
+            deployment_time = scan_status.get("deployment_started_at", "")[:19].replace("T", " ")
+            period_links = "".join(
+                f"<a class='button {'primary' if choice == period else 'secondary'}' "
+                f"href='/?period={choice}'>{label}</a>"
+                for choice, label in (("day", "Day"), ("week", "Week"), ("month", "Month"))
+            )
+            project_rows = []
+            for project in projects:
+                project_path = html.escape(str(project["project_path"]))
+                raw_url = str(project["web_url"])
+                parsed_url = urllib.parse.urlparse(raw_url)
+                if parsed_url.scheme == "https" and parsed_url.netloc:
+                    project_name = (
+                        f"<a href='{html.escape(raw_url)}' target='_blank' "
+                        f"rel='noopener noreferrer'>{project_path}</a>"
+                    )
+                else:
+                    project_name = project_path
+                project_rows.append(
+                    "<tr>"
+                    f"<td>{project_name}</td>"
+                    f"<td>{html.escape(str(project['last_seen_at'])[:19])}</td>"
+                    "</tr>"
+                )
+            visible_project_rows = "".join(project_rows) or (
+                "<tr><td colspan='2'>No repositories discovered yet.</td></tr>"
+            )
             fields = "".join(form_field(item.key, settings[item.key]) for item in RUNTIME_SETTINGS)
             rows = []
             for row in recent:
@@ -890,7 +989,7 @@ def handler_factory(
                     f"<td>!{int(row['mr_iid'])}</td>"
                     f"<td><code>{html.escape(str(row['head_sha'])[:12])}</code></td>"
                     f"<td class='status {html.escape(str(row['status']))}'>{html.escape(str(row['status']))}</td>"
-                    f"<td>{html.escape(str(row['reviewed_at'])[:19])}</td><td>{report_link}</td></tr>"
+                    f"<td>{html.escape(str(row['discovered_at'])[:19])}</td><td>{report_link}</td></tr>"
                 )
             table_rows = "".join(rows) or "<tr><td colspan='6'>No reviews recorded yet.</td></tr>"
             credentials_configured = store.credentials_configured()
@@ -919,6 +1018,13 @@ def handler_factory(
             <div class='top-actions'><span class='status {reviewer_class}'>{reviewer_label}</span>
             <form method='post' action='/logout'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><button class='secondary'>Sign out</button></form></div></header>
             {notice}{vault_panel}<section class='card'><h2>GitLab connection</h2>{scan_panel}</section>
+            <section class='card'><h2>Visible repositories ({len(projects)})</h2>
+            <p class='sub'>Every repository currently visible to the configured GitLab token.</p>
+            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Last seen</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div></section>
+            <section class='card'><h2>Fetched MRs</h2>
+            <p class='sub'>Counts distinct MRs first discovered after this deployment ({html.escape(deployment_time + ' UTC' if deployment_time else 'initializing')}). MRs created before deployment are excluded.</p>
+            <div class='actions'>{period_links}</div><div class='grid activity-grid'>
+            <div class='metric'>Fetched in the {period_labels[period]}<strong>{fetched_mrs}</strong></div></div></section>
             <section class='card'><h2>Review status</h2><div class='grid'>
             <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
             <div class='metric'>Completed<strong>{counts.get('completed', 0)}</strong></div>
@@ -934,7 +1040,7 @@ def handler_factory(
             <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off'><small>Required the first time; leave blank later to keep the stored token.</small></div>
             <div class='field'><label for='rotate_anthropic_key'>Anthropic API key (optional)</label><input id='rotate_anthropic_key' name='anthropic_api_key' type='password' autocomplete='off'><small>Leave blank initially for discovery only; later, a blank field keeps the stored key.</small></div>
             </div><div class='actions'><button type='submit'>Save encrypted credentials</button></div></form></section>
-            <section class='card'><h2>Recent MR revisions</h2><div class='table-wrap'><table><thead><tr><th>Project</th><th>MR</th><th>Commit</th><th>Status</th><th>Recorded</th><th>Report</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
+            <section class='card'><h2>MR revisions discovered in the {period_labels[period]}</h2><div class='table-wrap'><table><thead><tr><th>Project</th><th>MR</th><th>Commit</th><th>Status</th><th>Discovered</th><th>Report</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
             self.send_page(200, page("Dashboard", body))
 
         def update_settings(self, form: dict[str, str]) -> None:

@@ -5,6 +5,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -265,6 +266,87 @@ class CycleLimitTests(unittest.TestCase):
             self.assertEqual(review.call_count, 3)
             self.assertEqual(reviewed["completed"], 3)
             self.assertTrue(all(state.has(target) for target in targets))
+
+
+class DiscoveryInventoryTests(unittest.TestCase):
+    class FakeGitLabClient:
+        def list_projects(self):
+            return [
+                {
+                    "id": 1,
+                    "path_with_namespace": "company/first",
+                    "web_url": "https://gitlab.example.com/company/first",
+                },
+                {
+                    "id": 2,
+                    "path_with_namespace": "company/second",
+                    "web_url": "https://gitlab.example.com/company/second",
+                },
+            ]
+
+        def list_open_merge_requests(self, project_path):
+            if project_path == "company/first":
+                return [
+                    {
+                        "iid": 1,
+                        "sha": "before-deployment",
+                        "web_url": "https://gitlab.example.com/company/first/-/merge_requests/1",
+                        "created_at": "2026-09-14T09:00:00Z",
+                    },
+                    {
+                        "iid": 2,
+                        "sha": "after-deployment",
+                        "web_url": "https://gitlab.example.com/company/first/-/merge_requests/2",
+                        "created_at": "2026-09-15T11:00:00Z",
+                    },
+                ]
+            return []
+
+    def test_visible_projects_are_saved_and_predeployment_mrs_are_excluded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state.sqlite3"
+            state = ReviewState(database)
+            state.set_metadata("deployment_started_at", "2026-09-15T10:00:00+00:00")
+            result = scan_once(
+                self.FakeGitLabClient(),
+                state,
+                config_for_test(root, anthropic_api_key=""),
+            )
+            self.assertEqual(result["discovered"], 1)
+            self.assertEqual(result["queued"], 1)
+            stored_shas = [
+                row[0] for row in state.connection.execute("SELECT head_sha FROM reviews")
+            ]
+            self.assertEqual(stored_shas, ["after-deployment"])
+            self.assertEqual(len(WebStore(database).visible_projects()), 2)
+
+    def test_mr_activity_filters_distinct_mrs_by_period(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            state = ReviewState(database)
+            targets = [
+                ReviewTarget(1, "company/app", iid, f"sha{iid}", "")
+                for iid in range(1, 4)
+            ]
+            for target in targets:
+                state.queue(target)
+            now = datetime.now(timezone.utc)
+            timestamps = [
+                now - timedelta(hours=2),
+                now - timedelta(days=2),
+                now - timedelta(days=10),
+            ]
+            for target, discovered_at in zip(targets, timestamps):
+                state.connection.execute(
+                    "UPDATE reviews SET discovered_at = ? WHERE mr_iid = ?",
+                    (discovered_at.isoformat(), target.mr_iid),
+                )
+            state.connection.commit()
+            store = WebStore(database)
+            self.assertEqual(store.mr_activity("day")[0], 1)
+            self.assertEqual(store.mr_activity("week")[0], 2)
+            self.assertEqual(store.mr_activity("month")[0], 3)
 
 
 class WebAuthenticationTests(unittest.TestCase):
