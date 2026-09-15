@@ -163,6 +163,10 @@ a later update preserves its stored value when the provider remains unchanged.
 Changing provider requires entering the new provider's key so a key is never
 silently reused with a different provider.
 
+After a key is saved, its empty password field displays a masked
+`•••••••••••• (stored)` placeholder. This confirms that a value exists without
+returning the secret to the browser or submitting the placeholder as a new key.
+
 The provider dropdown offers these built-in modes:
 
 | Provider | Default model | Connection method |
@@ -188,6 +192,16 @@ Before saving, use the two credential-test buttons in the web console:
 Testing does not save or replace either credential. Signing in derives and
 unlocks the vault encryption key in memory, so the credential form does not ask
 for the administrator password again. The plaintext password is never retained.
+
+Use **Fetch models** beside the Model field after entering or saving the selected
+provider's API key. The browser asks the local service for the provider's model
+list and displays a dropdown; choosing an item copies its identifier into the
+editable Model field. This operation does not save the key, URL, or model and
+does not invoke a generation request. Anthropic, OpenAI, and Gemini use their
+official model-list endpoints. For a Custom OpenAI-compatible Chat Completions
+URL, the service derives the conventional sibling `/models` endpoint; custom
+providers that do not expose that endpoint require the model name to be entered
+manually.
 
 The GitLab and active LLM API credentials, provider, model, custom URL, and GitLab
 URL are encrypted with AES-GCM using a key derived from the administrator

@@ -20,9 +20,11 @@ from security_review.service import (  # noqa: E402
     ReviewTarget,
     api_project,
     build_context_bundle,
+    custom_models_endpoint,
     env_bool,
     effective_runtime_settings,
     is_context_candidate,
+    list_llm_models,
     normalized_archive_path,
     run_custom_llm,
     run_gemini,
@@ -196,6 +198,59 @@ class ConfigurationTests(unittest.TestCase):
             post.call_args.args[0], "https://llm.example.com/v1/chat/completions"
         )
         self.assertEqual(post.call_args.args[2]["model"], "company-model")
+
+    def test_anthropic_models_are_fetched_with_api_headers(self):
+        response = {"data": [{"id": "claude-opus"}, {"id": "claude-sonnet"}]}
+        with patch(
+            "security_review.service.get_provider_json", return_value=response
+        ) as request:
+            models = list_llm_models("anthropic", "anthropic-test-key")
+        self.assertEqual(models, ["claude-opus", "claude-sonnet"])
+        self.assertEqual(
+            request.call_args.args[0],
+            "https://api.anthropic.com/v1/models?limit=1000",
+        )
+        self.assertEqual(request.call_args.args[1]["x-api-key"], "anthropic-test-key")
+
+    def test_gemini_model_fetch_keeps_generate_content_models(self):
+        response = {
+            "models": [
+                {
+                    "name": "models/gemini-generate",
+                    "supportedGenerationMethods": ["generateContent"],
+                },
+                {
+                    "name": "models/gemini-embed",
+                    "supportedGenerationMethods": ["embedContent"],
+                },
+            ]
+        }
+        with patch("security_review.service.get_provider_json", return_value=response):
+            models = list_llm_models("gemini", "gemini-test-key")
+        self.assertEqual(models, ["gemini-generate"])
+
+    def test_custom_model_endpoint_is_derived_from_completion_url(self):
+        self.assertEqual(
+            custom_models_endpoint(
+                "https://llm.example.com/v1/chat/completions"
+            ),
+            "https://llm.example.com/v1/models",
+        )
+        response = {"data": [{"id": "company-model"}]}
+        with patch(
+            "security_review.service.get_provider_json", return_value=response
+        ) as request:
+            models = list_llm_models(
+                "custom",
+                "custom-test-key",
+                "https://llm.example.com/v1/chat/completions",
+            )
+        self.assertEqual(models, ["company-model"])
+        self.assertEqual(request.call_args.args[0], "https://llm.example.com/v1/models")
+
+    def test_model_fetch_requires_an_api_key(self):
+        with self.assertRaises(ReviewError):
+            list_llm_models("openai", "")
 
 
 class PathTests(unittest.TestCase):

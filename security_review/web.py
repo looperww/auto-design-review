@@ -32,6 +32,7 @@ from .service import (
     Config,
     ReviewError,
     effective_runtime_settings,
+    list_llm_models,
     normalize_runtime_setting,
     test_llm_connection,
 )
@@ -51,13 +52,59 @@ APP_JAVASCRIPT = b"""(() => {
   const provider = document.getElementById('llm_provider');
   const customField = document.getElementById('custom_api_url_field');
   const customInput = document.getElementById('llm_api_url');
+  const credentialForm = document.getElementById('credential_form');
+  const modelInput = document.getElementById('llm_model');
+  const modelPicker = document.getElementById('available_models');
+  const fetchButton = document.getElementById('fetch_models');
+  const modelStatus = document.getElementById('model_status');
   if (!provider || !customField || !customInput) return;
   const updateCustomField = () => {
     const visible = provider.value === 'custom';
     customField.hidden = !visible;
     customInput.disabled = !visible;
   };
-  provider.addEventListener('change', updateCustomField);
+  provider.addEventListener('change', () => {
+    updateCustomField();
+    if (modelPicker) modelPicker.hidden = true;
+    if (modelStatus) modelStatus.textContent = 'Fetch models after selecting a provider.';
+  });
+  if (modelPicker && modelInput) {
+    modelPicker.addEventListener('change', () => {
+      if (modelPicker.value) modelInput.value = modelPicker.value;
+    });
+  }
+  if (fetchButton && credentialForm && modelPicker && modelInput && modelStatus) {
+    fetchButton.addEventListener('click', async () => {
+      fetchButton.disabled = true;
+      modelPicker.hidden = true;
+      modelStatus.textContent = 'Fetching available models...';
+      try {
+        const formData = new FormData(credentialForm);
+        const requestData = new URLSearchParams();
+        for (const name of ['csrf', 'llm_provider', 'llm_api_key', 'llm_api_url']) {
+          if (formData.has(name)) requestData.set(name, String(formData.get(name) || ''));
+        }
+        const response = await fetch('/credentials/models', {
+          method: 'POST',
+          headers: {'Accept': 'application/json'},
+          body: requestData,
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || 'Could not fetch models.');
+        modelPicker.replaceChildren(new Option('Select a fetched model...', ''));
+        for (const model of payload.models) {
+          modelPicker.add(new Option(model, model));
+        }
+        if (payload.models.includes(modelInput.value)) modelPicker.value = modelInput.value;
+        modelPicker.hidden = false;
+        modelStatus.textContent = `${payload.models.length} model(s) available. Select one from the list.`;
+      } catch (error) {
+        modelStatus.textContent = error instanceof Error ? error.message : 'Could not fetch models.';
+      } finally {
+        fetchButton.disabled = false;
+      }
+    });
+  }
   updateCustomField();
 })();
 """
@@ -885,7 +932,7 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#14213d;--muted:#65758b;--line:#dbe3ed;--blue:#246bfd;--bg:#f5f8fc;--card:#fff;--red:#b42318;--green:#16803c}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:800}.severity-critical,.severity-high{background:#fff0ef;color:var(--red)}.severity-medium{background:#fff7df;color:#8a5700}.severity-low{background:#eaf0f8;color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}.settings-note{margin-bottom:22px}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
+main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:800}.severity-critical,.severity-high{background:#fff0ef;color:var(--red)}.severity-medium{background:#fff7df;color:#8a5700}.severity-low{background:#eaf0f8;color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
 """
 
 
@@ -944,7 +991,7 @@ def handler_factory(
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; form-action 'self'; "
-                "base-uri 'none'; frame-ancestors 'none'",
+                "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
             )
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
@@ -974,6 +1021,15 @@ def handler_factory(
             self.send_header("Content-Length", str(len(APP_JAVASCRIPT)))
             self.end_headers()
             self.wfile.write(APP_JAVASCRIPT)
+
+        def send_json(self, status: int, payload: dict[str, Any]) -> None:
+            encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            self.send_response(status)
+            self.security_headers()
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
 
         def redirect(
             self, location: str, extra_headers: list[tuple[str, str]] | None = None
@@ -1077,6 +1133,8 @@ def handler_factory(
                     self.test_gitlab_credentials(form)
                 elif parsed.path == "/credentials/test-llm":
                     self.test_llm_credentials(form)
+                elif parsed.path == "/credentials/models":
+                    self.fetch_llm_models(form)
                 elif parsed.path == "/settings":
                     self.update_settings(form)
                 else:
@@ -1305,6 +1363,44 @@ def handler_factory(
                     f"LLM connection test succeeded with {provider_label} using the {config.llm_model} model."
                 )
             )
+
+        def fetch_llm_models(self, form: dict[str, str]) -> None:
+            session = self.session()
+            if session is None:
+                self.send_json(401, {"error": "Sign in again before fetching models."})
+                return
+            _, user = session
+            if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
+                self.send_json(403, {"error": "The form expired. Reload Settings and try again."})
+                return
+            try:
+                existing, _, _ = self.credential_context()
+                provider = form.get("llm_provider", "anthropic").strip().lower()
+                submitted_key = form.get("llm_api_key", "").strip()
+                api_key = submitted_key or (
+                    existing.llm_api_key if provider == existing.llm_provider else ""
+                )
+                submitted_url = form.get("llm_api_url", "").strip()
+                api_url = submitted_url or (
+                    existing.llm_api_url if provider == existing.llm_provider else ""
+                )
+                validated = validated_credentials(
+                    "https://model-discovery.invalid",
+                    "model-discovery-token",
+                    api_key,
+                    provider,
+                    api_url,
+                    "model-discovery",
+                )
+                models = list_llm_models(
+                    validated.llm_provider,
+                    validated.llm_api_key,
+                    validated.llm_api_url,
+                )
+            except ReviewError as exc:
+                self.send_json(400, {"error": str(exc)})
+                return
+            self.send_json(200, {"models": models})
 
         def show_dashboard(self, query: dict[str, list[str]]) -> None:
             if store.user_count() == 0:
@@ -1569,6 +1665,16 @@ def handler_factory(
             else:
                 displayed_credentials = active_credentials or Credentials("", "", "")
                 gitlab_url = displayed_credentials.gitlab_url or "https://gitlab.com"
+                gitlab_token_placeholder = (
+                    "•••••••••••• (stored)"
+                    if displayed_credentials.gitlab_token
+                    else "Enter GitLab token"
+                )
+                llm_key_placeholder = (
+                    "•••••••••••• (stored)"
+                    if displayed_credentials.llm_api_key
+                    else "Enter LLM API key"
+                )
                 provider_options = "".join(
                     f"<option value='{provider}' {'selected' if displayed_credentials.llm_provider == provider else ''}>"
                     f"{html.escape(LLM_PROVIDER_LABELS[provider])}</option>"
@@ -1583,13 +1689,13 @@ def handler_factory(
                 credential_panel = f"""
                 <section class='card'><h2>Configure or rotate encrypted credentials</h2>
                 <p class='sub'>Save GitLab access first to test discovery. The LLM API key is optional and can be added later. Existing secrets are kept when their fields are left blank and the provider is unchanged.</p>
-                <form method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
+                <form id='credential_form' method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
                 <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
-                <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off'><small>Required the first time; leave blank later to keep the stored token.</small></div>
+                <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off' placeholder='{html.escape(gitlab_token_placeholder)}'><small>Required the first time; leave blank later to keep the stored token.</small></div>
                 <div class='field'><label for='llm_provider'>LLM provider</label><select id='llm_provider' name='llm_provider'>{provider_options}</select><small>Anthropic is the default. Custom means an OpenAI-compatible Chat Completions endpoint.</small></div>
-                <div class='field'><label for='llm_model'>Model</label><input id='llm_model' name='llm_model' value='{html.escape(llm_model)}' maxlength='256'><small>Use a model available to the selected provider account.</small></div>
+                <div class='field'><label for='llm_model'>Model</label><div class='inline-control'><input id='llm_model' name='llm_model' value='{html.escape(llm_model)}' maxlength='256'><button class='secondary' id='fetch_models' type='button'>Fetch models</button></div><select class='model-picker' id='available_models' aria-label='Available models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='model_status' aria-live='polite'>Use a model available to the selected provider account.</small></div>
                 <div class='field' id='custom_api_url_field'{custom_url_hidden}><label for='llm_api_url'>Custom API URL</label><input id='llm_api_url' name='llm_api_url' type='url' value='{html.escape(displayed_credentials.llm_api_url)}' placeholder='https://llm.example.com/v1/chat/completions'><small>Enter the exact HTTPS Chat Completions endpoint.</small></div>
-                <div class='field'><label for='llm_api_key'>LLM API key (optional)</label><input id='llm_api_key' name='llm_api_key' type='password' autocomplete='off'><small>Leave blank for discovery only. When changing provider, enter that provider's key.</small></div>
+                <div class='field'><label for='llm_api_key'>LLM API key (optional)</label><input id='llm_api_key' name='llm_api_key' type='password' autocomplete='off' placeholder='{html.escape(llm_key_placeholder)}'><small>Leave blank for discovery only. When changing provider, enter that provider's key.</small></div>
                 </div><div class='actions'><button type='submit'>Save encrypted credentials</button>
                 <button class='secondary' type='submit' formaction='/credentials/test-gitlab'>Test GitLab access</button>
                 <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test LLM connection</button></div>

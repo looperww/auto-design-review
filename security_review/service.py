@@ -1127,6 +1127,123 @@ def post_json(
     return result
 
 
+def get_provider_json(
+    url: str,
+    headers: Mapping[str, str],
+    *,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "security-review-service/1", **dict(headers)},
+        method="GET",
+    )
+    try:
+        opener = urllib.request.build_opener(NoRedirectHandler())
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read(10_000_001)
+    except urllib.error.HTTPError as exc:
+        raise ReviewError(f"LLM provider returned HTTP {exc.code} while listing models.") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise ReviewError("Could not connect to the LLM provider to list models.") from exc
+    if len(raw) > 10_000_000:
+        raise ReviewError("LLM model-list response exceeded the 10 MB safety limit.")
+    try:
+        result = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewError("LLM provider returned an invalid model-list response.") from exc
+    if not isinstance(result, dict):
+        raise ReviewError("LLM provider returned an unexpected model-list response.")
+    return result
+
+
+def custom_models_endpoint(api_url: str) -> str:
+    parsed = urllib.parse.urlsplit(api_url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/chat/completions"):
+        path = path[: -len("/chat/completions")] + "/models"
+    elif path.endswith("/responses"):
+        path = path[: -len("/responses")] + "/models"
+    elif path.endswith("/v1"):
+        path += "/models"
+    else:
+        path = path.rsplit("/", 1)[0] + "/models"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, path, parsed.query, "")
+    )
+
+
+def list_llm_models(provider: str, api_key: str, api_url: str = "") -> list[str]:
+    provider = provider.strip().lower()
+    api_key = api_key.strip()
+    if provider not in LLM_PROVIDERS:
+        raise ReviewError("Select a supported LLM provider.")
+    if not api_key:
+        raise ReviewError("Enter or save an API key before fetching models.")
+    if provider == "anthropic":
+        result = get_provider_json(
+            "https://api.anthropic.com/v1/models?limit=1000",
+            {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+        )
+        items = result.get("data")
+        name_key = "id"
+    elif provider == "openai":
+        result = get_provider_json(
+            "https://api.openai.com/v1/models",
+            {"Authorization": f"Bearer {api_key}"},
+        )
+        items = result.get("data")
+        name_key = "id"
+    elif provider == "gemini":
+        result = get_provider_json(
+            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
+            {"x-goog-api-key": api_key},
+        )
+        raw_items = result.get("models")
+        if not isinstance(raw_items, list):
+            raise ReviewError("Gemini returned an unexpected model-list response.")
+        models = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            methods = item.get("supportedGenerationMethods")
+            name = item.get("name")
+            if (
+                isinstance(name, str)
+                and isinstance(methods, list)
+                and "generateContent" in methods
+            ):
+                models.append(name.removeprefix("models/"))
+        items = [{"id": model} for model in models]
+        name_key = "id"
+    else:
+        if not api_url:
+            raise ReviewError("Enter the custom API URL before fetching models.")
+        result = get_provider_json(
+            custom_models_endpoint(api_url),
+            {"Authorization": f"Bearer {api_key}"},
+        )
+        items = result.get("data")
+        name_key = "id"
+    if not isinstance(items, list):
+        raise ReviewError("LLM provider returned an unexpected model-list response.")
+    models = sorted(
+        {
+            str(item[name_key]).strip()
+            for item in items
+            if isinstance(item, dict)
+            and isinstance(item.get(name_key), str)
+            and 0 < len(str(item[name_key]).strip()) <= 256
+        },
+        key=str.casefold,
+    )
+    if not models:
+        raise ReviewError("The provider returned no selectable models for this key.")
+    if len(models) > 2_000:
+        raise ReviewError("The provider returned too many models to display safely.")
+    return models
+
+
 def openai_response_text(result: Mapping[str, Any]) -> str:
     direct = result.get("output_text")
     if isinstance(direct, str) and direct.strip():
