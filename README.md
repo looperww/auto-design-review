@@ -137,7 +137,7 @@ account is created, the setup page is disabled and you are directed to sign in.
 
 ### 6. Sign in and configure the reviewer
 
-After signing in, configure:
+After signing in, select **Settings** in the dashboard header, then configure:
 
 - the GitLab URL;
 - the read-only GitLab token; and
@@ -209,9 +209,10 @@ Then open `http://127.0.0.1:6789` on your computer. Do not publish the console
 directly to a company network or the internet without an approved HTTPS reverse
 proxy and an infrastructure security review.
 
-The web console provides review status, repository health and MR activity,
-validated runtime settings, and credential rotation. Stored secrets are never
-displayed again.
+The home page is a dedicated dashboard for GitLab health, repository and MR
+activity, review status, and security findings. Runtime controls and credential
+rotation are kept on the separate authenticated **Settings** page. Stored
+secrets are never displayed again.
 
 After every container or host restart, sign in once to unlock the encrypted
 credential vault in memory. This is necessary because no plaintext credential
@@ -250,16 +251,24 @@ MR revisions discovered before the LLM key is configured appear with a `pending`
 status and have no report until the selected LLM reviews them.
 
 The dashboard combines visible repositories and fetched-MR activity in one
-table. For each repository it shows:
+**Repositories and MRs** table. For each repository it shows:
 
 - **Up** when the latest GitLab MR-list request for that repository succeeded,
   **Down** when it failed, and **Unknown** before the first completed check;
 - the number of distinct MRs in the selected period, counting multiple commit
-  revisions of one MR only once; and
+  revisions of one MR only once;
+- the number of parsed security findings in the latest reviewed revision of
+  those MRs; and
 - the latest MR creation date and time in that period.
 
 Click a non-zero MR count to open that repository's filtered MR list and its
 available security reports.
+
+The **Review status** section lists all parsed findings for the active period,
+ordered Critical, High, Medium, then Low. Each row shows the finding title, a
+direct link to the corresponding GitLab MR, and an expandable vulnerability
+details panel. A report containing the required `No high-confidence security
+findings.` result adds no finding rows.
 
 Day, Week, and Month select rolling windows of 24 hours, 7 days, and 30 days.
 The administrator can also select an inclusive UTC start-date and end-date

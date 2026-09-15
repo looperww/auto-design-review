@@ -11,12 +11,14 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
@@ -40,6 +42,10 @@ SESSION_LIFETIME_SECONDS = 12 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_LOGIN_ATTEMPTS = 10
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,64}$")
+FINDING_HEADING_PATTERN = re.compile(
+    r"(?m)^### \[(CRITICAL|HIGH|MEDIUM|LOW)\] ([^\r\n]+?)\s*$"
+)
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 VAULT_ASSOCIATED_DATA = b"gitlab-security-review-vault-v1"
 APP_JAVASCRIPT = b"""(() => {
   const provider = document.getElementById('llm_provider');
@@ -55,6 +61,61 @@ APP_JAVASCRIPT = b"""(() => {
   updateCustomField();
 })();
 """
+
+
+def parse_security_findings(report: str) -> list[dict[str, str]]:
+    matches = list(FINDING_HEADING_PATTERN.finditer(report))
+    findings: list[dict[str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(report)
+        details = report[match.end() : end].strip()
+        findings.append(
+            {
+                "severity": match.group(1),
+                "title": match.group(2).strip(),
+                "details": details or "No additional details were provided.",
+            }
+        )
+    return findings
+
+
+def collect_security_findings(
+    reports: Iterable[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    findings: list[dict[str, Any]] = []
+    counts: dict[int, int] = {}
+    for report in reports:
+        project_id = int(report["project_id"])
+        project_path = str(report["project_path"])
+        mr_iid = int(report["mr_iid"])
+        project_url = str(report["project_web_url"] or "")
+        parsed_url = urllib.parse.urlparse(project_url)
+        mr_url = (
+            project_url.rstrip("/") + f"/-/merge_requests/{mr_iid}"
+            if parsed_url.scheme == "https" and parsed_url.netloc
+            else ""
+        )
+        parsed_findings = parse_security_findings(str(report["report_content"]))
+        counts[project_id] = counts.get(project_id, 0) + len(parsed_findings)
+        for finding in parsed_findings:
+            findings.append(
+                {
+                    **finding,
+                    "project_id": project_id,
+                    "project_path": project_path,
+                    "mr_iid": mr_iid,
+                    "mr_url": mr_url,
+                }
+            )
+    findings.sort(
+        key=lambda finding: (
+            SEVERITY_ORDER[str(finding["severity"])],
+            str(finding["project_path"]).casefold(),
+            int(finding["mr_iid"]),
+            str(finding["title"]).casefold(),
+        )
+    )
+    return findings, counts
 
 
 @dataclass(frozen=True)
@@ -185,6 +246,10 @@ class MemoryVault:
                     "The credential vault is locked. Sign in again to unlock it."
                 )
             return self.kdf_salt, self.encryption_key
+
+    def ready_for_updates(self) -> bool:
+        with self.condition:
+            return self.kdf_salt is not None and self.encryption_key is not None
 
     def wait_for_credentials(self) -> tuple[Credentials, int]:
         with self.condition:
@@ -745,6 +810,37 @@ class WebStore:
                 (project_id, start.isoformat(), end.isoformat()),
             ).fetchall()
 
+    def latest_review_reports(
+        self, start: datetime, end: datetime
+    ) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                WITH ranked AS (
+                    SELECT reviews.project_id, reviews.project_path,
+                           reviews.mr_iid, reviews.head_sha, reviews.status,
+                           reviews.report_content, reviews.reviewed_at,
+                           projects.web_url AS project_web_url,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY reviews.project_id, reviews.mr_iid
+                               ORDER BY reviews.reviewed_at DESC
+                           ) AS revision_rank
+                    FROM reviews
+                    LEFT JOIN visible_projects AS projects
+                      ON projects.project_id = reviews.project_id
+                    WHERE COALESCE(NULLIF(reviews.mr_created_at, ''), reviews.discovered_at) >= ?
+                      AND COALESCE(NULLIF(reviews.mr_created_at, ''), reviews.discovered_at) < ?
+                      AND reviews.report_content IS NOT NULL
+                      AND reviews.report_content != ''
+                )
+                SELECT project_id, project_path, mr_iid, head_sha, status,
+                       report_content, reviewed_at, project_web_url
+                FROM ranked
+                WHERE revision_rank = 1
+                """,
+                (start.isoformat(), end.isoformat()),
+            ).fetchall()
+
     def mr_activity(self, period: str) -> tuple[int, list[sqlite3.Row]]:
         durations = {
             "day": timedelta(days=1),
@@ -789,7 +885,7 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#14213d;--muted:#65758b;--line:#dbe3ed;--blue:#246bfd;--bg:#f5f8fc;--card:#fff;--red:#b42318;--green:#16803c}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
+main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}[hidden]{display:none!important}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:800}.severity-critical,.severity-high{background:#fff0ef;color:var(--red)}.severity-medium{background:#fff7df;color:#8a5700}.severity-low{background:#eaf0f8;color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}.settings-note{margin-bottom:22px}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}.filter-bar{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
 """
 
 
@@ -952,6 +1048,8 @@ def handler_factory(
                 self.show_setup()
             elif parsed.path == "/login":
                 self.show_login()
+            elif parsed.path == "/settings":
+                self.show_settings(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/report":
                 self.show_report(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/repository":
@@ -1101,7 +1199,7 @@ def handler_factory(
             password = form.get("password", "")
             authenticated = store.authenticate(str(user["username"]), password)
             if authenticated is None:
-                self.redirect("/?message=" + urllib.parse.quote("The password was not accepted."))
+                self.redirect("/settings?message=" + urllib.parse.quote("The password was not accepted."))
                 return
             credentials, salt, encryption_key = store.unlock_credentials_with_key(
                 password
@@ -1112,7 +1210,7 @@ def handler_factory(
                 if credentials.llm_api_key
                 else "Credential vault unlocked; GitLab discovery can run. Add an LLM API key to begin reviews."
             )
-            self.redirect("/?message=" + urllib.parse.quote(message))
+            self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def update_credentials(self, form: dict[str, str]) -> None:
             session = self.require_session()
@@ -1130,7 +1228,7 @@ def handler_factory(
                 if credentials.llm_api_key
                 else "GitLab access saved; MR discovery is active. Add an LLM API key later to review queued MRs."
             )
-            self.redirect("/?message=" + urllib.parse.quote(message))
+            self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def credential_context(self) -> tuple[Credentials, bytes, bytes]:
             existing, _ = vault.snapshot()
@@ -1175,7 +1273,7 @@ def handler_factory(
                 credentials.gitlab_url, credentials.gitlab_token
             ).list_projects()
             self.redirect(
-                "/?message="
+                "/settings?message="
                 + urllib.parse.quote(
                     f"GitLab access test succeeded: {len(projects)} repositories are visible to this token."
                 )
@@ -1202,7 +1300,7 @@ def handler_factory(
             test_llm_connection(config)
             provider_label = LLM_PROVIDER_LABELS[credentials.llm_provider]
             self.redirect(
-                "/?message="
+                "/settings?message="
                 + urllib.parse.quote(
                     f"LLM connection test succeeded with {provider_label} using the {config.llm_model} model."
                 )
@@ -1216,11 +1314,6 @@ def handler_factory(
             if session is None:
                 return
             _, user = session
-            saved = store.settings()
-            try:
-                settings = effective_runtime_settings(saved)
-            except ReviewError:
-                settings = effective_runtime_settings({})
             period = query.get("period", ["week"])[0]
             if period not in {"day", "week", "month"}:
                 period = "week"
@@ -1234,14 +1327,17 @@ def handler_factory(
             counts, _ = store.dashboard()
             date_error = ""
             try:
-                projects, _, _ = store.repository_activity(
+                projects, activity_start, activity_end = store.repository_activity(
                     period, start_date, end_date
                 )
             except ReviewError as exc:
                 date_error = str(exc)
                 start_date = ""
                 end_date = ""
-                projects, _, _ = store.repository_activity(period)
+                projects, activity_start, activity_end = store.repository_activity(period)
+            findings, finding_counts = collect_security_findings(
+                store.latest_review_reports(activity_start, activity_end)
+            )
             fetched_mrs = sum(int(project["mr_count"]) for project in projects)
             filter_label = (
                 (
@@ -1312,6 +1408,31 @@ def handler_factory(
                 if start_date and end_date
                 else {"period": period}
             )
+            finding_rows = []
+            for finding in findings:
+                severity = str(finding["severity"])
+                mr_label = (
+                    f"{html.escape(str(finding['project_path']))} !{int(finding['mr_iid'])}"
+                )
+                mr_url = str(finding["mr_url"])
+                mr_display = (
+                    f"<a href='{html.escape(mr_url)}' target='_blank' "
+                    f"rel='noopener noreferrer'>{mr_label}</a>"
+                    if mr_url
+                    else mr_label
+                )
+                finding_rows.append(
+                    "<tr>"
+                    f"<td><span class='severity severity-{severity.lower()}'>{html.escape(severity)}</span></td>"
+                    f"<td>{html.escape(str(finding['title']))}</td>"
+                    f"<td>{mr_display}</td>"
+                    "<td><details><summary>View details</summary>"
+                    f"<pre class='finding-details'>{html.escape(str(finding['details']))}</pre>"
+                    "</details></td></tr>"
+                )
+            visible_finding_rows = "".join(finding_rows) or (
+                "<tr><td colspan='4'>No security findings in this period.</td></tr>"
+            )
             project_rows = []
             for project in projects:
                 project_path = html.escape(str(project["project_path"]))
@@ -1350,89 +1471,137 @@ def handler_factory(
                     if mr_count
                     else "0"
                 )
+                project_findings = finding_counts.get(int(project["project_id"]), 0)
                 project_rows.append(
                     "<tr>"
                     f"<td>{project_name}</td>"
                     f"<td><span class='status {html.escape(project_status)}' "
                     f"title='{html.escape(status_title)}'>{html.escape(project_status.title())}</span></td>"
                     f"<td>{mr_count_display}</td>"
+                    f"<td>{project_findings}</td>"
                     f"<td>{html.escape(latest_mr)}</td>"
                     "</tr>"
                 )
             visible_project_rows = "".join(project_rows) or (
-                "<tr><td colspan='4'>No repositories discovered yet.</td></tr>"
+                "<tr><td colspan='5'>No repositories discovered yet.</td></tr>"
             )
-            fields = "".join(form_field(item.key, settings[item.key]) for item in RUNTIME_SETTINGS)
             credentials_configured = store.credentials_configured()
             if active_credentials is None and credentials_configured:
-                vault_panel = f"""
-                <section class='card'><h2>Reviewer locked</h2>
-                <p class='error'>The encrypted credentials are safe in SQLite, but GitLab discovery must be unlocked after a restart.</p>
-                <form method='post' action='/unlock'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'>
-                <div class='field'><label for='unlock_password'>Administrator password</label><input id='unlock_password' name='password' type='password' autocomplete='current-password' required></div>
-                <div class='actions'><button type='submit'>Unlock service</button></div></form></section>"""
-                gitlab_url = "https://gitlab.com"
+                vault_panel = (
+                    "<p class='error'>The reviewer is locked after a restart. "
+                    "<a href='/settings'>Open Settings</a> to unlock it.</p>"
+                )
             elif active_credentials is None:
-                vault_panel = "<p class='error'>GitLab access is not configured. Enter it below to start MR discovery.</p>"
-                gitlab_url = "https://gitlab.com"
+                vault_panel = (
+                    "<p class='error'>GitLab access is not configured. "
+                    "<a href='/settings'>Open Settings</a> to start MR discovery.</p>"
+                )
             elif not active_credentials.llm_api_key:
                 vault_panel = (
                     "<p class='notice'>GitLab discovery is unlocked. Open MR revisions are queued without downloading code. "
-                    "Add an LLM API key to start reviewing the queue.</p>"
+                    "<a href='/settings'>Add an LLM API key</a> to start reviewing the queue.</p>"
                 )
-                gitlab_url = active_credentials.gitlab_url
             else:
                 provider_label = html.escape(LLM_PROVIDER_LABELS[active_credentials.llm_provider])
                 vault_panel = f"<p class='notice'>GitLab discovery and {provider_label} security reviews are unlocked.</p>"
-                gitlab_url = active_credentials.gitlab_url
-            displayed_credentials = active_credentials or Credentials("", "", "")
-            provider_options = "".join(
-                f"<option value='{provider}' {'selected' if displayed_credentials.llm_provider == provider else ''}>"
-                f"{html.escape(LLM_PROVIDER_LABELS[provider])}</option>"
-                for provider in LLM_PROVIDERS
-            )
-            llm_model = displayed_credentials.llm_model or LLM_DEFAULT_MODELS[
-                displayed_credentials.llm_provider
-            ]
-            llm_api_url = displayed_credentials.llm_api_url
-            custom_url_hidden = "" if displayed_credentials.llm_provider == "custom" else " hidden"
             maximum_filter_date = datetime.now(timezone.utc).date().isoformat()
             body = f"""
             <header><div><h1>Security Review</h1><p class='sub'>Signed in as {html.escape(str(user['username']))}</p></div>
             <div class='top-actions'><span class='status {reviewer_class}'>{reviewer_label}</span>
+            <a class='button secondary' href='/settings'>Settings</a>
             <form method='post' action='/logout'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><button class='secondary'>Sign out</button></form></div></header>
             {notice}{vault_panel}<section class='card'><h2>GitLab connection</h2>{scan_panel}</section>
-            <section class='card'><h2>Repositories and fetched MRs</h2>
+            <section class='card'><h2>Repositories and MRs</h2>
             <p class='sub'>Shows every currently visible repository and distinct MRs first discovered after this deployment ({html.escape(deployment_time + ' UTC' if deployment_time else 'initializing')}). Current filter: {html.escape(filter_label)}.</p>
             <div class='filter-bar'><div class='actions'>{period_links}</div>
             <form class='date-filter' method='get' action='/'>
             <div><label for='activity_start_date'>Start date (UTC)</label><input id='activity_start_date' name='start_date' type='date' value='{html.escape(start_date)}' max='{maximum_filter_date}' required></div>
             <div><label for='activity_end_date'>End date (UTC)</label><input id='activity_end_date' name='end_date' type='date' value='{html.escape(end_date)}' max='{maximum_filter_date}' required></div>
             <button class='secondary' type='submit'>Apply range</button></form></div>
-            <div class='grid activity-grid'><div class='metric'>Fetched MRs in {html.escape(filter_label)}<strong>{fetched_mrs}</strong></div><div class='metric'>Visible repositories<strong>{len(projects)}</strong></div></div>
-            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Status</th><th>MRs</th><th>Latest MR</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div></section>
+            <div class='grid activity-grid'><div class='metric'>Fetched MRs in {html.escape(filter_label)}<strong>{fetched_mrs}</strong></div><div class='metric'>Visible repositories<strong>{len(projects)}</strong></div><div class='metric'>Findings<strong>{len(findings)}</strong></div></div>
+            <div class='table-wrap'><table><thead><tr><th>Repository</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{visible_project_rows}</tbody></table></div></section>
             <section class='card'><h2>Review status</h2><div class='grid'>
             <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
             <div class='metric'>Completed<strong>{counts.get('completed', 0)}</strong></div>
             <div class='metric'>High severity<strong>{counts.get('high_severity', 0)}</strong></div>
             <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
-            <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div></div></section>
-            <section class='card'><h2>Runtime settings</h2><p class='sub'>Saved in SQLite and applied automatically at the next polling cycle.</p>
-            <form method='post' action='/settings'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>{fields}</div><div class='actions'><button type='submit'>Save settings</button></div></form></section>
-            <section class='card'><h2>Configure or rotate encrypted credentials</h2><p class='sub'>Save GitLab access first to test discovery. The LLM API key is optional and can be added later. Existing secrets are kept when their fields are left blank and the provider is unchanged.</p>
-            <form method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
-            <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
-            <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off'><small>Required the first time; leave blank later to keep the stored token.</small></div>
-            <div class='field'><label for='llm_provider'>LLM provider</label><select id='llm_provider' name='llm_provider'>{provider_options}</select><small>Anthropic is the default. Custom means an OpenAI-compatible Chat Completions endpoint.</small></div>
-            <div class='field'><label for='llm_model'>Model</label><input id='llm_model' name='llm_model' value='{html.escape(llm_model)}' maxlength='256'><small>Use a model available to the selected provider account.</small></div>
-            <div class='field' id='custom_api_url_field'{custom_url_hidden}><label for='llm_api_url'>Custom API URL</label><input id='llm_api_url' name='llm_api_url' type='url' value='{html.escape(llm_api_url)}' placeholder='https://llm.example.com/v1/chat/completions'><small>Enter the exact HTTPS Chat Completions endpoint.</small></div>
-            <div class='field'><label for='llm_api_key'>LLM API key (optional)</label><input id='llm_api_key' name='llm_api_key' type='password' autocomplete='off'><small>Leave blank for discovery only. When changing provider, enter that provider's key.</small></div>
-            </div><div class='actions'><button type='submit'>Save encrypted credentials</button>
-            <button class='secondary' type='submit' formaction='/credentials/test-gitlab'>Test GitLab access</button>
-            <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test LLM connection</button></div>
-            <p class='sub'>Tests do not save the entered values. The LLM test sends one minimal request using the selected provider and model and may incur a very small API charge.</p></form></section>
-            <script src='/app.js' defer></script>"""
+            <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div></div>
+            <h2 style='margin-top:28px'>Security findings</h2>
+            <p class='sub'>Latest reviewed revision of each MR in {html.escape(filter_label)}; ordered from Critical to Low.</p>
+            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th></tr></thead><tbody>{visible_finding_rows}</tbody></table></div></section>"""
             self.send_page(200, page("Dashboard", body))
+
+        def show_settings(self, query: dict[str, list[str]]) -> None:
+            if store.user_count() == 0:
+                self.redirect("/setup")
+                return
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            saved = store.settings()
+            try:
+                settings = effective_runtime_settings(saved)
+            except ReviewError:
+                settings = effective_runtime_settings({})
+            fields = "".join(
+                form_field(item.key, settings[item.key]) for item in RUNTIME_SETTINGS
+            )
+            message = query.get("message", [""])[0]
+            notice = (
+                f"<p class='notice'>{html.escape(message)}</p>" if message else ""
+            )
+            active_credentials, _ = vault.snapshot()
+            credentials_configured = store.credentials_configured()
+            if credentials_configured and active_credentials is None:
+                credential_panel = f"""
+                <section class='card'><h2>Unlock encrypted credentials</h2>
+                <p class='error'>The encrypted credentials are safe in SQLite, but the reviewer must be unlocked after a restart.</p>
+                <form method='post' action='/unlock'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'>
+                <div class='field'><label for='unlock_password'>Administrator password</label><input id='unlock_password' name='password' type='password' autocomplete='current-password' required></div>
+                <div class='actions'><button type='submit'>Unlock service</button></div></form></section>"""
+            elif not credentials_configured and not vault.ready_for_updates():
+                credential_panel = (
+                    "<section class='card'><h2>Configure encrypted credentials</h2>"
+                    "<p class='error'>Sign out and sign in again before saving credentials. "
+                    "This prepares the in-memory encryption key without storing your password.</p></section>"
+                )
+            else:
+                displayed_credentials = active_credentials or Credentials("", "", "")
+                gitlab_url = displayed_credentials.gitlab_url or "https://gitlab.com"
+                provider_options = "".join(
+                    f"<option value='{provider}' {'selected' if displayed_credentials.llm_provider == provider else ''}>"
+                    f"{html.escape(LLM_PROVIDER_LABELS[provider])}</option>"
+                    for provider in LLM_PROVIDERS
+                )
+                llm_model = displayed_credentials.llm_model or LLM_DEFAULT_MODELS[
+                    displayed_credentials.llm_provider
+                ]
+                custom_url_hidden = (
+                    "" if displayed_credentials.llm_provider == "custom" else " hidden"
+                )
+                credential_panel = f"""
+                <section class='card'><h2>Configure or rotate encrypted credentials</h2>
+                <p class='sub'>Save GitLab access first to test discovery. The LLM API key is optional and can be added later. Existing secrets are kept when their fields are left blank and the provider is unchanged.</p>
+                <form method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
+                <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
+                <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off'><small>Required the first time; leave blank later to keep the stored token.</small></div>
+                <div class='field'><label for='llm_provider'>LLM provider</label><select id='llm_provider' name='llm_provider'>{provider_options}</select><small>Anthropic is the default. Custom means an OpenAI-compatible Chat Completions endpoint.</small></div>
+                <div class='field'><label for='llm_model'>Model</label><input id='llm_model' name='llm_model' value='{html.escape(llm_model)}' maxlength='256'><small>Use a model available to the selected provider account.</small></div>
+                <div class='field' id='custom_api_url_field'{custom_url_hidden}><label for='llm_api_url'>Custom API URL</label><input id='llm_api_url' name='llm_api_url' type='url' value='{html.escape(displayed_credentials.llm_api_url)}' placeholder='https://llm.example.com/v1/chat/completions'><small>Enter the exact HTTPS Chat Completions endpoint.</small></div>
+                <div class='field'><label for='llm_api_key'>LLM API key (optional)</label><input id='llm_api_key' name='llm_api_key' type='password' autocomplete='off'><small>Leave blank for discovery only. When changing provider, enter that provider's key.</small></div>
+                </div><div class='actions'><button type='submit'>Save encrypted credentials</button>
+                <button class='secondary' type='submit' formaction='/credentials/test-gitlab'>Test GitLab access</button>
+                <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test LLM connection</button></div>
+                <p class='sub'>Tests do not save the entered values. The LLM test sends one minimal request using the selected provider and model and may incur a very small API charge.</p></form></section>"""
+            body = f"""
+            <header><div><h1>Settings</h1><p class='sub'>Runtime controls and encrypted service credentials</p></div>
+            <div class='top-actions'><a class='button secondary' href='/'>Dashboard</a>
+            <form method='post' action='/logout'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><button class='secondary'>Sign out</button></form></div></header>
+            {notice}<section class='card'><h2>Runtime settings</h2><p class='sub'>Saved in SQLite and applied automatically at the next polling cycle.</p>
+            <form method='post' action='/settings'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>{fields}</div><div class='actions'><button type='submit'>Save settings</button></div></form></section>
+            {credential_panel}<script src='/app.js' defer></script>"""
+            self.send_page(200, page("Settings", body))
 
         def update_settings(self, form: dict[str, str]) -> None:
             session = self.require_session()
@@ -1451,7 +1620,7 @@ def handler_factory(
                 message = "Settings saved. Unlock the reviewer with your administrator password."
             else:
                 message = "Settings saved. They will apply on the next polling cycle."
-            self.redirect("/?message=" + urllib.parse.quote(message))
+            self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def show_repository(self, query: dict[str, list[str]]) -> None:
             if self.require_session() is None:

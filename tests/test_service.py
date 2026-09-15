@@ -34,8 +34,10 @@ from security_review.service import (  # noqa: E402
 from security_review.web import (  # noqa: E402
     Credentials,
     WebStore,
+    collect_security_findings,
     decrypt_credentials,
     encrypt_credentials,
+    parse_security_findings,
     password_record,
     validated_credentials,
     verify_password,
@@ -416,6 +418,49 @@ class DiscoveryInventoryTests(unittest.TestCase):
             self.assertEqual(statuses["company/first"], "up")
             self.assertEqual(statuses["company/second"], "up")
             state.close()
+
+    def test_findings_are_parsed_counted_and_sorted_by_severity(self):
+        reports = [
+            {
+                "project_id": 1,
+                "project_path": "company/app",
+                "project_web_url": "https://gitlab.example.com/company/app",
+                "mr_iid": 7,
+                "report_content": (
+                    "# Security review\n\n## Findings\n\n"
+                    "### [LOW] Verbose error\nFile: app.py:1\nMinor exposure.\n\n"
+                    "### [CRITICAL] Command injection\nFile: shell.py:8\nUser input reaches a shell.\n"
+                ),
+            },
+            {
+                "project_id": 2,
+                "project_path": "company/api",
+                "project_web_url": "javascript:alert(1)",
+                "mr_iid": 9,
+                "report_content": (
+                    "# Security review\n\n## Findings\n\n"
+                    "### [HIGH] Authorization bypass\nFile: auth.py:3\nCheck is missing.\n"
+                ),
+            },
+        ]
+        findings, counts = collect_security_findings(reports)
+        self.assertEqual(
+            [finding["severity"] for finding in findings],
+            ["CRITICAL", "HIGH", "LOW"],
+        )
+        self.assertEqual(counts, {1: 2, 2: 1})
+        self.assertEqual(
+            findings[0]["mr_url"],
+            "https://gitlab.example.com/company/app/-/merge_requests/7",
+        )
+        self.assertEqual(findings[1]["mr_url"], "")
+        self.assertIn("User input reaches a shell.", findings[0]["details"])
+        self.assertEqual(
+            parse_security_findings(
+                "# Security review\n\n## Findings\nNo high-confidence security findings."
+            ),
+            [],
+        )
 
     def test_repository_activity_uses_mr_dates_and_project_health(self):
         with tempfile.TemporaryDirectory() as directory:
