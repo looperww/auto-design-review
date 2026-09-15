@@ -80,18 +80,12 @@ def decrypt_credentials(
         credentials = Credentials(
             gitlab_url=str(payload["gitlab_url"]),
             gitlab_token=str(payload["gitlab_token"]),
-            anthropic_api_key=str(payload["anthropic_api_key"]),
+            anthropic_api_key=str(payload.get("anthropic_api_key", "")),
         )
     except (ValueError, KeyError, TypeError, json.JSONDecodeError, InvalidTag) as exc:
         raise ReviewError("The credential vault could not be unlocked.") from exc
-    if not all(
-        (
-            credentials.gitlab_url.strip(),
-            credentials.gitlab_token.strip(),
-            credentials.anthropic_api_key.strip(),
-        )
-    ):
-        raise ReviewError("The credential vault is incomplete.")
+    if not credentials.gitlab_url.strip() or not credentials.gitlab_token.strip():
+        raise ReviewError("The credential vault does not contain GitLab access.")
     return credentials
 
 
@@ -162,8 +156,8 @@ def validated_credentials(
     anthropic_api_key = anthropic_api_key.strip()
     if not 8 <= len(gitlab_token) <= 4096:
         raise ReviewError("GitLab token is missing or has an invalid length.")
-    if not 8 <= len(anthropic_api_key) <= 4096:
-        raise ReviewError("Anthropic API key is missing or has an invalid length.")
+    if anthropic_api_key and not 8 <= len(anthropic_api_key) <= 4096:
+        raise ReviewError("Anthropic API key has an invalid length.")
     return Credentials(url, gitlab_token, anthropic_api_key)
 
 
@@ -261,6 +255,9 @@ class WebStore:
                 connection.execute("ALTER TABLE reviews ADD COLUMN report_content TEXT")
             if "metadata_json" not in review_columns:
                 connection.execute("ALTER TABLE reviews ADD COLUMN metadata_json TEXT")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
 
     def user_count(self) -> int:
         with self.connect() as connection:
@@ -349,7 +346,7 @@ class WebStore:
                 "SELECT kdf_salt, nonce, ciphertext FROM credential_vault WHERE id = 1"
             ).fetchone()
         if row is None:
-            raise ReviewError("GitLab and Anthropic credentials have not been configured.")
+            raise ReviewError("GitLab credentials have not been configured.")
         return decrypt_credentials(
             str(row["kdf_salt"]),
             str(row["nonce"]),
@@ -458,6 +455,13 @@ class WebStore:
             ).fetchall()
         return counts, recent
 
+    def scan_status(self) -> dict[str, str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT key, value FROM metadata WHERE key LIKE 'last_gitlab_check_%'"
+            ).fetchall()
+        return {str(row["key"]): str(row["value"]) for row in rows}
+
     def report(self, project_id: int, mr_iid: int, head_sha: str) -> sqlite3.Row | None:
         with self.connect() as connection:
             return connection.execute(
@@ -473,7 +477,7 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#14213d;--muted:#65758b;--line:#dbe3ed;--blue:#246bfd;--bg:#f5f8fc;--card:#fff;--red:#b42318;--green:#16803c}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed{color:var(--red)}.completed{color:var(--green)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
+main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}h1{font-size:31px;margin:0}h2{font-size:21px;margin:0 0 18px}.sub{color:var(--muted);margin:7px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;box-shadow:0 8px 28px rgba(20,33,61,.05);margin-bottom:22px}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:28px;margin-top:4px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus{outline:3px solid #d9e6ff;border-color:var(--blue)}button,.button{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}.secondary{background:#eaf0f8;color:var(--ink)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px}.notice,.error{padding:12px 14px;border-radius:9px;margin-bottom:18px}.notice{background:#eaf7ee;color:#116329}.error{background:#fff0ef;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}.status{font-weight:700}.high_severity,.failed{color:var(--red)}.completed{color:var(--green)}.pending{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.top-actions{display:flex;gap:10px;align-items:center}.top-actions form{margin:0}@media(max-width:760px){.grid,.form-grid{grid-template-columns:1fr}header{align-items:flex-start;gap:20px;flex-direction:column}.table-wrap{overflow:auto}}
 """
 
 
@@ -732,7 +736,7 @@ def handler_factory(
                 store.record_failed_login(remote)
                 self.show_login("Invalid username or password.")
                 return
-            if store.credentials_configured() and store.settings_configured():
+            if store.credentials_configured():
                 try:
                     credentials = store.unlock_credentials(password)
                 except ReviewError as exc:
@@ -762,15 +766,19 @@ def handler_factory(
             _, user = session
             if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
                 raise ReviewError("Invalid form token.")
-            if not store.settings_configured():
-                raise ReviewError("Save the runtime settings before unlocking the reviewer.")
             password = form.get("password", "")
             authenticated = store.authenticate(str(user["username"]), password)
             if authenticated is None:
                 self.redirect("/?message=" + urllib.parse.quote("The password was not accepted."))
                 return
-            vault.set(store.unlock_credentials(password))
-            self.redirect("/?message=" + urllib.parse.quote("Credential vault unlocked; reviews can run."))
+            credentials = store.unlock_credentials(password)
+            vault.set(credentials)
+            message = (
+                "Credential vault unlocked; GitLab discovery and Claude reviews can run."
+                if credentials.anthropic_api_key
+                else "Credential vault unlocked; GitLab discovery can run. Add an Anthropic API key to begin reviews."
+            )
+            self.redirect("/?message=" + urllib.parse.quote(message))
 
         def update_credentials(self, form: dict[str, str]) -> None:
             session = self.require_session()
@@ -782,17 +790,26 @@ def handler_factory(
             password = form.get("password", "")
             if store.authenticate(str(user["username"]), password) is None:
                 raise ReviewError("The administrator password was not accepted.")
+            existing = (
+                store.unlock_credentials(password)
+                if store.credentials_configured()
+                else Credentials("", "", "")
+            )
+            submitted_gitlab_url = form.get("gitlab_url", "").strip()
+            submitted_gitlab_token = form.get("gitlab_token", "").strip()
+            submitted_anthropic_key = form.get("anthropic_api_key", "").strip()
             credentials = validated_credentials(
-                form.get("gitlab_url", ""),
-                form.get("gitlab_token", ""),
-                form.get("anthropic_api_key", ""),
+                submitted_gitlab_url or existing.gitlab_url,
+                submitted_gitlab_token or existing.gitlab_token,
+                submitted_anthropic_key or existing.anthropic_api_key,
             )
             store.save_credentials(credentials, password)
-            if store.settings_configured():
-                vault.set(credentials)
-                message = "Encrypted credentials updated; reviewer unlocked."
-            else:
-                message = "Encrypted credentials saved. Save the runtime settings, then unlock the reviewer."
+            vault.set(credentials)
+            message = (
+                "Credentials saved; GitLab discovery and Claude reviews are active."
+                if credentials.anthropic_api_key
+                else "GitLab access saved; MR discovery is active. Add an Anthropic API key later to review queued MRs."
+            )
             self.redirect("/?message=" + urllib.parse.quote(message))
 
         def show_dashboard(self, query: dict[str, list[str]]) -> None:
@@ -809,15 +826,19 @@ def handler_factory(
             except ReviewError:
                 settings = effective_runtime_settings({})
             counts, recent = store.dashboard()
+            scan_status = store.scan_status()
             active_credentials, _ = vault.snapshot()
-            settings_configured = store.settings_configured()
             heartbeat = Path(os.environ.get("HEARTBEAT_FILE", "/data/heartbeat"))
             try:
                 running = heartbeat.is_file() and time.time() - heartbeat.stat().st_mtime < 180
             except OSError:
                 running = False
             if running and active_credentials is not None:
-                reviewer_label = "Reviewer active"
+                reviewer_label = (
+                    "Reviews active"
+                    if active_credentials.anthropic_api_key
+                    else "GitLab discovery active"
+                )
                 reviewer_class = "completed"
             elif running:
                 reviewer_label = "Reviewer locked"
@@ -827,6 +848,27 @@ def handler_factory(
                 reviewer_class = "failed"
             message = query.get("message", [""])[0]
             notice = f"<p class='notice'>{html.escape(message)}</p>" if message else ""
+            check_state = scan_status.get("last_gitlab_check_status", "")
+            check_time = scan_status.get("last_gitlab_check_at", "")[:19]
+            if check_state == "success":
+                try:
+                    summary = json.loads(scan_status.get("last_gitlab_check_summary", "{}"))
+                except json.JSONDecodeError:
+                    summary = {}
+                scan_panel = (
+                    "<p class='notice'><strong>GitLab connection successful.</strong> "
+                    f"Last checked {html.escape(check_time or 'recently')}; "
+                    f"found {int(summary.get('discovered', 0))} open MR revision(s), "
+                    f"with {int(summary.get('pending', 0))} awaiting review.</p>"
+                )
+            elif check_state == "failed":
+                scan_panel = (
+                    "<p class='error'><strong>GitLab connection failed.</strong> "
+                    f"Last checked {html.escape(check_time or 'recently')}: "
+                    f"{html.escape(scan_status.get('last_gitlab_check_error', 'Unknown error'))}</p>"
+                )
+            else:
+                scan_panel = "<p class='sub'>No GitLab connection check has completed yet.</p>"
             fields = "".join(form_field(item.key, settings[item.key]) for item in RUNTIME_SETTINGS)
             rows = []
             for row in recent:
@@ -852,48 +894,47 @@ def handler_factory(
                 )
             table_rows = "".join(rows) or "<tr><td colspan='6'>No reviews recorded yet.</td></tr>"
             credentials_configured = store.credentials_configured()
-            if not settings_configured:
-                vault_panel = (
-                    "<p class='error'>Complete and save the runtime settings below. "
-                    "The reviewer will remain locked until configuration is complete.</p>"
-                )
-                gitlab_url = "https://gitlab.com"
-            elif active_credentials is None and credentials_configured:
+            if active_credentials is None and credentials_configured:
                 vault_panel = f"""
                 <section class='card'><h2>Reviewer locked</h2>
-                <p class='error'>The encrypted credentials are safe in SQLite, but the reviewer must be unlocked after a restart.</p>
+                <p class='error'>The encrypted credentials are safe in SQLite, but GitLab discovery must be unlocked after a restart.</p>
                 <form method='post' action='/unlock'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'>
                 <div class='field'><label for='unlock_password'>Administrator password</label><input id='unlock_password' name='password' type='password' autocomplete='current-password' required></div>
-                <div class='actions'><button type='submit'>Unlock reviewer</button></div></form></section>"""
+                <div class='actions'><button type='submit'>Unlock service</button></div></form></section>"""
                 gitlab_url = "https://gitlab.com"
             elif active_credentials is None:
-                vault_panel = (
-                    "<p class='error'>Review credentials are not configured. "
-                    "Enter them in the credential section below.</p>"
-                )
+                vault_panel = "<p class='error'>GitLab access is not configured. Enter it below to start MR discovery.</p>"
                 gitlab_url = "https://gitlab.com"
+            elif not active_credentials.anthropic_api_key:
+                vault_panel = (
+                    "<p class='notice'>GitLab discovery is unlocked. Open MR revisions are queued without downloading code. "
+                    "Add an Anthropic API key to start reviewing the queue.</p>"
+                )
+                gitlab_url = active_credentials.gitlab_url
             else:
-                vault_panel = "<p class='notice'>Credential vault is unlocked; the reviewer can process MRs.</p>"
+                vault_panel = "<p class='notice'>GitLab discovery and Claude security reviews are unlocked.</p>"
                 gitlab_url = active_credentials.gitlab_url
             body = f"""
             <header><div><h1>Security Review</h1><p class='sub'>Signed in as {html.escape(str(user['username']))}</p></div>
             <div class='top-actions'><span class='status {reviewer_class}'>{reviewer_label}</span>
             <form method='post' action='/logout'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><button class='secondary'>Sign out</button></form></div></header>
-            {notice}{vault_panel}<section class='card'><h2>Review status</h2><div class='grid'>
+            {notice}{vault_panel}<section class='card'><h2>GitLab connection</h2>{scan_panel}</section>
+            <section class='card'><h2>Review status</h2><div class='grid'>
+            <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
             <div class='metric'>Completed<strong>{counts.get('completed', 0)}</strong></div>
             <div class='metric'>High severity<strong>{counts.get('high_severity', 0)}</strong></div>
             <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
             <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div></div></section>
             <section class='card'><h2>Runtime settings</h2><p class='sub'>Saved in SQLite and applied automatically at the next polling cycle.</p>
             <form method='post' action='/settings'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>{fields}</div><div class='actions'><button type='submit'>Save settings</button></div></form></section>
-            <section class='card'><h2>Configure or rotate encrypted credentials</h2><p class='sub'>Secrets are never displayed after saving. Enter both keys to create or replace the encrypted vault.</p>
+            <section class='card'><h2>Configure or rotate encrypted credentials</h2><p class='sub'>Save GitLab access first to test discovery. The Anthropic API key is optional and can be added later. Existing secrets are kept when their fields are left blank.</p>
             <form method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
             <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
             <div class='field'><label for='rotate_password'>Administrator password</label><input id='rotate_password' name='password' type='password' autocomplete='current-password' required></div>
-            <div class='field'><label for='rotate_gitlab_token'>New GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off' required></div>
-            <div class='field'><label for='rotate_anthropic_key'>New Anthropic API key</label><input id='rotate_anthropic_key' name='anthropic_api_key' type='password' autocomplete='off' required></div>
-            </div><div class='actions'><button type='submit'>Replace encrypted credentials</button></div></form></section>
-            <section class='card'><h2>Recent MR revisions</h2><div class='table-wrap'><table><thead><tr><th>Project</th><th>MR</th><th>Commit</th><th>Status</th><th>Reviewed</th><th>Report</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
+            <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off'><small>Required the first time; leave blank later to keep the stored token.</small></div>
+            <div class='field'><label for='rotate_anthropic_key'>Anthropic API key (optional)</label><input id='rotate_anthropic_key' name='anthropic_api_key' type='password' autocomplete='off'><small>Leave blank initially for discovery only; later, a blank field keeps the stored key.</small></div>
+            </div><div class='actions'><button type='submit'>Save encrypted credentials</button></div></form></section>
+            <section class='card'><h2>Recent MR revisions</h2><div class='table-wrap'><table><thead><tr><th>Project</th><th>MR</th><th>Commit</th><th>Status</th><th>Recorded</th><th>Report</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
             self.send_page(200, page("Dashboard", body))
 
         def update_settings(self, form: dict[str, str]) -> None:

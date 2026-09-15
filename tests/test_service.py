@@ -31,6 +31,7 @@ from security_review.web import (  # noqa: E402
     decrypt_credentials,
     encrypt_credentials,
     password_record,
+    validated_credentials,
     verify_password,
 )
 
@@ -100,6 +101,12 @@ class ConfigurationTests(unittest.TestCase):
     def test_zero_reviews_per_cycle_means_unlimited(self):
         settings = effective_runtime_settings({"MAX_REVIEWS_PER_CYCLE": "0"})
         self.assertEqual(settings["MAX_REVIEWS_PER_CYCLE"], "0")
+
+    def test_managed_config_allows_gitlab_discovery_without_claude(self):
+        config = Config.from_credentials(
+            "https://gitlab.example.com", "gitlab-secret", ""
+        )
+        self.assertEqual(config.anthropic_api_key, "")
 
 
 class PathTests(unittest.TestCase):
@@ -226,6 +233,39 @@ class CycleLimitTests(unittest.TestCase):
         self.assertEqual(review.call_count, 5)
         self.assertEqual(result["deferred"], 2)
 
+    def test_gitlab_only_scan_queues_mrs_for_later_review(self):
+        targets = [
+            ReviewTarget(1, "company/app", iid, f"sha{iid}", "")
+            for iid in range(1, 4)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = ReviewState(root / "state.sqlite3")
+            discovery_config = config_for_test(root, anthropic_api_key="")
+            with (
+                patch("security_review.service.discover_targets", return_value=targets),
+                patch("security_review.service.review_target") as review,
+            ):
+                discovered = scan_once(object(), state, discovery_config)
+            self.assertEqual(review.call_count, 0)
+            self.assertEqual(discovered["queued"], 3)
+            self.assertEqual(discovered["pending"], 3)
+            self.assertTrue(state.initialized())
+
+            def complete(_client, review_state, _config, target):
+                review_state.record(target, "completed")
+                return "completed"
+
+            review_config = config_for_test(root, max_reviews_per_cycle=0)
+            with (
+                patch("security_review.service.discover_targets", return_value=targets),
+                patch("security_review.service.review_target", side_effect=complete) as review,
+            ):
+                reviewed = scan_once(object(), state, review_config)
+            self.assertEqual(review.call_count, 3)
+            self.assertEqual(reviewed["completed"], 3)
+            self.assertTrue(all(state.has(target) for target in targets))
+
 
 class WebAuthenticationTests(unittest.TestCase):
     def test_password_hash_round_trip(self):
@@ -269,6 +309,25 @@ class WebAuthenticationTests(unittest.TestCase):
         )
         with self.assertRaises(ReviewError):
             decrypt_credentials(salt, nonce, ciphertext, "wrong password")
+
+    def test_gitlab_credentials_can_be_saved_without_anthropic_key(self):
+        credentials = validated_credentials(
+            "https://gitlab.example.com", "gitlab-test-token", ""
+        )
+        salt, nonce, ciphertext = encrypt_credentials(credentials, "correct password")
+        self.assertEqual(
+            decrypt_credentials(salt, nonce, ciphertext, "correct password"), credentials
+        )
+
+    def test_scan_status_is_shared_with_web_console(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            store = WebStore(database)
+            state = ReviewState(database)
+            state.set_metadata("last_gitlab_check_status", "success")
+            self.assertEqual(
+                store.scan_status()["last_gitlab_check_status"], "success"
+            )
 
 
 if __name__ == "__main__":

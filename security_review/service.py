@@ -294,8 +294,8 @@ class Config:
         anthropic_api_key: str,
         overrides: Mapping[str, str] | None = None,
     ) -> "Config":
-        if not gitlab_url.strip() or not gitlab_token.strip() or not anthropic_api_key.strip():
-            raise ReviewError("GitLab and Anthropic credentials are not configured.")
+        if not gitlab_url.strip() or not gitlab_token.strip():
+            raise ReviewError("GitLab credentials are not configured.")
         settings = effective_runtime_settings(overrides)
         return cls(
             gitlab_url=gitlab_url.rstrip("/"),
@@ -537,10 +537,29 @@ class ReviewState:
 
     def has(self, target: ReviewTarget) -> bool:
         row = self.connection.execute(
-            "SELECT 1 FROM reviews WHERE project_id = ? AND mr_iid = ? AND head_sha = ?",
+            "SELECT status FROM reviews WHERE project_id = ? AND mr_iid = ? AND head_sha = ?",
             (target.project_id, target.mr_iid, target.head_sha),
         ).fetchone()
-        return row is not None
+        return row is not None and str(row[0]) != "pending"
+
+    def queue(self, target: ReviewTarget) -> bool:
+        cursor = self.connection.execute(
+            """
+            INSERT OR IGNORE INTO reviews
+                (project_id, mr_iid, head_sha, project_path, status, report_path,
+                 report_content, metadata_json, reviewed_at)
+            VALUES (?, ?, ?, ?, 'pending', '', '', '', ?)
+            """,
+            (
+                target.project_id,
+                target.mr_iid,
+                target.head_sha,
+                target.project_path,
+                utc_now(),
+            ),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
 
     def record(
         self,
@@ -581,6 +600,13 @@ class ReviewState:
         self.connection.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('initialized', ?)",
             (utc_now(),),
+        )
+        self.connection.commit()
+
+    def set_metadata(self, key: str, value: str) -> None:
+        self.connection.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (key, value),
         )
         self.connection.commit()
 
@@ -981,6 +1007,22 @@ def discover_targets(client: GitLabClient) -> list[ReviewTarget]:
 
 def scan_once(client: GitLabClient, state: ReviewState, config: Config) -> dict[str, int]:
     targets = discover_targets(client)
+    if not config.anthropic_api_key:
+        if not state.initialized():
+            state.mark_initialized()
+        queued = sum(1 for target in targets if state.queue(target))
+        pending = sum(1 for target in targets if not state.has(target))
+        print(
+            f"GitLab discovery complete; {pending} MR revision(s) are queued "
+            "until an Anthropic API key is configured.",
+            flush=True,
+        )
+        return {
+            "discovered": len(targets),
+            "pending": pending,
+            "queued": queued,
+            "waiting_for_claude": pending,
+        }
     if not state.initialized():
         state.mark_initialized()
         if not config.review_existing_mrs:
@@ -991,7 +1033,7 @@ def scan_once(client: GitLabClient, state: ReviewState, config: Config) -> dict[
                 "new MRs and new commits will be reviewed.",
                 flush=True,
             )
-            return {"baseline": len(targets)}
+            return {"discovered": len(targets), "baseline": len(targets), "pending": 0}
 
     pending = [target for target in targets if not state.has(target)]
     selected = (
@@ -1067,8 +1109,15 @@ def run_managed_poll(state_db: Path, vault: Any) -> None:
             sleep_seconds = config.poll_interval_seconds
             client = GitLabClient(config.gitlab_url, config.gitlab_token)
             counters = scan_once(client, state, config)
+            state.set_metadata("last_gitlab_check_at", utc_now())
+            state.set_metadata("last_gitlab_check_status", "success")
+            state.set_metadata("last_gitlab_check_summary", json.dumps(counters, sort_keys=True))
+            state.set_metadata("last_gitlab_check_error", "")
             print(f"Scan complete: {json.dumps(counters, sort_keys=True)}", flush=True)
         except ReviewError as exc:
+            state.set_metadata("last_gitlab_check_at", utc_now())
+            state.set_metadata("last_gitlab_check_status", "failed")
+            state.set_metadata("last_gitlab_check_error", str(exc))
             print(f"Scan failed: {exc}", file=sys.stderr, flush=True)
         vault.wait_for_change(vault_version, sleep_seconds)
 

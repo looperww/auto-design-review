@@ -45,7 +45,8 @@ related files. All Claude Code tools are disabled.
 - Network access to the GitLab API, Docker image sources, Claude Code download
   endpoints, and the Anthropic API.
 - At least 4 GB RAM for the Docker host.
-- An Anthropic API key with billing and a spending limit configured.
+- An Anthropic API key with billing and a spending limit configured when Claude
+  reviews are enabled. GitLab discovery can be tested before this key is added.
 - A GitLab fine-grained personal access token or service-account token.
 
 ## GitLab token permissions
@@ -130,11 +131,23 @@ account is created, the setup page is disabled and you are directed to sign in.
 
 ### 6. Sign in and configure the reviewer
 
-After signing in, first review and save the runtime settings. Then configure:
+After signing in, configure:
 
 - the GitLab URL;
 - the read-only GitLab token; and
-- the Anthropic API key.
+- optionally, the Anthropic API key.
+
+The GitLab token can be saved without an Anthropic API key. The service then
+checks the GitLab connection, discovers open MR revisions, and records them as
+`pending` in SQLite. It does not download repository archives or diffs and does
+not invoke Claude in this mode. The dashboard shows the last GitLab connection
+result and the queued MR count, allowing the administrator to verify the GitLab
+URL, token, scope, and permissions without incurring Claude cost.
+
+The Anthropic API key can be added later without re-entering the stored GitLab
+token. Once it is saved, queued open MR revisions are reviewed in order, subject
+to the configured maximum reviews per cycle. Leaving either secret field blank
+during a later update preserves its stored value.
 
 The two API credentials and GitLab URL are encrypted with AES-GCM using a key
 derived from the administrator password. Password hashes, encrypted credentials,
@@ -142,8 +155,9 @@ operational settings, review state, report content, and report metadata are
 stored in SQLite under the host's `data/` folder, which is mounted inside the
 container at `/data`.
 
-The reviewer remains locked and cannot contact GitLab or Anthropic until the
-runtime settings and encrypted credentials have both been saved.
+The service cannot contact GitLab until the encrypted GitLab credentials have
+been saved and unlocked. Claude reviews remain disabled until the encrypted
+Anthropic API key is also present.
 
 For a remote server, keep the console bound to localhost and use an SSH tunnel:
 
@@ -161,7 +175,8 @@ settings, and credential rotation. Stored secrets are never displayed again.
 After every container or host restart, sign in once to unlock the encrypted
 credential vault in memory. This is necessary because no plaintext credential
 or separate master encryption key is stored on disk. Until it is unlocked, the
-web console remains available but security reviews wait.
+web console remains available but both GitLab discovery and security reviews
+wait.
 
 Keep an approved backup of the host `data/` folder. Stop the service before
 copying it so the SQLite backup is consistent. The encryption password is not
@@ -170,10 +185,16 @@ the service must be initialized again. Fully unattended unlock after a restart
 would require an external secret manager or master key, which this deployment
 intentionally does not store.
 
-Before the first scan, choose whether to review existing open MRs in the setup
-page. The default records them as a baseline without spending Claude tokens.
-Any MR created later, or any new commit pushed to an MR, is reviewed
-automatically. Enabling existing-MR review can create significant API cost.
+When GitLab and Anthropic credentials are supplied together, choose whether to
+review existing open MRs before the first scan. The default records them as a
+baseline without spending Claude tokens. Any MR created later, or any new commit
+pushed to an MR, is reviewed automatically. Enabling existing-MR review can
+create significant API cost.
+
+When GitLab discovery is deliberately started before the Anthropic key is
+available, discovered MR revisions are queued instead of baselined. This ensures
+the administrator can add the Anthropic key later and review the MRs that were
+used to validate GitLab access.
 
 ## Read the reports
 
@@ -182,6 +203,9 @@ and its metadata are stored directly in SQLite with the MR identity, commit,
 selected context files, prompt size, Claude duration, and estimated Claude cost.
 Report records never contain either token; API credentials exist in a separate
 SQLite table only as authenticated ciphertext.
+
+MR revisions discovered before the Anthropic key is configured appear with a
+`pending` status and have no report until Claude reviews them.
 
 ## Automatic discovery
 
