@@ -347,10 +347,10 @@ Week, Month, and inclusive UTC date-range filters as the repository inventory.
 Each MR row is selectable and expands into a bounded code-diff panel for manual
 inspection. The latest commit SHA links directly to that commit in GitLab. A
 compact list of commit messages and authors loads automatically above the diff
-when the row is expanded; commit messages link to their GitLab commits when a
-valid link is available. There is no separate commit section or additional
-button, and no commit API request is made until the row is expanded. A completed
-review uses its retained diff immediately. If a queued
+when the row is expanded. The messages and authors are plain text; the existing
+commit SHA remains the link to GitLab. There is no separate commit section or
+additional button, and no commit API request is made until the row is expanded.
+A completed review uses its retained diff immediately. If a queued
 or historical row has no retained diff, expanding it fetches the exact current
 MR revision from GitLab on demand and caches it in SQLite. The service refuses
 to display a mismatched diff or commit history if GitLab has received a newer
