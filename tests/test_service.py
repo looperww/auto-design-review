@@ -731,6 +731,43 @@ class DiscoveryInventoryTests(unittest.TestCase):
             parse_security_findings(reviews[0]["report_content"])[0]["details"],
         )
 
+    def test_false_positive_is_removed_from_dashboard_and_retained_as_safe(self):
+        report_content = (
+            "# Security review\n\n## Summary\nA possible shell path changed.\n\n"
+            "## Findings\n### [HIGH] Command injection\n"
+            "File: app.py:9\nUser input may reach the shell.\n\n"
+            "## Overall severity rationale\nThe automated review rated the path High."
+        )
+        finding = parse_security_findings(report_content)[0]
+        report = {
+            "project_id": 1,
+            "project_path": "company/app",
+            "project_web_url": "https://gitlab.example.com/company/app",
+            "mr_iid": 7,
+            "head_sha": "abcdef1234567",
+            "reviewed_at": "2026-09-15T12:00:00+00:00",
+            "diff_content": "+run_shell(user_input)",
+            "report_content": report_content,
+        }
+        decisions = {
+            (1, 7, "abcdef1234567", finding["item_key"]): {
+                "workflow_status": "done",
+                "resolution": "false_positive",
+                "severity": "",
+                "comments": "The caller passes a fixed server-controlled value.",
+            }
+        }
+
+        dashboard_findings, counts = collect_security_findings([report], decisions)
+        completed = completed_review_entries([report], decisions)
+
+        self.assertEqual(dashboard_findings, [])
+        self.assertEqual(counts, {})
+        self.assertEqual(completed[0]["severity"], "SAFE")
+        self.assertEqual(completed[0]["manual_status"], "done")
+        self.assertEqual(completed[0]["manual_resolution"], "false_positive")
+        self.assertIn("server-controlled", completed[0]["manual_comments"])
+
     def test_diff_html_uses_light_syntax_classes_and_escapes_code(self):
         rendered = render_diff_html(
             "## Changed file: app.py\n@@ -1 +1 @@\n-old <value>\n+new & safe\n context"
@@ -841,6 +878,153 @@ class DiscoveryInventoryTests(unittest.TestCase):
 
 
 class WebAuthenticationTests(unittest.TestCase):
+    def test_manual_review_endpoint_closes_false_positive_and_updates_views(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state.sqlite3"
+            store = WebStore(database)
+            user_id = store.create_first_user(
+                "security-admin", "a secure test password"
+            )
+            session_token, csrf = store.create_session(user_id)
+            report = (
+                "# Security review\n\n## Summary\nA possible shell path changed.\n\n"
+                "## Findings\n### [HIGH] Command injection\n"
+                "File: app.py:9\nUser input may reach the shell.\n\n"
+                "## Overall severity rationale\nThe automated review rated the path High."
+            )
+            finding_key = parse_security_findings(report)[0]["item_key"]
+            state = ReviewState(database)
+            state.record_visible_projects(
+                [
+                    {
+                        "id": 1,
+                        "path_with_namespace": "company/app",
+                        "web_url": "https://gitlab.example.com/company/app",
+                    }
+                ]
+            )
+            state.record(
+                ReviewTarget(
+                    1,
+                    "company/app",
+                    7,
+                    "abcdef1234567",
+                    "https://gitlab.example.com/company/app/-/merge_requests/7",
+                ),
+                "high_severity",
+                report_content=report,
+                diff_content="+run_shell(server_controlled_value)",
+            )
+            state.close()
+            handler = handler_factory(store, root / "reports", False, MemoryVault())
+            handler.log_message = lambda *_args: None
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            headers = {"Cookie": f"reviewer_session={session_token}"}
+            try:
+                form = urllib.parse.urlencode(
+                    {
+                        "csrf": csrf,
+                        "project_id": "1",
+                        "mr_iid": "7",
+                        "head_sha": "abcdef1234567",
+                        "item_key": finding_key,
+                        "workflow_status": "done",
+                        "resolution": "false_positive",
+                        "severity": "",
+                        "comments": "The caller supplies a fixed server-controlled value.",
+                        "return_to": "/",
+                    }
+                ).encode("utf-8")
+                request = urllib.request.Request(
+                    base_url + "/manual-review",
+                    data=form,
+                    headers={
+                        **headers,
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                )
+                with urllib.request.urlopen(request) as response:
+                    dashboard = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(base_url + "/completed", headers=headers)
+                ) as response:
+                    completed = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        base_url + "/completed?manual_status=open", headers=headers
+                    )
+                ) as response:
+                    open_completed = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        base_url + "/repository?project_id=1&manual_status=done",
+                        headers=headers,
+                    )
+                ) as response:
+                    done_mrs = response.read().decode("utf-8")
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+
+            decision = store.manual_review_map()[
+                (1, 7, "abcdef1234567", finding_key)
+            ]
+            self.assertEqual(decision["workflow_status"], "done")
+            self.assertEqual(decision["resolution"], "false_positive")
+            self.assertNotIn("Command injection", dashboard)
+            self.assertIn("Command injection", completed)
+            self.assertIn("severity-safe'>SAFE", completed)
+            self.assertIn("False positive", completed)
+            self.assertIn("server-controlled value", completed)
+            self.assertNotIn("Command injection", open_completed)
+            self.assertIn("!7", done_mrs)
+
+    def test_manual_review_state_is_persisted_and_reset_with_review_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            store = WebStore(database)
+            state = ReviewState(database)
+            state.record(
+                ReviewTarget(
+                    1,
+                    "company/app",
+                    7,
+                    "abcdef1234567",
+                    "https://gitlab.example.com/company/app/-/merge_requests/7",
+                ),
+                "high_severity",
+                report_content=(
+                    "# Security review\n\n## Findings\n"
+                    "### [HIGH] Command injection\nEvidence."
+                ),
+            )
+            state.close()
+
+            store.save_manual_review(
+                1,
+                7,
+                "abcdef1234567",
+                "mr",
+                "done",
+                "finding",
+                "HIGH",
+                "Verified attacker-controlled input reaches the shell.",
+                "security-admin",
+            )
+            stored = store.manual_review_map()[(1, 7, "abcdef1234567", "mr")]
+            self.assertEqual(stored["workflow_status"], "done")
+            self.assertEqual(stored["resolution"], "finding")
+            self.assertEqual(stored["severity"], "HIGH")
+            self.assertEqual(stored["updated_by"], "security-admin")
+
+            store.reset_review_data()
+            self.assertEqual(store.manual_review_map(), {})
+
     def test_restart_invalidates_session_and_requires_fresh_login(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1064,15 +1248,27 @@ class WebAuthenticationTests(unittest.TestCase):
             )
             self.assertIn(expected_columns, dashboard)
             self.assertIn(expected_columns, completed)
+            self.assertIn("<th>Manual review</th>", dashboard)
+            self.assertIn("<th>Manual review</th>", completed)
+            self.assertIn("id='manual-review-dialog'", dashboard)
+            self.assertIn(
+                "aria-label='Filter completed reviews by manual-review status'",
+                completed,
+            )
             self.assertIn("<h2>Merge requests</h2>", repository_mrs)
             self.assertIn("name='project_id' value='1'", repository_mrs)
-            self.assertIn("/repository?project_id=1&amp;period=day", repository_mrs)
+            self.assertIn(
+                "/repository?project_id=1&amp;manual_status=all&amp;period=day",
+                repository_mrs,
+            )
             self.assertIn("name='start_date'", repository_mrs)
             self.assertIn("name='end_date'", repository_mrs)
             self.assertIn("class='expandable-row'", repository_mrs)
             self.assertIn("data-open-label='View diff'", repository_mrs)
             self.assertIn("run_shell(user_input)", repository_mrs)
             self.assertIn("data-lazy-diff", repository_mrs)
+            self.assertIn("<th>Manual review</th>", repository_mrs)
+            self.assertIn("All statuses", repository_mrs)
             self.assertEqual(stored_diff["source"], "stored")
             self.assertIn("run_shell(user_input)", stored_diff["diff"])
             self.assertEqual(fetched_diff["source"], "gitlab")

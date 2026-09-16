@@ -52,6 +52,11 @@ SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 REPOSITORIES_PER_PAGE = 10
 COMPLETED_ROWS_PER_PAGE = 20
 COMPLETED_SEVERITIES = {"all", "critical", "high", "medium", "low", "safe"}
+MANUAL_REVIEW_STATUSES = {"open", "in_progress", "done"}
+MANUAL_REVIEW_FILTERS = {"all", *MANUAL_REVIEW_STATUSES}
+MANUAL_REVIEW_RESOLUTIONS = {"false_positive", "finding"}
+MANUAL_FINDING_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
+MR_MANUAL_REVIEW_KEY = "mr"
 SEVERITY_EXPLANATIONS = {
     "CRITICAL": "Critical indicates a credible path to broad compromise of sensitive systems, users, or company data.",
     "HIGH": "High indicates a credible path to meaningful unauthorized access, sensitive-data exposure, or code execution.",
@@ -127,6 +132,54 @@ APP_JAVASCRIPT = b"""(() => {
     });
     if (button) button.addEventListener('click', toggle);
   }
+  const reviewDialog = document.getElementById('manual-review-dialog');
+  const reviewForm = document.getElementById('manual-review-form');
+  if (reviewDialog && reviewForm) {
+    const statusInput = reviewForm.elements.namedItem('workflow_status');
+    const severityInput = reviewForm.elements.namedItem('severity');
+    const commentsInput = reviewForm.elements.namedItem('comments');
+    const resolutionFields = document.getElementById('manual-resolution-fields');
+    const severityField = document.getElementById('manual-severity-field');
+    const selectedResolution = () =>
+      reviewForm.querySelector('input[name="resolution"]:checked')?.value || '';
+    const updateReviewFields = () => {
+      const done = statusInput.value === 'done';
+      resolutionFields.hidden = !done;
+      const confirmed = done && selectedResolution() === 'finding';
+      severityField.hidden = !confirmed;
+      severityInput.required = confirmed;
+      commentsInput.required = done;
+      for (const input of reviewForm.querySelectorAll('input[name="resolution"]')) {
+        input.required = done;
+      }
+    };
+    statusInput.addEventListener('change', updateReviewFields);
+    for (const input of reviewForm.querySelectorAll('input[name="resolution"]')) {
+      input.addEventListener('change', updateReviewFields);
+    }
+    for (const button of document.querySelectorAll('.manual-review-button')) {
+      button.addEventListener('click', () => {
+        for (const name of ['project_id', 'mr_iid', 'head_sha', 'item_key', 'return_to']) {
+          reviewForm.elements.namedItem(name).value = button.dataset[name.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase())] || '';
+        }
+        statusInput.value = button.dataset.workflowStatus || 'open';
+        severityInput.value = button.dataset.severity || '';
+        commentsInput.value = button.dataset.comments || '';
+        const resolution = button.dataset.resolution || '';
+        for (const input of reviewForm.querySelectorAll('input[name="resolution"]')) {
+          input.checked = input.value === resolution;
+        }
+        updateReviewFields();
+        reviewDialog.showModal();
+      });
+    }
+    for (const button of reviewDialog.querySelectorAll('.dialog-close, .dialog-cancel')) {
+      button.addEventListener('click', () => reviewDialog.close());
+    }
+    reviewDialog.addEventListener('click', (event) => {
+      if (event.target === reviewDialog) reviewDialog.close();
+    });
+  }
   const provider = document.getElementById('llm_provider');
   const customField = document.getElementById('custom_api_url_field');
   const customInput = document.getElementById('llm_api_url');
@@ -197,11 +250,17 @@ def parse_security_findings(report: str) -> list[dict[str, str]]:
         if next_section is not None:
             end = match.end() + next_section.start()
         details = report[match.end() : end].strip()
+        severity = match.group(1)
+        title = match.group(2).strip()
+        item_key = hashlib.sha256(
+            f"{index}\0{severity}\0{title}\0{details}".encode("utf-8")
+        ).hexdigest()
         findings.append(
             {
-                "severity": match.group(1),
-                "title": match.group(2).strip(),
+                "severity": severity,
+                "title": title,
                 "details": details or "No additional details were provided.",
+                "item_key": item_key,
             }
         )
     return findings
@@ -237,7 +296,9 @@ def render_diff_html(diff_content: str) -> str:
 
 def collect_security_findings(
     reports: Iterable[Mapping[str, Any]],
+    manual_reviews: Mapping[tuple[int, int, str, str], Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    decisions = manual_reviews or {}
     findings: list[dict[str, Any]] = []
     counts: dict[int, int] = {}
     for report in reports:
@@ -252,15 +313,40 @@ def collect_security_findings(
             else ""
         )
         parsed_findings = parse_security_findings(str(report["report_content"]))
-        counts[project_id] = counts.get(project_id, 0) + len(parsed_findings)
         for finding in parsed_findings:
+            try:
+                head_sha = str(report["head_sha"] or "")
+            except (KeyError, IndexError):
+                head_sha = ""
+            item_key = str(finding["item_key"])
+            decision = decisions.get(
+                (project_id, mr_iid, head_sha, item_key)
+            ) or decisions.get(
+                (project_id, mr_iid, head_sha, MR_MANUAL_REVIEW_KEY)
+            )
+            workflow_status = str(decision["workflow_status"]) if decision else "open"
+            resolution = str(decision["resolution"] or "") if decision else ""
+            if workflow_status == "done" and resolution == "false_positive":
+                continue
+            severity = str(finding["severity"])
+            if workflow_status == "done" and resolution == "finding":
+                manual_severity = str(decision["severity"] or "") if decision else ""
+                if manual_severity in MANUAL_FINDING_SEVERITIES:
+                    severity = manual_severity
+            counts[project_id] = counts.get(project_id, 0) + 1
             findings.append(
                 {
                     **finding,
+                    "severity": severity,
                     "project_id": project_id,
                     "project_path": project_path,
                     "mr_iid": mr_iid,
                     "mr_url": mr_url,
+                    "head_sha": head_sha,
+                    "manual_status": workflow_status,
+                    "manual_resolution": resolution,
+                    "manual_severity": str(decision["severity"] or "") if decision else "",
+                    "manual_comments": str(decision["comments"] or "") if decision else "",
                 }
             )
     findings.sort(
@@ -276,7 +362,9 @@ def collect_security_findings(
 
 def completed_review_entries(
     reviews: Iterable[Mapping[str, Any]],
+    manual_reviews: Mapping[tuple[int, int, str, str], Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    decisions = manual_reviews or {}
     entries: list[dict[str, Any]] = []
     for review in reviews:
         report = str(review["report_content"] or "")
@@ -302,23 +390,75 @@ def completed_review_entries(
             "reviewed_at": str(review["reviewed_at"]),
         }
         if not findings:
+            decision = decisions.get(
+                (
+                    int(review["project_id"]),
+                    mr_iid,
+                    str(review["head_sha"]),
+                    MR_MANUAL_REVIEW_KEY,
+                )
+            )
+            workflow_status = str(decision["workflow_status"]) if decision else "open"
+            resolution = str(decision["resolution"] or "") if decision else ""
+            manual_severity = str(decision["severity"] or "") if decision else ""
+            severity = (
+                manual_severity
+                if workflow_status == "done"
+                and resolution == "finding"
+                and manual_severity in MANUAL_FINDING_SEVERITIES
+                else "SAFE"
+            )
             entries.append(
                 {
                     **base,
-                    "severity": "SAFE",
+                    "severity": severity,
                     "title": "No evidence-backed findings",
                     "finding_details": (
                         "The review found no high-confidence security finding in the supplied change and bounded repository context."
                     ),
-                    "severity_explanation": overall_rationale
-                    or SEVERITY_EXPLANATIONS["SAFE"],
+                    "severity_explanation": (
+                        SEVERITY_EXPLANATIONS[severity]
+                        if severity != "SAFE"
+                        else overall_rationale or SEVERITY_EXPLANATIONS["SAFE"]
+                    ),
+                    "item_key": MR_MANUAL_REVIEW_KEY,
+                    "manual_status": workflow_status,
+                    "manual_resolution": resolution,
+                    "manual_severity": str(decision["severity"] or "") if decision else "",
+                    "manual_comments": str(decision["comments"] or "") if decision else "",
                 }
             )
             continue
         for finding in findings:
+            item_key = str(finding["item_key"])
+            decision = decisions.get(
+                (
+                    int(review["project_id"]),
+                    mr_iid,
+                    str(review["head_sha"]),
+                    item_key,
+                )
+            ) or decisions.get(
+                (
+                    int(review["project_id"]),
+                    mr_iid,
+                    str(review["head_sha"]),
+                    MR_MANUAL_REVIEW_KEY,
+                )
+            )
+            workflow_status = str(decision["workflow_status"]) if decision else "open"
+            resolution = str(decision["resolution"] or "") if decision else ""
             severity = str(finding["severity"])
+            if workflow_status == "done" and resolution == "false_positive":
+                severity = "SAFE"
+            elif workflow_status == "done" and resolution == "finding":
+                manual_severity = str(decision["severity"] or "") if decision else ""
+                if manual_severity in MANUAL_FINDING_SEVERITIES:
+                    severity = manual_severity
             explanation = SEVERITY_EXPLANATIONS[severity]
-            if overall_rationale:
+            if overall_rationale and not (
+                workflow_status == "done" and resolution == "false_positive"
+            ):
                 explanation += "\n\nOverall review rationale:\n" + overall_rationale
             entries.append(
                 {
@@ -327,9 +467,111 @@ def completed_review_entries(
                     "title": str(finding["title"]),
                     "finding_details": str(finding["details"]),
                     "severity_explanation": explanation,
+                    "item_key": item_key,
+                    "manual_status": workflow_status,
+                    "manual_resolution": resolution,
+                    "manual_severity": str(decision["severity"] or "") if decision else "",
+                    "manual_comments": str(decision["comments"] or "") if decision else "",
                 }
             )
     return entries
+
+
+def manual_review_status_for_mr(
+    project_id: int,
+    mr_iid: int,
+    head_sha: str,
+    report_content: str,
+    manual_reviews: Mapping[tuple[int, int, str, str], Mapping[str, Any]],
+) -> str:
+    mr_decision = manual_reviews.get(
+        (project_id, mr_iid, head_sha, MR_MANUAL_REVIEW_KEY)
+    )
+    if mr_decision is not None:
+        return str(mr_decision["workflow_status"])
+    findings = parse_security_findings(report_content)
+    if not findings:
+        return "open"
+    statuses = []
+    for finding in findings:
+        decision = manual_reviews.get(
+            (project_id, mr_iid, head_sha, str(finding["item_key"]))
+        )
+        statuses.append(str(decision["workflow_status"]) if decision else "open")
+    if any(status == "in_progress" for status in statuses):
+        return "in_progress"
+    if statuses and all(status == "done" for status in statuses):
+        return "done"
+    return "open"
+
+
+def manual_review_button(
+    *,
+    project_id: int,
+    mr_iid: int,
+    head_sha: str,
+    item_key: str,
+    workflow_status: str,
+    resolution: str = "",
+    severity: str = "",
+    comments: str = "",
+    return_to: str,
+) -> str:
+    label = {
+        "open": "Open",
+        "in_progress": "In Progress",
+        "done": "Done",
+    }.get(workflow_status, "Open")
+    return (
+        "<button class='manual-review-button secondary' type='button' "
+        f"data-project-id='{project_id}' data-mr-iid='{mr_iid}' "
+        f"data-head-sha='{html.escape(head_sha)}' "
+        f"data-item-key='{html.escape(item_key)}' "
+        f"data-workflow-status='{html.escape(workflow_status)}' "
+        f"data-resolution='{html.escape(resolution)}' "
+        f"data-severity='{html.escape(severity)}' "
+        f"data-comments='{html.escape(comments)}' "
+        f"data-return-to='{html.escape(return_to)}'>"
+        f"<span class='review-state review-state-{html.escape(workflow_status)}'>"
+        f"{html.escape(label)}</span></button>"
+    )
+
+
+def manual_review_dialog(csrf_token: str) -> str:
+    return f"""
+    <dialog class='manual-review-dialog' id='manual-review-dialog'>
+      <form method='post' action='/manual-review' id='manual-review-form'>
+        <input type='hidden' name='csrf' value='{html.escape(csrf_token)}'>
+        <input type='hidden' name='project_id'>
+        <input type='hidden' name='mr_iid'>
+        <input type='hidden' name='head_sha'>
+        <input type='hidden' name='item_key'>
+        <input type='hidden' name='return_to'>
+        <div class='dialog-heading'><div><p class='eyebrow'>Human verification</p><h2>Update manual-review status</h2></div>
+        <button class='dialog-close secondary' type='button' aria-label='Close'>Close</button></div>
+        <div class='field'><label for='manual_workflow_status'>Status</label>
+          <select id='manual_workflow_status' name='workflow_status'>
+            <option value='open'>Open</option><option value='in_progress'>In Progress</option><option value='done'>Done</option>
+          </select>
+        </div>
+        <div id='manual-resolution-fields' hidden>
+          <fieldset><legend>Resolution</legend>
+            <label><input type='radio' name='resolution' value='false_positive'> False positive</label>
+            <label><input type='radio' name='resolution' value='finding'> Confirmed finding</label>
+          </fieldset>
+          <div class='field' id='manual-severity-field' hidden><label for='manual_severity'>Finding severity</label>
+            <select id='manual_severity' name='severity'>
+              <option value=''>Choose severity</option><option value='CRITICAL'>Critical</option><option value='HIGH'>High</option><option value='MEDIUM'>Medium</option><option value='LOW'>Low</option>
+            </select>
+          </div>
+          <div class='field'><label for='manual_comments'>Comments</label>
+            <textarea id='manual_comments' name='comments' maxlength='4000' rows='5' placeholder='Record the verification evidence and decision.'></textarea>
+            <small>Comments are required when closing a review.</small>
+          </div>
+        </div>
+        <div class='actions'><button type='submit'>Save review status</button><button class='dialog-cancel secondary' type='button'>Cancel</button></div>
+      </form>
+    </dialog>"""
 
 
 def paginate_repositories(
@@ -714,6 +956,30 @@ class WebStore:
                     "WHERE mr_created_at = ''"
                 )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS manual_reviews (
+                    project_id INTEGER NOT NULL,
+                    mr_iid INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    workflow_status TEXT NOT NULL DEFAULT 'open',
+                    resolution TEXT NOT NULL DEFAULT '',
+                    severity TEXT NOT NULL DEFAULT '',
+                    comments TEXT NOT NULL DEFAULT '',
+                    updated_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, mr_iid, head_sha, item_key),
+                    FOREIGN KEY (project_id, mr_iid, head_sha)
+                        REFERENCES reviews(project_id, mr_iid, head_sha)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS manual_reviews_status "
+                "ON manual_reviews(workflow_status)"
+            )
+            connection.execute(
                 "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
             connection.execute(
@@ -980,6 +1246,68 @@ class WebStore:
                 )
         return repository_count, review_count, reset_at
 
+    def manual_review_map(
+        self,
+    ) -> dict[tuple[int, int, str, str], sqlite3.Row]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT project_id, mr_iid, head_sha, item_key, workflow_status,
+                       resolution, severity, comments, updated_by, updated_at
+                FROM manual_reviews
+                """
+            ).fetchall()
+        return {
+            (
+                int(row["project_id"]),
+                int(row["mr_iid"]),
+                str(row["head_sha"]),
+                str(row["item_key"]),
+            ): row
+            for row in rows
+        }
+
+    def save_manual_review(
+        self,
+        project_id: int,
+        mr_iid: int,
+        head_sha: str,
+        item_key: str,
+        workflow_status: str,
+        resolution: str,
+        severity: str,
+        comments: str,
+        updated_by: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO manual_reviews
+                    (project_id, mr_iid, head_sha, item_key, workflow_status,
+                     resolution, severity, comments, updated_by, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, mr_iid, head_sha, item_key) DO UPDATE SET
+                    workflow_status = excluded.workflow_status,
+                    resolution = excluded.resolution,
+                    severity = excluded.severity,
+                    comments = excluded.comments,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    project_id,
+                    mr_iid,
+                    head_sha,
+                    item_key,
+                    workflow_status,
+                    resolution,
+                    severity,
+                    comments,
+                    updated_by,
+                    now_iso(),
+                ),
+            )
+
     def dashboard(self) -> tuple[dict[str, int], list[sqlite3.Row]]:
         with self.connect() as connection:
             counts = {
@@ -1233,7 +1561,7 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#172033;--muted:#667085;--line:#e3e8ef;--blue:#2563eb;--blue-dark:#1746a2;--blue-soft:#edf4ff;--bg:#f5f7fb;--card:#fff;--sidebar:#111827;--sidebar-muted:#a8b3c5;--red:#b42318;--red-soft:#fff1f0;--green:#16803c;--green-soft:#ebf8ef;--amber:#9a6700;--amber-soft:#fff7df;--shadow:0 12px 32px rgba(17,24,39,.06)}
 *{box-sizing:border-box}html{min-height:100%}body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45}a{color:var(--blue);text-underline-offset:2px}.public-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}.app-shell{display:grid;grid-template-columns:252px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;background:var(--sidebar);color:#fff;padding:24px 16px 18px;display:flex;flex-direction:column}.brand{display:flex;align-items:center;gap:12px;color:#fff;text-decoration:none;padding:0 10px 24px;border-bottom:1px solid rgba(255,255,255,.1)}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:linear-gradient(145deg,#3b82f6,#1d4ed8);font-size:13px;font-weight:850;letter-spacing:.04em;box-shadow:0 8px 18px rgba(37,99,235,.3)}.brand strong{display:block;font-size:15px}.brand small{display:block;color:var(--sidebar-muted);font-size:11px;margin-top:1px}.side-nav{display:grid;gap:6px;padding:22px 0}.side-nav a{display:flex;align-items:center;gap:12px;padding:11px 12px;border-radius:9px;color:var(--sidebar-muted);font-weight:650;text-decoration:none}.side-nav a:hover{background:rgba(255,255,255,.07);color:#fff}.side-nav a[aria-current=page]{background:#243c66;color:#fff;box-shadow:inset 3px 0 #60a5fa}.nav-icon{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:rgba(255,255,255,.08);font-size:11px;font-weight:800}.sidebar-footer{margin-top:auto;border-top:1px solid rgba(255,255,255,.1);padding:18px 10px 0}.service-state{display:flex;align-items:flex-start;gap:9px;color:var(--sidebar-muted);font-size:12px;line-height:1.35;margin-bottom:17px}.service-dot{width:9px;height:9px;margin-top:3px;border-radius:50%;background:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.14);flex:0 0 auto}.service-dot.completed{background:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.14)}.service-dot.failed{background:#f87171;box-shadow:0 0 0 3px rgba(248,113,113,.14)}.user-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}.user-avatar{display:grid;place-items:center;width:32px;height:32px;border-radius:50%;background:#334155;color:#fff;font-size:12px;font-weight:800}.user-row span{font-size:13px;overflow:hidden;text-overflow:ellipsis}.signout{width:100%;background:transparent;border:1px solid rgba(255,255,255,.16);color:#d9e1ec;padding:9px 12px}.signout:hover{background:rgba(255,255,255,.07)}.app-main{min-width:0;padding:34px clamp(24px,4vw,56px) 72px}.content{width:100%;max-width:1440px;margin:0 auto}.page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:28px}.eyebrow{color:var(--blue);font-size:12px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;margin:0 0 7px}.page-header h1{font-size:32px;line-height:1.15;margin:0;letter-spacing:-.025em}.page-header .sub{max-width:720px}.connection-status{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:14px;margin:9px 0 0}.connection-dot{width:9px;height:9px;border-radius:50%;background:var(--red);box-shadow:0 0 0 3px rgba(180,35,24,.1);flex:0 0 auto}.connection-dot.up{background:var(--green);box-shadow:0 0 0 3px rgba(22,128,60,.12)}.header-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}h1{font-size:31px;margin:0}h2{font-size:20px;margin:0 0 8px;letter-spacing:-.01em}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px}.sub{color:var(--muted);margin:6px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:var(--shadow);margin-bottom:22px}.danger-zone{border-color:#f2b8b3}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{position:relative;padding:19px 20px;border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,#fff,#fbfcfe);color:var(--muted);font-size:13px;font-weight:650}.metric strong{display:block;color:var(--ink);font-size:29px;line-height:1.2;margin-top:7px;letter-spacing:-.03em}.metric.critical{border-color:#f2b8b3;background:linear-gradient(180deg,#fff,var(--red-soft))}.metric.success{border-color:#b9dfc4;background:linear-gradient(180deg,#fff,var(--green-soft))}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus,button:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid #bed4ff;outline-offset:2px;border-color:var(--blue)}[hidden]{display:none!important}button,.button{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:10px 15px;cursor:pointer;text-decoration:none;font:inherit}.button:hover,button:hover{filter:brightness(.97)}.secondary{background:var(--blue-soft);color:var(--blue-dark)}.danger{background:var(--red)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:20px;padding:16px;background:#f8fafc;border:1px solid var(--line);border-radius:12px}.filter-bar .actions{margin-top:0}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.pagination{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:18px}.pagination .actions{margin-top:0}.page-selector{display:flex;align-items:center;gap:8px}.page-selector label{font-weight:700}.page-selector select{padding:10px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.notice,.error{padding:13px 15px;border-radius:10px;margin-bottom:18px;border:1px solid transparent}.notice{background:var(--green-soft);border-color:#c9e8d2;color:#116329}.error{background:var(--red-soft);border-color:#f5c7c3;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:13px 11px;border-bottom:1px solid var(--line);vertical-align:top}tbody tr:hover{background:#f8faff}tbody tr:last-child td{border-bottom:0}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.065em;white-space:nowrap}.status{font-weight:750}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:850;letter-spacing:.035em}.severity-critical,.severity-high{background:var(--red-soft);color:var(--red)}.severity-medium{background:var(--amber-soft);color:var(--amber)}.severity-low{background:var(--blue-soft);color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}.empty-state{text-align:center;color:var(--muted);padding:34px!important}.table-wrap{overflow:auto}.muted-link{color:var(--muted)}
-.severity-safe{background:var(--green-soft);color:var(--green)}.severity-filter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}.severity-filter .button{padding:8px 12px}.expandable-row{cursor:pointer}.expandable-row:focus{outline:3px solid #bed4ff;outline-offset:-3px}.row-toggle{padding:7px 10px;font-size:13px;white-space:nowrap}.expanded-review td{padding:0 11px 18px;background:#f8fafc}.review-details{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px}.review-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}.review-section{border:1px solid var(--line);border-radius:10px;padding:16px}.review-section h3{font-size:14px;margin:0 0 8px}.review-copy{white-space:pre-wrap;margin:0;color:var(--ink)}.diff-view{max-height:520px;overflow:auto;margin:8px 0 0;padding:8px 0;background:#fff;color:#344054;border:1px solid #d0d5dd;border-radius:10px;font-size:12px;line-height:1.55;white-space:pre}.diff-view code{display:block;min-width:max-content}.diff-line{display:block;padding:0 14px;min-height:1.55em}.diff-context{color:#344054}.diff-add{color:#067647;background:#ecfdf3}.diff-delete{color:#b42318;background:#fff1f0}.diff-hunk{color:#175cd3;background:#eff8ff}.diff-meta{color:#6941c6;background:#f9f5ff;font-weight:650}.historical-note{color:var(--muted);font-style:italic}.review-meta{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-top:14px}
+.severity-safe{background:var(--green-soft);color:var(--green)}.severity-filter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}.severity-filter .button{padding:8px 12px}.expandable-row{cursor:pointer}.expandable-row:focus{outline:3px solid #bed4ff;outline-offset:-3px}.row-toggle,.manual-review-button{padding:7px 10px;font-size:13px;white-space:nowrap}.review-state{font-weight:800}.review-state-open{color:var(--blue-dark)}.review-state-in_progress{color:var(--amber)}.review-state-done{color:var(--green)}.expanded-review td{padding:0 11px 18px;background:#f8fafc}.review-details{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px}.review-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}.review-section{border:1px solid var(--line);border-radius:10px;padding:16px}.review-section h3{font-size:14px;margin:0 0 8px}.review-copy{white-space:pre-wrap;margin:0;color:var(--ink)}.diff-view{max-height:520px;overflow:auto;margin:8px 0 0;padding:8px 0;background:#fff;color:#344054;border:1px solid #d0d5dd;border-radius:10px;font-size:12px;line-height:1.55;white-space:pre}.diff-view code{display:block;min-width:max-content}.diff-line{display:block;padding:0 14px;min-height:1.55em}.diff-context{color:#344054}.diff-add{color:#067647;background:#ecfdf3}.diff-delete{color:#b42318;background:#fff1f0}.diff-hunk{color:#175cd3;background:#eff8ff}.diff-meta{color:#6941c6;background:#f9f5ff;font-weight:650}.historical-note{color:var(--muted);font-style:italic}.review-meta{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-top:14px}.manual-review-dialog{width:min(620px,calc(100vw - 32px));border:0;border-radius:16px;padding:24px;box-shadow:0 24px 80px rgba(17,24,39,.28)}.manual-review-dialog::backdrop{background:rgba(15,23,42,.55)}.dialog-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:20px}.dialog-heading h2{margin:0}.manual-review-dialog fieldset{display:flex;gap:18px;border:1px solid var(--line);border-radius:10px;margin:18px 0;padding:14px}.manual-review-dialog legend{font-weight:750;padding:0 6px}.manual-review-dialog textarea{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;font:inherit;resize:vertical}.manual-decision{margin-top:12px;padding:12px;border-radius:9px;background:#f8fafc;border:1px solid var(--line)}
 .grid+.table-wrap{margin-top:22px}
 @media(max-width:900px){.app-shell{grid-template-columns:1fr}.sidebar{position:relative;height:auto;padding:14px 18px}.brand{padding:0 4px 14px}.side-nav{display:flex;overflow:auto;padding:12px 0 0}.side-nav a{white-space:nowrap}.sidebar-footer{display:flex;align-items:center;gap:14px;margin:12px 0 0;padding:12px 4px 0}.service-state{margin:0;margin-right:auto}.user-row{margin:0}.signout{width:auto}.app-main{padding:26px 20px 56px}.page-header{margin-bottom:22px}}
 @media(max-width:680px){.grid,.form-grid,.review-detail-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination,.page-header,.section-heading{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}.page-header h1{font-size:28px}.app-main{padding:22px 14px 48px}.card{padding:18px}.sidebar-footer{align-items:stretch;flex-wrap:wrap}.service-state{width:100%}.table-wrap{overflow:auto}}
@@ -1525,6 +1853,8 @@ def handler_factory(
                     self.update_settings(form)
                 elif parsed.path == "/reset-review-data":
                     self.reset_review_data(form)
+                elif parsed.path == "/manual-review":
+                    self.update_manual_review(form)
                 else:
                     self.send_page(404, page("Not found", "<div class='card'><h1>Not found</h1></div>"))
             except (ReviewError, UnicodeDecodeError) as exc:
@@ -1659,6 +1989,82 @@ def handler_factory(
                 else "GitLab access saved; MR discovery is active. Add an LLM API key later to review queued MRs."
             )
             self.redirect("/settings?message=" + urllib.parse.quote(message))
+
+        def update_manual_review(self, form: dict[str, str]) -> None:
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
+                raise ReviewError("Invalid form token.")
+            try:
+                project_id = int(form.get("project_id", ""))
+                mr_iid = int(form.get("mr_iid", ""))
+            except ValueError as exc:
+                raise ReviewError("Invalid merge-request reference.") from exc
+            head_sha = form.get("head_sha", "").strip()
+            item_key = form.get("item_key", "").strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{7,64}", head_sha):
+                raise ReviewError("Invalid merge-request revision.")
+            if item_key != MR_MANUAL_REVIEW_KEY and not re.fullmatch(
+                r"[0-9a-f]{64}", item_key
+            ):
+                raise ReviewError("Invalid manual-review item.")
+            review = store.report(project_id, mr_iid, head_sha)
+            if review is None:
+                raise ReviewError("The merge-request revision no longer exists.")
+            if item_key != MR_MANUAL_REVIEW_KEY:
+                valid_keys = {
+                    finding["item_key"]
+                    for finding in parse_security_findings(
+                        str(review["report_content"] or "")
+                    )
+                }
+                if item_key not in valid_keys:
+                    raise ReviewError("The security finding no longer exists.")
+
+            workflow_status = form.get("workflow_status", "").strip()
+            if workflow_status not in MANUAL_REVIEW_STATUSES:
+                raise ReviewError("Choose a valid manual-review status.")
+            resolution = form.get("resolution", "").strip()
+            severity = form.get("severity", "").strip().upper()
+            comments = form.get("comments", "").strip()
+            if len(comments) > 4000:
+                raise ReviewError("Comments cannot exceed 4,000 characters.")
+            if workflow_status == "done":
+                if resolution not in MANUAL_REVIEW_RESOLUTIONS:
+                    raise ReviewError("Choose false positive or confirmed finding.")
+                if not comments:
+                    raise ReviewError("Add comments before marking the review Done.")
+                if resolution == "finding" and severity not in MANUAL_FINDING_SEVERITIES:
+                    raise ReviewError("Choose a severity for the confirmed finding.")
+                if resolution == "false_positive":
+                    severity = ""
+            else:
+                resolution = ""
+                severity = ""
+                comments = ""
+
+            store.save_manual_review(
+                project_id,
+                mr_iid,
+                head_sha,
+                item_key,
+                workflow_status,
+                resolution,
+                severity,
+                comments,
+                str(user["username"]),
+            )
+            return_to = form.get("return_to", "/").strip()
+            return_url = urllib.parse.urlparse(return_to)
+            if (
+                return_url.scheme
+                or return_url.netloc
+                or return_url.path not in {"/", "/completed", "/repository"}
+            ):
+                return_to = "/"
+            self.redirect(return_to)
 
         def credential_context(self) -> tuple[Credentials, bytes, bytes]:
             existing, _ = vault.snapshot()
@@ -1898,7 +2304,9 @@ def handler_factory(
             <div><label for='activity_end_date'>End date (UTC)</label><input id='activity_end_date' name='end_date' type='date' value='{html.escape(str(context['end_date']))}' max='{maximum_date}' required></div>
             <button class='secondary' type='submit'>Apply range</button></form></div>"""
 
-        def findings_rows(self, findings: list[dict[str, Any]]) -> str:
+        def findings_rows(
+            self, findings: list[dict[str, Any]], return_to: str
+        ) -> str:
             rows = []
             for finding in findings:
                 severity = str(finding["severity"])
@@ -1919,10 +2327,11 @@ def handler_factory(
                     f"<td>{mr_display}</td>"
                     "<td><details><summary>View details</summary>"
                     f"<pre class='finding-details'>{html.escape(str(finding['details']))}</pre>"
-                    "</details></td></tr>"
+                    "</details></td>"
+                    f"<td>{manual_review_button(project_id=int(finding['project_id']), mr_iid=int(finding['mr_iid']), head_sha=str(finding['head_sha']), item_key=str(finding['item_key']), workflow_status=str(finding['manual_status']), resolution=str(finding['manual_resolution']), severity=str(finding['severity']) if str(finding['manual_resolution']) == 'finding' else '', comments=str(finding['manual_comments']), return_to=return_to)}</td></tr>"
                 )
             return "".join(rows) or (
-                "<tr><td class='empty-state' colspan='4'>No Critical or High security findings in this period.</td></tr>"
+                "<tr><td class='empty-state' colspan='5'>No open Critical or High security findings in this period.</td></tr>"
             )
 
         def vault_notice(self) -> str:
@@ -1963,10 +2372,12 @@ def handler_factory(
             _, user = session
             context = self.activity_window(query)
             counts, _ = store.dashboard()
+            manual_reviews = store.manual_review_map()
             findings, _ = collect_security_findings(
                 store.latest_review_reports(
                     context["activity_start"], context["activity_end"]
-                )
+                ),
+                manual_reviews,
             )
             findings = [
                 finding
@@ -1984,13 +2395,14 @@ def handler_factory(
             <div class='grid'>
               <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
               <div class='metric success'>Completed<strong>{counts.get('completed', 0)}</strong></div>
-              <div class='metric critical'>High severity<strong>{counts.get('high_severity', 0)}</strong></div>
+              <div class='metric critical'>High findings<strong>{len(findings)}</strong></div>
               <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
               <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div>
             </div></section>
             <section class='card'><div class='section-heading'><div><h2>High-severity findings</h2><p class='sub'>Critical and High findings from the latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
             {self.filter_controls(context, '/')}
-            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th></tr></thead><tbody>{self.findings_rows(findings)}</tbody></table></div></section>"""
+            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th><th>Manual review</th></tr></thead><tbody>{self.findings_rows(findings, self.path)}</tbody></table></div></section>
+            {manual_review_dialog(str(user['csrf_token']))}<script src='/app.js' defer></script>"""
             connection_status = self.gitlab_connection_status()
             self.application_response(
                 "Dashboard",
@@ -2012,19 +2424,26 @@ def handler_factory(
                 return
             _, user = session
             reviews = store.completed_reviews()
-            entries = completed_review_entries(reviews)
+            manual_reviews = store.manual_review_map()
+            entries = completed_review_entries(reviews, manual_reviews)
             selected_severity = query.get("severity", ["all"])[0].lower()
             if selected_severity not in COMPLETED_SEVERITIES:
                 selected_severity = "all"
-            filtered_entries = (
-                entries
-                if selected_severity == "all"
-                else [
-                    entry
-                    for entry in entries
-                    if str(entry["severity"]).lower() == selected_severity
-                ]
-            )
+            selected_status = query.get("manual_status", ["all"])[0].lower()
+            if selected_status not in MANUAL_REVIEW_FILTERS:
+                selected_status = "all"
+            filtered_entries = [
+                entry
+                for entry in entries
+                if (
+                    selected_severity == "all"
+                    or str(entry["severity"]).lower() == selected_severity
+                )
+                and (
+                    selected_status == "all"
+                    or str(entry["manual_status"]) == selected_status
+                )
+            ]
             try:
                 requested_page = int(query.get("page", ["1"])[0])
             except ValueError:
@@ -2047,7 +2466,7 @@ def handler_factory(
             }
             filter_links = "".join(
                 f"<a class='button {'primary' if value == selected_severity else 'secondary'}' "
-                f"href='/completed?severity={value}'>{label} ({len(entries) if value == 'all' else severity_counts[value]})</a>"
+                f"href='/completed?{urllib.parse.urlencode({'severity': value, 'manual_status': selected_status})}'>{label} ({len(entries) if value == 'all' else severity_counts[value]})</a>"
                 for value, label in (
                     ("all", "All"),
                     ("critical", "Critical"),
@@ -2055,6 +2474,22 @@ def handler_factory(
                     ("medium", "Medium"),
                     ("low", "Low"),
                     ("safe", "Safe"),
+                )
+            )
+            status_counts = {
+                status: sum(
+                    1 for entry in entries if str(entry["manual_status"]) == status
+                )
+                for status in ("open", "in_progress", "done")
+            }
+            status_filter_links = "".join(
+                f"<a class='button {'primary' if value == selected_status else 'secondary'}' "
+                f"href='/completed?{urllib.parse.urlencode({'severity': selected_severity, 'manual_status': value})}'>{label} ({len(entries) if value == 'all' else status_counts[value]})</a>"
+                for value, label in (
+                    ("all", "All statuses"),
+                    ("open", "Open"),
+                    ("in_progress", "In Progress"),
+                    ("done", "Done"),
                 )
             )
             rows = []
@@ -2085,31 +2520,56 @@ def handler_factory(
                 )
                 evidence_heading = "Review result" if severity == "SAFE" else "Finding evidence"
                 reviewed_at = str(entry["reviewed_at"])[:19].replace("T", " ") + " UTC"
+                decision_details = ""
+                if str(entry["manual_status"]) == "done":
+                    resolution_label = (
+                        "False positive"
+                        if str(entry["manual_resolution"]) == "false_positive"
+                        else f"Confirmed finding · {html.escape(str(entry['manual_severity']))}"
+                    )
+                    decision_details = (
+                        "<section class='manual-decision'><strong>Manual resolution: "
+                        f"{resolution_label}</strong><p class='review-copy'>"
+                        f"{html.escape(str(entry['manual_comments']))}</p></section>"
+                    )
+                action = manual_review_button(
+                    project_id=int(entry["project_id"]),
+                    mr_iid=int(entry["mr_iid"]),
+                    head_sha=str(entry["head_sha"]),
+                    item_key=str(entry["item_key"]),
+                    workflow_status=str(entry["manual_status"]),
+                    resolution=str(entry["manual_resolution"]),
+                    severity=str(entry["manual_severity"]),
+                    comments=str(entry["manual_comments"]),
+                    return_to=self.path,
+                )
                 rows.append(
                     f"<tr class='expandable-row' data-details-id='{detail_id}' tabindex='0' role='button' aria-expanded='false'>"
                     f"<td><span class='severity severity-{severity.lower()}'>{html.escape(severity)}</span></td>"
                     f"<td>{html.escape(str(entry['title']))}</td><td>{mr_display}</td>"
-                    "<td><button class='row-toggle secondary' type='button'>View review</button></td></tr>"
-                    f"<tr class='expanded-review' id='{detail_id}' hidden><td colspan='4'><div class='review-details'>"
+                    "<td><button class='row-toggle secondary' type='button'>View review</button></td>"
+                    f"<td>{action}</td></tr>"
+                    f"<tr class='expanded-review' id='{detail_id}' hidden><td colspan='5'><div class='review-details'>"
                     "<div class='review-detail-grid'>"
                     f"<section class='review-section'><h3>Review summary</h3><p class='review-copy'>{html.escape(str(entry['summary']))}</p></section>"
                     f"<section class='review-section'><h3>Severity explanation</h3><p class='review-copy'>{html.escape(str(entry['severity_explanation']))}</p></section>"
-                    f"</div><section class='review-section'><h3>{evidence_heading}</h3><p class='review-copy'>{html.escape(str(entry['finding_details']))}</p></section>"
+                    f"</div><section class='review-section'><h3>{evidence_heading}</h3><p class='review-copy'>{html.escape(str(entry['finding_details']))}</p></section>{decision_details}"
                     f"<section class='review-section'><h3>Reviewed code diff</h3>{diff_display}</section>"
                     f"<div class='review-meta'><span class='sub'>Reviewed {html.escape(reviewed_at)} · Commit <code>{html.escape(str(entry['head_sha'])[:12])}</code></span>"
                     f"<a class='button secondary' href='/report?{report_query}'>Open full report</a></div>"
                     "</div></td></tr>"
                 )
             table_rows = "".join(rows) or (
-                "<tr><td class='empty-state' colspan='4'>No completed reviews match this severity.</td></tr>"
+                "<tr><td class='empty-state' colspan='5'>No completed reviews match these filters.</td></tr>"
             )
+            page_query = {"severity": selected_severity, "manual_status": selected_status}
             previous_page = (
-                f"<a class='button secondary' href='/completed?severity={selected_severity}&page={page_number - 1}'>Previous</a>"
+                f"<a class='button secondary' href='/completed?{urllib.parse.urlencode({**page_query, 'page': page_number - 1})}'>Previous</a>"
                 if page_number > 1
                 else ""
             )
             next_page = (
-                f"<a class='button secondary' href='/completed?severity={selected_severity}&page={page_number + 1}'>Next</a>"
+                f"<a class='button secondary' href='/completed?{urllib.parse.urlencode({**page_query, 'page': page_number + 1})}'>Next</a>"
                 if page_number < page_count
                 else ""
             )
@@ -2123,8 +2583,9 @@ def handler_factory(
             body = f"""
             <section class='card'><div class='section-heading'><div><h2>Completed review results</h2><p class='sub'>Latest completed revision of every reviewed MR, including reviews with no findings. Select a row to inspect the evidence.</p></div><span class='severity severity-safe'>{len(reviews)} MRs</span></div>
             <nav class='severity-filter' aria-label='Filter completed reviews by severity'>{filter_links}</nav>
-            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>
-            <script src='/app.js' defer></script>"""
+            <nav class='severity-filter' aria-label='Filter completed reviews by manual-review status'>{status_filter_links}</nav>
+            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th><th>Manual review</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>
+            {manual_review_dialog(str(user['csrf_token']))}<script src='/app.js' defer></script>"""
             self.application_response(
                 "Completed MRs",
                 "Completed MRs",
@@ -2144,10 +2605,12 @@ def handler_factory(
             _, user = session
             context = self.activity_window(query)
             projects = context["projects"]
+            manual_reviews = store.manual_review_map()
             findings, finding_counts = collect_security_findings(
                 store.latest_review_reports(
                     context["activity_start"], context["activity_end"]
-                )
+                ),
+                manual_reviews,
             )
             fetched_mrs = sum(int(project["mr_count"]) for project in projects)
             total_repositories = len(projects)
@@ -2503,8 +2966,30 @@ def handler_factory(
                     ),
                 )
                 return
+            selected_status = query.get("manual_status", ["all"])[0].lower()
+            if selected_status not in MANUAL_REVIEW_FILTERS:
+                selected_status = "all"
+            manual_reviews = store.manual_review_map()
+            repository_rows = store.repository_mrs(project_id, start, end)
+            row_statuses = {
+                (int(row["mr_iid"]), str(row["head_sha"])): manual_review_status_for_mr(
+                    int(row["project_id"]),
+                    int(row["mr_iid"]),
+                    str(row["head_sha"]),
+                    str(row["report_content"] or ""),
+                    manual_reviews,
+                )
+                for row in repository_rows
+            }
+            status_counts = {
+                status: sum(1 for value in row_statuses.values() if value == status)
+                for status in ("open", "in_progress", "done")
+            }
             rows = []
-            for index, row in enumerate(store.repository_mrs(project_id, start, end)):
+            for index, row in enumerate(repository_rows):
+                manual_status = row_statuses[(int(row["mr_iid"]), str(row["head_sha"]))]
+                if selected_status != "all" and manual_status != selected_status:
+                    continue
                 params = urllib.parse.urlencode(
                     {
                         "project_id": row["project_id"],
@@ -2548,6 +3033,25 @@ def handler_factory(
                     if mr_url
                     else ""
                 )
+                mr_decision = manual_reviews.get(
+                    (
+                        int(row["project_id"]),
+                        int(row["mr_iid"]),
+                        str(row["head_sha"]),
+                        MR_MANUAL_REVIEW_KEY,
+                    )
+                )
+                action = manual_review_button(
+                    project_id=int(row["project_id"]),
+                    mr_iid=int(row["mr_iid"]),
+                    head_sha=str(row["head_sha"]),
+                    item_key=MR_MANUAL_REVIEW_KEY,
+                    workflow_status=manual_status,
+                    resolution=str(mr_decision["resolution"] or "") if mr_decision else "",
+                    severity=str(mr_decision["severity"] or "") if mr_decision else "",
+                    comments=str(mr_decision["comments"] or "") if mr_decision else "",
+                    return_to=self.path,
+                )
                 rows.append(
                     f"<tr class='expandable-row' data-details-id='{detail_id}' "
                     f"data-diff-url='/mr-diff?{html.escape(diff_query)}' "
@@ -2558,14 +3062,15 @@ def handler_factory(
                     f"<td class='status {html.escape(str(row['status']))}'>{html.escape(str(row['status']))}</td>"
                     f"<td>{html.escape(str(row['mr_created_at'])[:19].replace('T', ' '))} UTC</td>"
                     f"<td>{report_link}</td>"
-                    "<td><button class='row-toggle secondary' type='button'>View diff</button></td></tr>"
-                    f"<tr class='expanded-review' id='{detail_id}' hidden><td colspan='6'>"
+                    "<td><button class='row-toggle secondary' type='button'>View diff</button></td>"
+                    f"<td>{action}</td></tr>"
+                    f"<tr class='expanded-review' id='{detail_id}' hidden><td colspan='7'>"
                     "<div class='review-details'><section class='review-section'>"
                     f"<h3>MR !{int(row['mr_iid'])} reviewed code diff</h3>{diff_display}"
                     f"</section><div class='review-meta'>{gitlab_link}</div></div></td></tr>"
                 )
             table_rows = "".join(rows) or (
-                "<tr><td class='empty-state' colspan='6'>No MRs in this period.</td></tr>"
+                "<tr><td class='empty-state' colspan='7'>No MRs match this date range and manual-review status.</td></tr>"
             )
             filter_label = (
                 (
@@ -2581,13 +3086,29 @@ def handler_factory(
                 if start_date and end_date
                 else {"period": period}
             )
+            date_query = (
+                {"start_date": start_date, "end_date": end_date}
+                if start_date and end_date
+                else {"period": period}
+            )
+            status_filter_links = "".join(
+                f"<a class='button {'primary' if value == selected_status else 'secondary'}' "
+                f"href='/repository?{urllib.parse.urlencode({'project_id': project_id, **date_query, 'manual_status': value})}'>{label} ({len(repository_rows) if value == 'all' else status_counts[value]})</a>"
+                for value, label in (
+                    ("all", "All statuses"),
+                    ("open", "Open"),
+                    ("in_progress", "In Progress"),
+                    ("done", "Done"),
+                )
+            )
             body = f"""
             <section class='card'><div class='section-heading'><div><h2>Merge requests</h2><p class='sub'>Select a date range, then select an MR row to inspect its bounded code diff.</p></div></div>
-            {self.filter_controls({'period': period, 'start_date': start_date, 'end_date': end_date}, '/repository', {'project_id': project_id})}
+            {self.filter_controls({'period': period, 'start_date': start_date, 'end_date': end_date}, '/repository', {'project_id': project_id, 'manual_status': selected_status})}
+            <nav class='severity-filter' aria-label='Filter merge requests by manual-review status'>{status_filter_links}</nav>
             <div class='table-wrap'><table><thead><tr>
-            <th>MR</th><th>Latest commit</th><th>Review status</th><th>MR created</th><th>Report</th><th>Code diff</th>
+            <th>MR</th><th>Latest commit</th><th>AI review</th><th>MR created</th><th>Report</th><th>Code diff</th><th>Manual review</th>
             </tr></thead><tbody>{table_rows}</tbody></table></div></section>
-            <script src='/app.js' defer></script>"""
+            {manual_review_dialog(str(user['csrf_token']))}<script src='/app.js' defer></script>"""
             self.application_response(
                 "Repository MRs",
                 str(project["project_path"]),
