@@ -48,6 +48,7 @@ from security_review.service import (  # noqa: E402
     test_claude_api_key as verify_claude_api_key,
 )
 from security_review.web import (  # noqa: E402
+    APP_JAVASCRIPT,
     Credentials,
     MemoryVault,
     WebStore,
@@ -1505,6 +1506,7 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("data-lazy-commits", repository_mrs)
             self.assertIn("Commit messages and authors load", repository_mrs)
             self.assertNotIn("View commits", repository_mrs)
+            self.assertNotIn("message.href", APP_JAVASCRIPT.decode("utf-8"))
             self.assertEqual(stored_diff["source"], "stored")
             self.assertIn("run_shell(user_input)", stored_diff["diff"])
             self.assertEqual(fetched_diff["source"], "gitlab")
