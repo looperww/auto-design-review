@@ -55,6 +55,7 @@ from security_review.web import (  # noqa: E402
     parse_security_findings,
     password_record,
     report_section,
+    render_diff_html,
     handler_factory,
     validated_credentials,
     verify_password,
@@ -650,6 +651,20 @@ class DiscoveryInventoryTests(unittest.TestCase):
             "Overall severity rationale",
             parse_security_findings(reviews[0]["report_content"])[0]["details"],
         )
+
+    def test_diff_html_uses_light_syntax_classes_and_escapes_code(self):
+        rendered = render_diff_html(
+            "## Changed file: app.py\n@@ -1 +1 @@\n-old <value>\n+new & safe\n context"
+        )
+
+        self.assertIn("class='diff-line diff-meta'", rendered)
+        self.assertIn("class='diff-line diff-hunk'", rendered)
+        self.assertIn("class='diff-line diff-delete'", rendered)
+        self.assertIn("class='diff-line diff-add'", rendered)
+        self.assertIn("class='diff-line diff-context'", rendered)
+        self.assertIn("&lt;value&gt;", rendered)
+        self.assertIn("new &amp; safe", rendered)
+        self.assertNotIn("<value>", rendered)
 
     def test_repository_activity_uses_mr_dates_and_project_health(self):
         with tempfile.TemporaryDirectory() as directory:
