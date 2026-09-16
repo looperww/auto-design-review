@@ -1,5 +1,6 @@
 import io
 import http.client
+import json
 import os
 import sqlite3
 import subprocess
@@ -858,6 +859,15 @@ class WebAuthenticationTests(unittest.TestCase):
                 ),
                 diff_content="@@ -5,0 +6 @@\n+cursor.execute(query, (user_input,))",
             )
+            state.queue(
+                ReviewTarget(
+                    1,
+                    "company/app",
+                    10,
+                    "pending-sha",
+                    "https://gitlab.example.com/company/app/-/merge_requests/10",
+                )
+            )
             state.close()
             handler = handler_factory(store, root / "reports", False, vault)
             handler.log_message = lambda *_args: None
@@ -879,6 +889,46 @@ class WebAuthenticationTests(unittest.TestCase):
                     urllib.request.Request(base_url + "/completed", headers=headers)
                 ) as response:
                     completed = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        base_url + "/repository?project_id=1&period=week",
+                        headers=headers,
+                    )
+                ) as response:
+                    repository_mrs = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        base_url
+                        + "/mr-diff?project_id=1&mr_iid=7&sha=high-sha",
+                        headers=headers,
+                    )
+                ) as response:
+                    stored_diff = json.loads(response.read().decode("utf-8"))
+                with (
+                    patch.object(
+                        GitLabClient,
+                        "get_merge_request",
+                        return_value={"sha": "pending-sha"},
+                    ),
+                    patch.object(
+                        GitLabClient,
+                        "get_merge_request_diffs",
+                        return_value=[
+                            {
+                                "new_path": "pending.py",
+                                "diff": "@@ -0,0 +1 @@\n+pending_change = True",
+                            }
+                        ],
+                    ),
+                ):
+                    with urllib.request.urlopen(
+                        urllib.request.Request(
+                            base_url
+                            + "/mr-diff?project_id=1&mr_iid=10&sha=pending-sha",
+                            headers=headers,
+                        )
+                    ) as response:
+                        fetched_diff = json.loads(response.read().decode("utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
@@ -920,6 +970,22 @@ class WebAuthenticationTests(unittest.TestCase):
             )
             self.assertIn(expected_columns, dashboard)
             self.assertIn(expected_columns, completed)
+            self.assertIn("<h2>Merge requests</h2>", repository_mrs)
+            self.assertIn("name='project_id' value='1'", repository_mrs)
+            self.assertIn("/repository?project_id=1&amp;period=day", repository_mrs)
+            self.assertIn("name='start_date'", repository_mrs)
+            self.assertIn("name='end_date'", repository_mrs)
+            self.assertIn("class='expandable-row'", repository_mrs)
+            self.assertIn("data-open-label='View diff'", repository_mrs)
+            self.assertIn("run_shell(user_input)", repository_mrs)
+            self.assertIn("data-lazy-diff", repository_mrs)
+            self.assertEqual(stored_diff["source"], "stored")
+            self.assertIn("run_shell(user_input)", stored_diff["diff"])
+            self.assertEqual(fetched_diff["source"], "gitlab")
+            self.assertIn("pending_change = True", fetched_diff["diff"])
+            cached_pending = store.mr_revision(1, 10, "pending-sha")
+            self.assertIsNotNone(cached_pending)
+            self.assertIn("pending_change = True", cached_pending["diff_content"])
 
     def test_application_shell_has_safe_navigation_and_active_page(self):
         rendered = application_page(

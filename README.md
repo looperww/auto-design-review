@@ -324,7 +324,14 @@ period or custom UTC date range. Repository totals continue to cover all visible
 repositories, not only the current page.
 
 Click a non-zero MR count to open that repository's filtered MR list and its
-available security reports.
+available security reports. The repository-specific MR page has the same Day,
+Week, Month, and inclusive UTC date-range filters as the repository inventory.
+Each MR row is selectable and expands into a bounded code-diff panel for manual
+inspection. A completed review uses its retained diff immediately. If a queued
+or historical row has no retained diff, expanding it fetches the exact current
+MR revision from GitLab on demand and caches it in SQLite. The service refuses
+to display a mismatched revision if GitLab has received a newer commit; the next
+discovery cycle must record that revision first.
 
 The Dashboard **High-severity findings** section lists only Critical and High
 findings for the active period. Each row shows the finding title, a direct link

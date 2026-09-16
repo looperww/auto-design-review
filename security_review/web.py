@@ -35,6 +35,7 @@ from .service import (
     list_llm_models,
     normalize_gitlab_group_path,
     normalize_runtime_setting,
+    render_diffs,
     test_llm_connection,
 )
 
@@ -67,10 +68,30 @@ APP_JAVASCRIPT = b"""(() => {
     const details = document.getElementById(row.dataset.detailsId || '');
     const button = row.querySelector('.row-toggle');
     if (!details) continue;
+    const openLabel = row.dataset.openLabel || 'View review';
+    const closeLabel = row.dataset.closeLabel || 'Hide review';
+    const lazyDiff = details.querySelector('[data-lazy-diff]');
+    const loadDiff = async () => {
+      if (!lazyDiff || lazyDiff.dataset.loaded === 'true') return;
+      lazyDiff.dataset.loaded = 'true';
+      lazyDiff.textContent = 'Loading the MR diff from GitLab...';
+      try {
+        const response = await fetch(row.dataset.diffUrl || '', {
+          headers: {'Accept': 'application/json'},
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || 'Could not load the MR diff.');
+        lazyDiff.textContent = payload.diff || 'GitLab returned an empty diff for this MR revision.';
+      } catch (error) {
+        lazyDiff.dataset.loaded = 'false';
+        lazyDiff.textContent = error instanceof Error ? error.message : 'Could not load the MR diff.';
+      }
+    };
     const setExpanded = (expanded) => {
       details.hidden = !expanded;
       row.setAttribute('aria-expanded', String(expanded));
-      if (button) button.textContent = expanded ? 'Hide review' : 'View review';
+      if (button) button.textContent = expanded ? closeLabel : openLabel;
+      if (expanded) loadDiff();
     };
     const toggle = () => setExpanded(details.hidden);
     row.addEventListener('click', (event) => {
@@ -1016,7 +1037,8 @@ class WebStore:
                 """
                 WITH ranked AS (
                     SELECT project_id, project_path, mr_iid, head_sha, status,
-                           report_path, report_content, mr_created_at, reviewed_at,
+                           report_path, report_content, diff_content,
+                           mr_created_at, reviewed_at,
                            ROW_NUMBER() OVER (
                                PARTITION BY project_id, mr_iid
                                ORDER BY reviewed_at DESC
@@ -1027,13 +1049,41 @@ class WebStore:
                       AND COALESCE(NULLIF(mr_created_at, ''), discovered_at) < ?
                 )
                 SELECT project_id, project_path, mr_iid, head_sha, status,
-                       report_path, report_content, mr_created_at, reviewed_at
+                       report_path, report_content, diff_content,
+                       mr_created_at, reviewed_at
                 FROM ranked
                 WHERE revision_rank = 1
                 ORDER BY mr_created_at DESC, mr_iid DESC
                 """,
                 (project_id, start.isoformat(), end.isoformat()),
             ).fetchall()
+
+    def mr_revision(
+        self, project_id: int, mr_iid: int, head_sha: str
+    ) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT project_id, project_path, mr_iid, head_sha, status,
+                       diff_content
+                FROM reviews
+                WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
+                """,
+                (project_id, mr_iid, head_sha),
+            ).fetchone()
+
+    def cache_mr_diff(
+        self, project_id: int, mr_iid: int, head_sha: str, diff_content: str
+    ) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE reviews SET diff_content = ?
+                WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
+                """,
+                (diff_content, project_id, mr_iid, head_sha),
+            )
+            return cursor.rowcount == 1
 
     def latest_review_reports(
         self, start: datetime, end: datetime
@@ -1401,6 +1451,8 @@ def handler_factory(
                 self.show_completed(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/report":
                 self.show_report(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/mr-diff":
+                self.show_mr_diff(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/repository":
                 self.show_repository(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/":
@@ -1777,17 +1829,28 @@ def handler_factory(
                 "date_error": date_error,
             }
 
-        def filter_controls(self, context: dict[str, Any], action: str) -> str:
+        def filter_controls(
+            self,
+            context: dict[str, Any],
+            action: str,
+            fixed_query: Mapping[str, Any] | None = None,
+        ) -> str:
             period = str(context["period"])
+            fixed = dict(fixed_query or {})
             period_links = "".join(
                 f"<a class='button {'primary' if choice == period else 'secondary'}' "
-                f"href='{action}?period={choice}'>{label}</a>"
+                f"href='{html.escape(action + '?' + urllib.parse.urlencode({**fixed, 'period': choice}))}'>{label}</a>"
                 for choice, label in (("day", "Day"), ("week", "Week"), ("month", "Month"))
+            )
+            hidden_fields = "".join(
+                f"<input type='hidden' name='{html.escape(str(key))}' value='{html.escape(str(value))}'>"
+                for key, value in fixed.items()
             )
             maximum_date = datetime.now(timezone.utc).date().isoformat()
             return f"""
             <div class='filter-bar'><div class='actions'>{period_links}</div>
             <form class='date-filter' method='get' action='{action}'>
+            {hidden_fields}
             <div><label for='activity_start_date'>Start date (UTC)</label><input id='activity_start_date' name='start_date' type='date' value='{html.escape(str(context['start_date']))}' max='{maximum_date}' required></div>
             <div><label for='activity_end_date'>End date (UTC)</label><input id='activity_end_date' name='end_date' type='date' value='{html.escape(str(context['end_date']))}' max='{maximum_date}' required></div>
             <button class='secondary' type='submit'>Apply range</button></form></div>"""
@@ -2273,6 +2336,80 @@ def handler_factory(
             )
             self.redirect("/settings?message=" + urllib.parse.quote(message))
 
+        def show_mr_diff(self, query: dict[str, list[str]]) -> None:
+            if self.require_session() is None:
+                return
+            try:
+                project_id = int(query.get("project_id", [""])[0])
+                mr_iid = int(query.get("mr_iid", [""])[0])
+            except ValueError:
+                self.send_json(400, {"error": "Invalid MR reference."})
+                return
+            head_sha = query.get("sha", [""])[0].strip()
+            if not head_sha or len(head_sha) > 128:
+                self.send_json(400, {"error": "Invalid MR revision."})
+                return
+            revision = store.mr_revision(project_id, mr_iid, head_sha)
+            if revision is None:
+                self.send_json(404, {"error": "MR revision not found."})
+                return
+            stored_diff = str(revision["diff_content"] or "")
+            if stored_diff:
+                self.send_json(200, {"diff": stored_diff, "source": "stored"})
+                return
+            credentials, _ = vault.snapshot()
+            if credentials is None:
+                self.send_json(
+                    503,
+                    {"error": "Sign in again to unlock the GitLab credentials."},
+                )
+                return
+            try:
+                config = Config.from_credentials(
+                    credentials.gitlab_url,
+                    credentials.gitlab_token,
+                    credentials.llm_api_key,
+                    store.settings(),
+                    llm_provider=credentials.llm_provider,
+                    llm_api_url=credentials.llm_api_url,
+                    llm_model=credentials.llm_model,
+                    gitlab_group_path=credentials.gitlab_group_path,
+                )
+                client = GitLabClient(
+                    config.gitlab_url,
+                    config.gitlab_token,
+                    config.gitlab_group_path,
+                )
+                diffs = client.get_merge_request_diffs(
+                    str(revision["project_path"]), mr_iid
+                )
+                mr = client.get_merge_request(str(revision["project_path"]), mr_iid)
+                diff_refs = mr.get("diff_refs")
+                if not isinstance(diff_refs, Mapping):
+                    diff_refs = {}
+                current_sha = str(mr.get("sha") or diff_refs.get("head_sha") or "")
+                if current_sha != head_sha:
+                    self.send_json(
+                        409,
+                        {
+                            "error": (
+                                "A newer MR revision exists. Wait for the next discovery "
+                                "cycle, then reload this page."
+                            )
+                        },
+                    )
+                    return
+                rendered_diff = render_diffs(diffs, config) or (
+                    "GitLab returned no changed lines for this MR revision."
+                )
+            except ReviewError as exc:
+                self.send_json(502, {"error": str(exc)})
+                return
+            if not store.cache_mr_diff(project_id, mr_iid, head_sha, rendered_diff):
+                self.send_json(404, {"error": "MR revision is no longer available."})
+                return
+            self.send_json(200, {"diff": rendered_diff, "source": "gitlab"})
+
         def show_repository(self, query: dict[str, list[str]]) -> None:
             session = self.require_session()
             if session is None:
@@ -2324,7 +2461,7 @@ def handler_factory(
                 )
                 return
             rows = []
-            for row in store.repository_mrs(project_id, start, end):
+            for index, row in enumerate(store.repository_mrs(project_id, start, end)):
                 params = urllib.parse.urlencode(
                     {
                         "project_id": row["project_id"],
@@ -2337,16 +2474,55 @@ def handler_factory(
                     if row["report_content"] or row["report_path"]
                     else "—"
                 )
+                detail_id = f"repository-mr-{index}"
+                diff_query = urllib.parse.urlencode(
+                    {
+                        "project_id": row["project_id"],
+                        "mr_iid": row["mr_iid"],
+                        "sha": row["head_sha"],
+                    }
+                )
+                stored_diff = str(row["diff_content"] or "")
+                diff_display = (
+                    f"<pre class='diff-view'>{html.escape(stored_diff)}</pre>"
+                    if stored_diff
+                    else (
+                        "<pre class='diff-view' data-lazy-diff data-loaded='false'>"
+                        "Select this row to load the bounded diff from GitLab.</pre>"
+                    )
+                )
+                project_url = str(project["web_url"] or "")
+                parsed_project_url = urllib.parse.urlparse(project_url)
+                mr_url = (
+                    project_url.rstrip("/")
+                    + f"/-/merge_requests/{int(row['mr_iid'])}"
+                    if parsed_project_url.scheme == "https"
+                    and parsed_project_url.netloc
+                    else ""
+                )
+                gitlab_link = (
+                    f"<a class='button secondary' href='{html.escape(mr_url)}' target='_blank' rel='noopener noreferrer'>Open in GitLab</a>"
+                    if mr_url
+                    else ""
+                )
                 rows.append(
-                    "<tr>"
+                    f"<tr class='expandable-row' data-details-id='{detail_id}' "
+                    f"data-diff-url='/mr-diff?{html.escape(diff_query)}' "
+                    "data-open-label='View diff' data-close-label='Hide diff' "
+                    "tabindex='0' role='button' aria-expanded='false'>"
                     f"<td>!{int(row['mr_iid'])}</td>"
                     f"<td><code>{html.escape(str(row['head_sha'])[:12])}</code></td>"
                     f"<td class='status {html.escape(str(row['status']))}'>{html.escape(str(row['status']))}</td>"
                     f"<td>{html.escape(str(row['mr_created_at'])[:19].replace('T', ' '))} UTC</td>"
-                    f"<td>{report_link}</td></tr>"
+                    f"<td>{report_link}</td>"
+                    "<td><button class='row-toggle secondary' type='button'>View diff</button></td></tr>"
+                    f"<tr class='expanded-review' id='{detail_id}' hidden><td colspan='6'>"
+                    "<div class='review-details'><section class='review-section'>"
+                    f"<h3>MR !{int(row['mr_iid'])} reviewed code diff</h3>{diff_display}"
+                    f"</section><div class='review-meta'>{gitlab_link}</div></div></td></tr>"
                 )
             table_rows = "".join(rows) or (
-                "<tr><td colspan='5'>No MRs in this period.</td></tr>"
+                "<tr><td class='empty-state' colspan='6'>No MRs in this period.</td></tr>"
             )
             filter_label = (
                 (
@@ -2363,9 +2539,12 @@ def handler_factory(
                 else {"period": period}
             )
             body = f"""
-            <section class='card'><div class='table-wrap'><table><thead><tr>
-            <th>MR</th><th>Latest commit</th><th>Review status</th><th>MR created</th><th>Report</th>
-            </tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
+            <section class='card'><div class='section-heading'><div><h2>Merge requests</h2><p class='sub'>Select a date range, then select an MR row to inspect its bounded code diff.</p></div></div>
+            {self.filter_controls({'period': period, 'start_date': start_date, 'end_date': end_date}, '/repository', {'project_id': project_id})}
+            <div class='table-wrap'><table><thead><tr>
+            <th>MR</th><th>Latest commit</th><th>Review status</th><th>MR created</th><th>Report</th><th>Code diff</th>
+            </tr></thead><tbody>{table_rows}</tbody></table></div></section>
+            <script src='/app.js' defer></script>"""
             self.application_response(
                 "Repository MRs",
                 str(project["project_path"]),
