@@ -95,6 +95,7 @@ APP_JAVASCRIPT = b"""(() => {
     const openLabel = row.dataset.openLabel || 'View review';
     const closeLabel = row.dataset.closeLabel || 'Hide review';
     const lazyDiff = details.querySelector('[data-lazy-diff]');
+    const lazyCommits = details.querySelector('[data-lazy-commits]');
     const loadDiff = async () => {
       if (!lazyDiff || lazyDiff.dataset.loaded === 'true') return;
       lazyDiff.dataset.loaded = 'true';
@@ -114,11 +115,54 @@ APP_JAVASCRIPT = b"""(() => {
         lazyDiff.textContent = error instanceof Error ? error.message : 'Could not load the MR diff.';
       }
     };
+    const loadCommits = async () => {
+      if (!lazyCommits || lazyCommits.dataset.loaded === 'true') return;
+      lazyCommits.dataset.loaded = 'true';
+      lazyCommits.textContent = 'Loading commit details from GitLab...';
+      try {
+        const response = await fetch(lazyCommits.dataset.commitsUrl || '', {
+          headers: {'Accept': 'application/json'},
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || 'Could not load commit details.');
+        const commits = Array.isArray(payload.commits) ? payload.commits : [];
+        if (!commits.length) {
+          lazyCommits.textContent = 'GitLab returned no commit details for this MR.';
+          return;
+        }
+        const list = document.createElement('div');
+        list.className = 'commit-summary-list';
+        for (const commit of commits) {
+          const item = document.createElement('div');
+          item.className = 'commit-summary-item';
+          const message = document.createElement(commit.web_url ? 'a' : 'span');
+          message.className = 'commit-message';
+          message.textContent = commit.message || commit.title || 'Untitled commit';
+          if (commit.web_url) {
+            message.href = commit.web_url;
+            message.target = '_blank';
+            message.rel = 'noopener noreferrer';
+          }
+          const author = document.createElement('span');
+          author.className = 'commit-author';
+          author.textContent = `by ${commit.author_name || 'Unknown author'}`;
+          item.append(message, author);
+          list.appendChild(item);
+        }
+        lazyCommits.replaceChildren(list);
+      } catch (error) {
+        lazyCommits.dataset.loaded = 'false';
+        lazyCommits.textContent = error instanceof Error ? error.message : 'Could not load commit details.';
+      }
+    };
     const setExpanded = (expanded) => {
       details.hidden = !expanded;
       row.setAttribute('aria-expanded', String(expanded));
       if (button) button.textContent = expanded ? closeLabel : openLabel;
-      if (expanded) loadDiff();
+      if (expanded) {
+        loadCommits();
+        loadDiff();
+      }
     };
     const toggle = () => setExpanded(details.hidden);
     row.addEventListener('click', (event) => {
@@ -131,71 +175,6 @@ APP_JAVASCRIPT = b"""(() => {
       toggle();
     });
     if (button) button.addEventListener('click', toggle);
-  }
-  for (const button of document.querySelectorAll('.commit-history-button')) {
-    const target = document.getElementById(button.dataset.targetId || '');
-    if (!target) continue;
-    button.addEventListener('click', async () => {
-      if (target.dataset.loaded === 'true') {
-        target.hidden = !target.hidden;
-        button.textContent = target.hidden ? 'View commits' : 'Hide commits';
-        return;
-      }
-      button.disabled = true;
-      target.hidden = false;
-      target.textContent = 'Loading MR commits from GitLab...';
-      try {
-        const response = await fetch(button.dataset.commitsUrl || '', {
-          headers: {'Accept': 'application/json'},
-        });
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || 'Could not load MR commits.');
-        const commits = Array.isArray(payload.commits) ? payload.commits : [];
-        if (!commits.length) {
-          target.textContent = 'GitLab returned no commits for this MR.';
-        } else {
-          const table = document.createElement('table');
-          table.className = 'commit-table';
-          const head = document.createElement('thead');
-          head.innerHTML = '<tr><th>Commit</th><th>Message</th><th>Author</th><th>Committed</th></tr>';
-          table.appendChild(head);
-          const body = document.createElement('tbody');
-          for (const commit of commits) {
-            const row = document.createElement('tr');
-            const shaCell = document.createElement('td');
-            const sha = document.createElement(commit.web_url ? 'a' : 'code');
-            sha.textContent = commit.short_id || commit.id.slice(0, 12);
-            if (commit.web_url) {
-              sha.href = commit.web_url;
-              sha.target = '_blank';
-              sha.rel = 'noopener noreferrer';
-            }
-            shaCell.appendChild(sha);
-            for (const [value, className] of [
-              [commit.title, 'commit-title'],
-              [commit.author_name, ''],
-              [commit.committed_date, ''],
-            ]) {
-              const cell = document.createElement('td');
-              cell.textContent = value || '-';
-              if (className) cell.className = className;
-              row.appendChild(cell);
-            }
-            row.prepend(shaCell);
-            body.appendChild(row);
-          }
-          table.appendChild(body);
-          target.replaceChildren(table);
-        }
-        target.dataset.loaded = 'true';
-        button.textContent = 'Hide commits';
-      } catch (error) {
-        target.hidden = false;
-        target.textContent = error instanceof Error ? error.message : 'Could not load MR commits.';
-      } finally {
-        button.disabled = false;
-      }
-    });
   }
   const reviewDialog = document.getElementById('manual-review-dialog');
   const reviewForm = document.getElementById('manual-review-form');
@@ -385,6 +364,9 @@ def normalize_gitlab_commits(
                 "id": commit_id,
                 "short_id": short_id,
                 "title": str(commit.get("title") or "Untitled commit").strip()[:1000],
+                "message": str(
+                    commit.get("message") or commit.get("title") or "Untitled commit"
+                ).strip()[:4000],
                 "author_name": str(
                     commit.get("author_name") or commit.get("committer_name") or ""
                 ).strip()[:300],
@@ -678,24 +660,18 @@ def manual_review_dialog(csrf_token: str) -> str:
     </dialog>"""
 
 
-def commit_history_panel(
+def inline_commit_summary(
     project_id: int,
     mr_iid: int,
     head_sha: str,
-    target_id: str,
 ) -> str:
     query = urllib.parse.urlencode(
         {"project_id": project_id, "mr_iid": mr_iid, "sha": head_sha}
     )
     return (
-        "<section class='review-section'><div class='section-heading'>"
-        "<div><h3>MR commits</h3><p class='sub'>Commit message, author, date, and GitLab link for this reviewed revision.</p></div>"
-        f"<button class='commit-history-button secondary' type='button' "
-        f"data-target-id='{html.escape(target_id)}' "
-        f"data-commits-url='/mr-commits?{html.escape(query)}'>View commits</button>"
-        "</div>"
-        f"<div class='commit-history' id='{html.escape(target_id)}' "
-        "data-loaded='false' hidden></div></section>"
+        "<div class='inline-commit-summary' data-lazy-commits "
+        f"data-commits-url='/mr-commits?{html.escape(query)}' "
+        "data-loaded='false'>Commit messages and authors load when this row is expanded.</div>"
     )
 
 
@@ -1686,7 +1662,7 @@ class WebStore:
 STYLE = """
 :root{color-scheme:light;--ink:#172033;--muted:#667085;--line:#e3e8ef;--blue:#2563eb;--blue-dark:#1746a2;--blue-soft:#edf4ff;--bg:#f5f7fb;--card:#fff;--sidebar:#111827;--sidebar-muted:#a8b3c5;--red:#b42318;--red-soft:#fff1f0;--green:#16803c;--green-soft:#ebf8ef;--amber:#9a6700;--amber-soft:#fff7df;--shadow:0 12px 32px rgba(17,24,39,.06)}
 *{box-sizing:border-box}html{min-height:100%}body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45}a{color:var(--blue);text-underline-offset:2px}.public-main{max-width:1120px;margin:0 auto;padding:38px 24px 72px}.app-shell{display:grid;grid-template-columns:252px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;background:var(--sidebar);color:#fff;padding:24px 16px 18px;display:flex;flex-direction:column}.brand{display:flex;align-items:center;gap:12px;color:#fff;text-decoration:none;padding:0 10px 24px;border-bottom:1px solid rgba(255,255,255,.1)}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:linear-gradient(145deg,#3b82f6,#1d4ed8);font-size:13px;font-weight:850;letter-spacing:.04em;box-shadow:0 8px 18px rgba(37,99,235,.3)}.brand strong{display:block;font-size:15px}.brand small{display:block;color:var(--sidebar-muted);font-size:11px;margin-top:1px}.side-nav{display:grid;gap:6px;padding:22px 0}.side-nav a{display:flex;align-items:center;gap:12px;padding:11px 12px;border-radius:9px;color:var(--sidebar-muted);font-weight:650;text-decoration:none}.side-nav a:hover{background:rgba(255,255,255,.07);color:#fff}.side-nav a[aria-current=page]{background:#243c66;color:#fff;box-shadow:inset 3px 0 #60a5fa}.nav-icon{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:rgba(255,255,255,.08);font-size:11px;font-weight:800}.sidebar-footer{margin-top:auto;border-top:1px solid rgba(255,255,255,.1);padding:18px 10px 0}.service-state{display:flex;align-items:flex-start;gap:9px;color:var(--sidebar-muted);font-size:12px;line-height:1.35;margin-bottom:17px}.service-dot{width:9px;height:9px;margin-top:3px;border-radius:50%;background:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.14);flex:0 0 auto}.service-dot.completed{background:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.14)}.service-dot.failed{background:#f87171;box-shadow:0 0 0 3px rgba(248,113,113,.14)}.user-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}.user-avatar{display:grid;place-items:center;width:32px;height:32px;border-radius:50%;background:#334155;color:#fff;font-size:12px;font-weight:800}.user-row span{font-size:13px;overflow:hidden;text-overflow:ellipsis}.signout{width:100%;background:transparent;border:1px solid rgba(255,255,255,.16);color:#d9e1ec;padding:9px 12px}.signout:hover{background:rgba(255,255,255,.07)}.app-main{min-width:0;padding:34px clamp(24px,4vw,56px) 72px}.content{width:100%;max-width:1440px;margin:0 auto}.page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:28px}.eyebrow{color:var(--blue);font-size:12px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;margin:0 0 7px}.page-header h1{font-size:32px;line-height:1.15;margin:0;letter-spacing:-.025em}.page-header .sub{max-width:720px}.connection-status{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:14px;margin:9px 0 0}.connection-dot{width:9px;height:9px;border-radius:50%;background:var(--red);box-shadow:0 0 0 3px rgba(180,35,24,.1);flex:0 0 auto}.connection-dot.up{background:var(--green);box-shadow:0 0 0 3px rgba(22,128,60,.12)}.header-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}h1{font-size:31px;margin:0}h2{font-size:20px;margin:0 0 8px;letter-spacing:-.01em}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:20px}.sub{color:var(--muted);margin:6px 0 0}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:var(--shadow);margin-bottom:22px}.danger-zone{border-color:#f2b8b3}.auth{max-width:480px;margin:8vh auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}.metric{position:relative;padding:19px 20px;border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,#fff,#fbfcfe);color:var(--muted);font-size:13px;font-weight:650}.metric strong{display:block;color:var(--ink);font-size:29px;line-height:1.2;margin-top:7px;letter-spacing:-.03em}.metric.critical{border-color:#f2b8b3;background:linear-gradient(180deg,#fff,var(--red-soft))}.metric.success{border-color:#b9dfc4;background:linear-gradient(180deg,#fff,var(--green-soft))}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label,.date-filter label{display:block;font-weight:700;margin-bottom:7px}.field small{display:block;color:var(--muted);line-height:1.35;margin-top:6px}.field input,.field select,.date-filter input{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.field input:focus,.field select:focus,.date-filter input:focus,button:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid #bed4ff;outline-offset:2px;border-color:var(--blue)}[hidden]{display:none!important}button,.button{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:10px 15px;cursor:pointer;text-decoration:none;font:inherit}.button:hover,button:hover{filter:brightness(.97)}.secondary{background:var(--blue-soft);color:var(--blue-dark)}.danger{background:var(--red)}.actions{display:flex;gap:10px;align-items:center;margin-top:22px;flex-wrap:wrap}.inline-control{display:flex;gap:8px;align-items:center}.inline-control input{min-width:0;flex:1}.inline-control button{white-space:nowrap}.model-picker{margin-top:8px}.model-status{min-height:18px}.filter-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:20px;padding:16px;background:#f8fafc;border:1px solid var(--line);border-radius:12px}.filter-bar .actions{margin-top:0}.date-filter{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:8px;align-items:end}.pagination{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:18px}.pagination .actions{margin-top:0}.page-selector{display:flex;align-items:center;gap:8px}.page-selector label{font-weight:700}.page-selector select{padding:10px;border:1px solid #aebdce;border-radius:9px;background:#fff;font:inherit}.notice,.error{padding:13px 15px;border-radius:10px;margin-bottom:18px;border:1px solid transparent}.notice{background:var(--green-soft);border-color:#c9e8d2;color:#116329}.error{background:var(--red-soft);border-color:#f5c7c3;color:var(--red)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:13px 11px;border-bottom:1px solid var(--line);vertical-align:top}tbody tr:hover{background:#f8faff}tbody tr:last-child td{border-bottom:0}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.065em;white-space:nowrap}.status{font-weight:750}.high_severity,.failed,.down{color:var(--red)}.completed,.up{color:var(--green)}.pending,.unknown{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:20px;border-radius:12px;line-height:1.5}.severity{display:inline-block;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:850;letter-spacing:.035em}.severity-critical,.severity-high{background:var(--red-soft);color:var(--red)}.severity-medium{background:var(--amber-soft);color:var(--amber)}.severity-low{background:var(--blue-soft);color:#31506f}details summary{cursor:pointer;color:var(--blue);font-weight:700}.finding-details{margin:10px 0 0;min-width:320px;max-width:620px;background:#f5f8fc;color:var(--ink);border:1px solid var(--line);padding:14px;font-size:13px}.empty-state{text-align:center;color:var(--muted);padding:34px!important}.table-wrap{overflow:auto}.muted-link{color:var(--muted)}
-.severity-safe{background:var(--green-soft);color:var(--green)}.severity-filter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}.severity-filter .button{padding:8px 12px}.expandable-row{cursor:pointer}.expandable-row:focus{outline:3px solid #bed4ff;outline-offset:-3px}.row-toggle,.manual-review-button{padding:7px 10px;font-size:13px;white-space:nowrap}.review-state{font-weight:800}.review-state-open{color:var(--blue-dark)}.review-state-in_progress{color:var(--amber)}.review-state-done{color:var(--green)}.expanded-review td{padding:0 11px 18px;background:#f8fafc}.review-details{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px}.review-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}.review-section{border:1px solid var(--line);border-radius:10px;padding:16px}.review-section+.review-section{margin-top:16px}.review-section h3{font-size:14px;margin:0 0 8px}.review-copy{white-space:pre-wrap;margin:0;color:var(--ink)}.diff-view{max-height:520px;overflow:auto;margin:8px 0 0;padding:8px 0;background:#fff;color:#344054;border:1px solid #d0d5dd;border-radius:10px;font-size:12px;line-height:1.55;white-space:pre}.diff-view code{display:block;min-width:max-content}.diff-line{display:block;padding:0 14px;min-height:1.55em}.diff-context{color:#344054}.diff-add{color:#067647;background:#ecfdf3}.diff-delete{color:#b42318;background:#fff1f0}.diff-hunk{color:#175cd3;background:#eff8ff}.diff-meta{color:#6941c6;background:#f9f5ff;font-weight:650}.historical-note{color:var(--muted);font-style:italic}.review-meta{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-top:14px}.commit-history{margin-top:12px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:#fff}.commit-table{margin:0}.commit-table th,.commit-table td{padding:10px}.commit-table td:first-child{white-space:nowrap}.commit-title{min-width:260px;max-width:600px}.manual-review-dialog{width:min(620px,calc(100vw - 32px));border:0;border-radius:16px;padding:24px;box-shadow:0 24px 80px rgba(17,24,39,.28)}.manual-review-dialog::backdrop{background:rgba(15,23,42,.55)}.dialog-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:20px}.dialog-heading h2{margin:0}.manual-review-dialog fieldset{display:flex;gap:18px;border:1px solid var(--line);border-radius:10px;margin:18px 0;padding:14px}.manual-review-dialog legend{font-weight:750;padding:0 6px}.manual-review-dialog textarea{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;font:inherit;resize:vertical}.manual-decision{margin-top:12px;padding:12px;border-radius:9px;background:#f8fafc;border:1px solid var(--line)}
+.severity-safe{background:var(--green-soft);color:var(--green)}.severity-filter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}.severity-filter .button{padding:8px 12px}.expandable-row{cursor:pointer}.expandable-row:focus{outline:3px solid #bed4ff;outline-offset:-3px}.row-toggle,.manual-review-button{padding:7px 10px;font-size:13px;white-space:nowrap}.review-state{font-weight:800}.review-state-open{color:var(--blue-dark)}.review-state-in_progress{color:var(--amber)}.review-state-done{color:var(--green)}.expanded-review td{padding:0 11px 18px;background:#f8fafc}.review-details{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px}.review-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}.review-section{border:1px solid var(--line);border-radius:10px;padding:16px}.review-section+.review-section{margin-top:16px}.review-section h3{font-size:14px;margin:0 0 8px}.review-copy{white-space:pre-wrap;margin:0;color:var(--ink)}.diff-view{max-height:520px;overflow:auto;margin:8px 0 0;padding:8px 0;background:#fff;color:#344054;border:1px solid #d0d5dd;border-radius:10px;font-size:12px;line-height:1.55;white-space:pre}.diff-view code{display:block;min-width:max-content}.diff-line{display:block;padding:0 14px;min-height:1.55em}.diff-context{color:#344054}.diff-add{color:#067647;background:#ecfdf3}.diff-delete{color:#b42318;background:#fff1f0}.diff-hunk{color:#175cd3;background:#eff8ff}.diff-meta{color:#6941c6;background:#f9f5ff;font-weight:650}.historical-note{color:var(--muted);font-style:italic}.review-meta{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-top:14px}.inline-commit-summary{margin:0 0 12px;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:#f8fafc;color:var(--muted)}.commit-summary-list{display:grid;gap:8px}.commit-summary-item{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}.commit-message{font-weight:750;color:var(--blue-dark);white-space:pre-wrap}.commit-author{font-size:13px;color:var(--muted)}.manual-review-dialog{width:min(620px,calc(100vw - 32px));border:0;border-radius:16px;padding:24px;box-shadow:0 24px 80px rgba(17,24,39,.28)}.manual-review-dialog::backdrop{background:rgba(15,23,42,.55)}.dialog-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:20px}.dialog-heading h2{margin:0}.manual-review-dialog fieldset{display:flex;gap:18px;border:1px solid var(--line);border-radius:10px;margin:18px 0;padding:14px}.manual-review-dialog legend{font-weight:750;padding:0 6px}.manual-review-dialog textarea{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;font:inherit;resize:vertical}.manual-decision{margin-top:12px;padding:12px;border-radius:9px;background:#f8fafc;border:1px solid var(--line)}
 .grid+.table-wrap{margin-top:22px}
 @media(max-width:900px){.app-shell{grid-template-columns:1fr}.sidebar{position:relative;height:auto;padding:14px 18px}.brand{padding:0 4px 14px}.side-nav{display:flex;overflow:auto;padding:12px 0 0}.side-nav a{white-space:nowrap}.sidebar-footer{display:flex;align-items:center;gap:14px;margin:12px 0 0;padding:12px 4px 0}.service-state{margin:0;margin-right:auto}.user-row{margin:0}.signout{width:auto}.app-main{padding:26px 20px 56px}.page-header{margin-bottom:22px}}
 @media(max-width:680px){.grid,.form-grid,.review-detail-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination,.page-header,.section-heading{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}.page-header h1{font-size:28px}.app-main{padding:22px 14px 48px}.card{padding:18px}.sidebar-footer{align-items:stretch;flex-wrap:wrap}.service-state{width:100%}.table-wrap{overflow:auto}}
@@ -2647,12 +2623,10 @@ def handler_factory(
                 )
                 evidence_heading = "Review result" if severity == "SAFE" else "Finding evidence"
                 reviewed_at = str(entry["reviewed_at"])[:19].replace("T", " ") + " UTC"
-                commit_target_id = f"completed-commits-{index}"
-                commits_panel = commit_history_panel(
+                commit_summary = inline_commit_summary(
                     int(entry["project_id"]),
                     int(entry["mr_iid"]),
                     str(entry["head_sha"]),
-                    commit_target_id,
                 )
                 project_url = str(entry["project_web_url"])
                 parsed_project_url = urllib.parse.urlparse(project_url)
@@ -2703,7 +2677,7 @@ def handler_factory(
                     f"<section class='review-section'><h3>Review summary</h3><p class='review-copy'>{html.escape(str(entry['summary']))}</p></section>"
                     f"<section class='review-section'><h3>Severity explanation</h3><p class='review-copy'>{html.escape(str(entry['severity_explanation']))}</p></section>"
                     f"</div><section class='review-section'><h3>{evidence_heading}</h3><p class='review-copy'>{html.escape(str(entry['finding_details']))}</p></section>{decision_details}"
-                    f"<section class='review-section'><h3>Reviewed code diff</h3>{diff_display}</section>{commits_panel}"
+                    f"<section class='review-section'><h3>Reviewed code diff</h3>{commit_summary}{diff_display}</section>"
                     f"<div class='review-meta'><span class='sub'>Reviewed {html.escape(reviewed_at)} · Commit {commit_display}</span>"
                     f"<a class='button secondary' href='/report?{report_query}'>Open full report</a></div>"
                     "</div></td></tr>"
@@ -3266,11 +3240,10 @@ def handler_factory(
                     if commit_url
                     else f"<code>{html.escape(str(row['head_sha'])[:12])}</code>"
                 )
-                commits_panel = commit_history_panel(
+                commit_summary = inline_commit_summary(
                     int(row["project_id"]),
                     int(row["mr_iid"]),
                     str(row["head_sha"]),
-                    f"repository-commits-{index}",
                 )
                 mr_decision = manual_reviews.get(
                     (
@@ -3305,8 +3278,8 @@ def handler_factory(
                     f"<td>{action}</td></tr>"
                     f"<tr class='expanded-review' id='{detail_id}' hidden><td colspan='7'>"
                     "<div class='review-details'><section class='review-section'>"
-                    f"<h3>MR !{int(row['mr_iid'])} reviewed code diff</h3>{diff_display}"
-                    f"</section>{commits_panel}<div class='review-meta'>{gitlab_link}</div></div></td></tr>"
+                    f"<h3>MR !{int(row['mr_iid'])} reviewed code diff</h3>{commit_summary}{diff_display}"
+                    f"</section><div class='review-meta'>{gitlab_link}</div></div></td></tr>"
                 )
             table_rows = "".join(rows) or (
                 "<tr><td class='empty-state' colspan='7'>No MRs match this date range and manual-review status.</td></tr>"
