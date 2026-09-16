@@ -52,6 +52,7 @@ from security_review.web import (  # noqa: E402
     completed_review_entries,
     decrypt_credentials,
     encrypt_credentials,
+    normalize_gitlab_commits,
     paginate_repositories,
     parse_security_findings,
     password_record,
@@ -102,6 +103,21 @@ def archive_with(files):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_gitlab_client_fetches_paginated_mr_commits_with_a_safety_limit(self):
+        client = GitLabClient("https://gitlab.example.com", "test-token")
+        with patch.object(
+            client,
+            "get_all",
+            return_value=[{"id": "abcdef1234567", "title": "Secure input handling"}],
+        ) as get_all:
+            commits = client.get_merge_request_commits("company/app", 27)
+
+        self.assertEqual(commits[0]["title"], "Secure input handling")
+        get_all.assert_called_once_with(
+            "projects/company%2Fapp/merge_requests/27/commits",
+            max_results=1_000,
+        )
+
     def test_security_skill_loads_only_approved_bounded_references(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -580,6 +596,31 @@ class CycleLimitTests(unittest.TestCase):
 
 
 class DiscoveryInventoryTests(unittest.TestCase):
+    def test_commit_normalization_rejects_invalid_ids_and_external_links(self):
+        commits = normalize_gitlab_commits(
+            [
+                {
+                    "id": "abcdef1234567890",
+                    "short_id": "abcdef12",
+                    "title": "Validate authorization",
+                    "author_name": "Security Engineer",
+                    "committed_date": "2026-09-16T08:00:00Z",
+                    "web_url": "https://gitlab.example.com/company/app/-/commit/abcdef1234567890",
+                },
+                {
+                    "id": "1234567abcdef",
+                    "title": "Untrusted link",
+                    "web_url": "https://attacker.example/commit/1234567abcdef",
+                },
+                {"id": "not-a-sha", "title": "Invalid"},
+            ],
+            "https://gitlab.example.com",
+        )
+
+        self.assertEqual(len(commits), 2)
+        self.assertEqual(commits[0]["short_id"], "abcdef12")
+        self.assertIn("gitlab.example.com", commits[0]["web_url"])
+        self.assertEqual(commits[1]["web_url"], "")
     class FakeGitLabClient:
         def list_projects(self):
             return [
@@ -1207,6 +1248,38 @@ class WebAuthenticationTests(unittest.TestCase):
                         )
                     ) as response:
                         fetched_diff = json.loads(response.read().decode("utf-8"))
+                with (
+                    patch.object(
+                        GitLabClient,
+                        "get_merge_request",
+                        return_value={"sha": "high-sha"},
+                    ),
+                    patch.object(
+                        GitLabClient,
+                        "get_merge_request_commits",
+                        return_value=[
+                            {
+                                "id": "abcdef1234567890",
+                                "short_id": "abcdef12",
+                                "title": "Validate shell input",
+                                "author_name": "Security Engineer",
+                                "committed_date": "2026-09-16T08:00:00Z",
+                                "web_url": (
+                                    "https://gitlab.example.com/company/app/"
+                                    "-/commit/abcdef1234567890"
+                                ),
+                            }
+                        ],
+                    ),
+                ):
+                    with urllib.request.urlopen(
+                        urllib.request.Request(
+                            base_url
+                            + "/mr-commits?project_id=1&mr_iid=7&sha=high-sha",
+                            headers=headers,
+                        )
+                    ) as response:
+                        mr_commits = json.loads(response.read().decode("utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1242,6 +1315,7 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("The query uses bound parameters", completed)
             self.assertIn("class='expandable-row'", completed)
             self.assertIn("href='/completed' aria-current='page'", completed)
+            self.assertIn("data-commits-url='/mr-commits?", completed)
             expected_columns = (
                 "<th>Severity</th><th>Finding title</th><th>MR</th>"
                 "<th>Vulnerability details</th>"
@@ -1269,10 +1343,14 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("data-lazy-diff", repository_mrs)
             self.assertIn("<th>Manual review</th>", repository_mrs)
             self.assertIn("All statuses", repository_mrs)
+            self.assertIn("MR commits", repository_mrs)
+            self.assertIn("View commits", repository_mrs)
             self.assertEqual(stored_diff["source"], "stored")
             self.assertIn("run_shell(user_input)", stored_diff["diff"])
             self.assertEqual(fetched_diff["source"], "gitlab")
             self.assertIn("pending_change = True", fetched_diff["diff"])
+            self.assertEqual(mr_commits["commits"][0]["title"], "Validate shell input")
+            self.assertEqual(mr_commits["commits"][0]["short_id"], "abcdef12")
             cached_pending = store.mr_revision(1, 10, "pending-sha")
             self.assertIsNotNone(cached_pending)
             self.assertIn("pending_change = True", cached_pending["diff_content"])

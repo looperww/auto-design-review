@@ -345,11 +345,18 @@ Click a non-zero MR count to open that repository's filtered MR list and its
 available security reports. The repository-specific MR page has the same Day,
 Week, Month, and inclusive UTC date-range filters as the repository inventory.
 Each MR row is selectable and expands into a bounded code-diff panel for manual
-inspection. A completed review uses its retained diff immediately. If a queued
+inspection. The latest commit SHA links directly to that commit in GitLab. A
+**View commits** control lazily loads the MR's complete commit list, including
+commit SHA, title, author, committed date, and a GitLab link. No additional API
+request is made until the control is selected. A completed review uses its
+retained diff immediately. If a queued
 or historical row has no retained diff, expanding it fetches the exact current
 MR revision from GitLab on demand and caches it in SQLite. The service refuses
-to display a mismatched revision if GitLab has received a newer commit; the next
-discovery cycle must record that revision first. Diff panels use a light
+to display a mismatched diff or commit history if GitLab has received a newer
+commit; the next discovery cycle must record that revision first. Commit data
+comes from GitLab's read-only
+[Retrieve merge request commits](https://docs.gitlab.com/api/merge_requests/#retrieve-merge-request-commits)
+endpoint and is normalized before it is returned to the browser. Diff panels use a light
 code-review theme: additions are green, deletions are red, hunk markers are
 blue, and file metadata is purple for easier manual inspection.
 
@@ -362,7 +369,8 @@ The Completed MRs table adds **Manual review** to the common **Severity**,
 **Finding title**, **MR**, and **Vulnerability details** columns. It includes
 Critical, High, Medium, Low, and SAFE results, supports severity and
 human-review-status filters, and displays 20 rows per page. Clicking a result
-row expands a full-width evidence panel. SAFE means either the evidence-bounded
+row expands a full-width evidence panel with the reviewed diff and the same
+lazy-loaded MR commit history. SAFE means either the evidence-bounded
 review established no high-confidence vulnerability or an administrator
 verified the AI result as a false positive; the retained resolution explains
 which applies. Neither case guarantees that the repository is
