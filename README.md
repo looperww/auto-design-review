@@ -246,9 +246,9 @@ The authenticated console uses a responsive sidebar with four primary pages:
   Critical and High security-finding queue. A compact green/red indicator
   beneath the page title shows the latest GitLab connection status.
 - **Completed MRs** lists the latest completed review for every MR, including
-  SAFE reviews with no findings. Results can be filtered by severity, and each
-  row expands to show the reviewed diff, review summary, severity rationale,
-  and finding evidence.
+  SAFE reviews with no findings. Results can be filtered by severity and human
+  review status, and each row expands to show the reviewed diff, review summary,
+  severity rationale, finding evidence, and recorded human decision.
 - **Repositories** provides a focused inventory of repository coverage,
   per-repository access status, MR activity, finding totals, date filters, and
   pagination. Overall GitLab health remains in the compact Dashboard header.
@@ -258,9 +258,27 @@ The authenticated console uses a responsive sidebar with four primary pages:
 The sidebar also shows the current reviewer state and signed-in administrator.
 Stored secrets are never displayed again.
 
+Every finding row on the Dashboard and Completed MRs page, and every MR row on
+the repository-specific MR page, has a human-review control. Its default state
+is **Open**. An administrator can change it to **In Progress** or **Done**. A
+Done decision requires the administrator to choose **False positive** or
+**Confirmed finding**, select a severity for a confirmed finding, and record
+comments explaining the verification decision. These decisions are stored in
+SQLite against the exact MR commit and finding, together with the administrator
+and update time.
+
+A finding resolved as a false positive is removed from the Dashboard queue and
+repository finding totals. It remains in Completed MRs with a **SAFE** label,
+the original AI evidence, and the human comments, preserving the audit trail.
+An MR-level decision made from the repository MR page applies to the entire MR
+revision; a finding-level decision takes precedence for that individual
+finding. New MR commits start with a fresh Open status. Completed MRs and
+repository MR lists can both be filtered by Open, In Progress, or Done.
+
 The Settings page also provides a protected **Reset repository and MR data**
 action. The administrator must type `RESET` exactly before it runs. The reset
-deletes the repository inventory, every MR revision, report, and parsed finding,
+deletes the repository inventory, every MR revision, report, parsed finding,
+and associated human-review decision,
 clears the previous GitLab scan status, and records the reset time as a new
 deployment cutoff. Administrator accounts, active login sessions, encrypted
 GitLab and LLM credentials, and runtime settings remain unchanged. The reviewer
@@ -335,15 +353,19 @@ discovery cycle must record that revision first. Diff panels use a light
 code-review theme: additions are green, deletions are red, hunk markers are
 blue, and file metadata is purple for easier manual inspection.
 
-The Dashboard **High-severity findings** section lists only Critical and High
-findings for the active period. Each row shows the finding title, a direct link
-to the corresponding GitLab MR, and an expandable vulnerability details panel.
+The Dashboard **High-severity findings** section lists only unresolved or
+confirmed Critical and High findings for the active period. Each row shows the
+finding title, a direct link to the corresponding GitLab MR, an expandable
+vulnerability details panel, and the human-review status control.
 
-The Completed MRs table uses the same **Severity**, **Finding title**, **MR**,
-and **Vulnerability details** columns. It includes Critical, High, Medium, Low,
-and SAFE results and displays 20 rows per page. Clicking a result row expands a
-full-width evidence panel. SAFE means the evidence-bounded review established
-no high-confidence vulnerability; it is not a guarantee that the repository is
+The Completed MRs table adds **Manual review** to the common **Severity**,
+**Finding title**, **MR**, and **Vulnerability details** columns. It includes
+Critical, High, Medium, Low, and SAFE results, supports severity and
+human-review-status filters, and displays 20 rows per page. Clicking a result
+row expands a full-width evidence panel. SAFE means either the evidence-bounded
+review established no high-confidence vulnerability or an administrator
+verified the AI result as a false positive; the retained resolution explains
+which applies. Neither case guarantees that the repository is
 vulnerability-free.
 
 On both Dashboard and Repositories, Day, Week, and Month select rolling windows
