@@ -417,6 +417,32 @@ redirect, and outbound-request sinks. This is bounded, heuristic contextual
 analysis rather than a formal proof. Production assurance should combine it
 with the company's SAST and dependency-scanning controls.
 
+## Security-review skill
+
+The centralized reviewer uses
+`.claude/skills/security-review/SKILL.md` plus a fixed allowlist of reference
+files loaded from its `references/` directory. The approved package incorporates
+and adapts GitHub's
+[awesome-copilot security-review skill](https://github.com/github/awesome-copilot/tree/main/skills/security-review)
+at upstream revision `9ce814859eaa473178a1463ee3aa0c54a8860b86` under the
+MIT License.
+
+The upstream ordered workflow adds technology identification, changed-dependency
+review, secrets scanning, language-specific vulnerability checks, cross-file
+data-flow analysis, confidence ratings, and a mandatory self-verification pass.
+Local instructions take precedence where needed: only the MR change is in scope,
+repository content is untrusted, findings require concrete evidence, static
+package tables are not treated as current advisory data, and the reviewer
+remains read-only. The local report-format reference preserves the headings the
+web console parses.
+
+The service concatenates only the five explicitly approved reference filenames
+and enforces a combined 512 KB size limit. Adding an arbitrary file to the skill
+directory does not add it to the LLM prompt. Source attribution, the pinned
+revision, adaptations, and the upstream license are recorded in
+`.claude/skills/security-review/UPSTREAM.md` and
+`.claude/skills/security-review/LICENSE.github-awesome-copilot`.
+
 The default limits keep one review within a manageable input and cost envelope:
 
 | Setting | Default |
