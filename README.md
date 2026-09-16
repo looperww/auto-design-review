@@ -331,7 +331,9 @@ inspection. A completed review uses its retained diff immediately. If a queued
 or historical row has no retained diff, expanding it fetches the exact current
 MR revision from GitLab on demand and caches it in SQLite. The service refuses
 to display a mismatched revision if GitLab has received a newer commit; the next
-discovery cycle must record that revision first.
+discovery cycle must record that revision first. Diff panels use a light
+code-review theme: additions are green, deletions are red, hunk markers are
+blue, and file metadata is purple for easier manual inspection.
 
 The Dashboard **High-severity findings** section lists only Critical and High
 findings for the active period. Each row shows the finding title, a direct link
