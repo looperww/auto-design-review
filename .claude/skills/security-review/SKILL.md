@@ -10,10 +10,13 @@ purpose is to identify material security risks early without blocking normal
 development.
 
 This workflow incorporates the detection and self-verification method from
-GitHub's `awesome-copilot` security-review skill. The company-specific scope,
-evidence threshold, report format, and non-negotiable boundaries in this file
-override any conflicting upstream guidance. The application appends the
-approved files under `references/` to these instructions automatically.
+GitHub's `awesome-copilot` security-review skill and the high-confidence,
+context-aware review method from Sentry's security-review skill. The
+company-specific scope, evidence threshold, report format, and non-negotiable
+boundaries in this file override any conflicting upstream guidance. The
+application appends approved core references automatically and loads the
+approved Sentry Python, JavaScript, and Docker guidance only when the changed
+file paths make it relevant.
 
 ## Ordered review workflow
 
@@ -93,6 +96,14 @@ Examine relevant changes for newly introduced weaknesses involving:
 Report a finding only when the changed code provides concrete evidence of the
 issue. Do not report speculative concerns, code-style suggestions, generic best
 practices, or missing tests as security findings.
+
+Classify every alleged source before reporting it. Request parameters, headers,
+uploaded content, externally supplied messages, and attacker-influenced stored
+data may be attacker controlled. Environment variables, deployment settings,
+and trusted server configuration are not attacker controlled unless the
+supplied context establishes a credible way for an attacker to modify them.
+Authentication is an attack precondition that may reduce severity; it does not
+automatically make a real authorization, injection, or data-exposure flaw safe.
 
 For every finding, include a confidence rating of `High`, `Medium`, or `Low`.
 Confidence measures the strength of the evidence, not the business impact.

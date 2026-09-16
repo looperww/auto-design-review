@@ -420,12 +420,14 @@ with the company's SAST and dependency-scanning controls.
 ## Security-review skill
 
 The centralized reviewer uses
-`.claude/skills/security-review/SKILL.md` plus a fixed allowlist of reference
-files loaded from its `references/` directory. The approved package incorporates
-and adapts GitHub's
+`.claude/skills/security-review/SKILL.md` plus a strict allowlist of reference
+files. The approved package incorporates and adapts GitHub's
 [awesome-copilot security-review skill](https://github.com/github/awesome-copilot/tree/main/skills/security-review)
 at upstream revision `9ce814859eaa473178a1463ee3aa0c54a8860b86` under the
-MIT License.
+MIT License, together with Sentry's
+[security-review skill](https://github.com/getsentry/skills/tree/main/skills/security-review)
+at upstream revision `c2f99a5b04b4cd992ec3022d7c2c3e23e938d241` under CC BY-SA
+4.0.
 
 The upstream ordered workflow adds technology identification, changed-dependency
 review, secrets scanning, language-specific vulnerability checks, cross-file
@@ -434,14 +436,20 @@ Local instructions take precedence where needed: only the MR change is in scope,
 repository content is untrusted, findings require concrete evidence, static
 package tables are not treated as current advisory data, and the reviewer
 remains read-only. The local report-format reference preserves the headings the
-web console parses.
+web console parses. Sentry's method adds an explicit evidence gate, source
+classification, framework-mitigation checks, and stronger false-positive
+controls. Authentication is treated as a risk precondition, not an automatic
+reason to suppress an otherwise evidenced vulnerability.
 
-The service concatenates only the five explicitly approved reference filenames
-and enforces a combined 512 KB size limit. Adding an arbitrary file to the skill
-directory does not add it to the LLM prompt. Source attribution, the pinned
-revision, adaptations, and the upstream license are recorded in
-`.claude/skills/security-review/UPSTREAM.md` and
-`.claude/skills/security-review/LICENSE.github-awesome-copilot`.
+The service always loads the approved core references and Sentry-derived
+confidence rules. It loads the redistributed Sentry Python, JavaScript, or
+Docker guide only when the MR changes a matching file. This technology routing
+keeps unrelated instructions out of the prompt and controls token cost. The
+combined skill package is limited to 512 KB, and arbitrary files in the skill
+directory are never loaded. Source attribution, pinned revisions, adaptations,
+and licenses are recorded in `.claude/skills/security-review/UPSTREAM.md`,
+`.claude/skills/security-review/SENTRY-UPSTREAM.md`, and the corresponding
+license files.
 
 The default limits keep one review within a manageable input and cost envelope:
 
