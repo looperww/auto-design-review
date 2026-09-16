@@ -20,7 +20,7 @@ GitLab projects visible to the token
               ▼
      portable reviewer container
               │
-              ├── MR metadata and diff
+              ├── MR metadata, bounded commit timeline, and diff
               ├── exact read-only repository snapshot at the MR head SHA
               ├── bounded source/sanitizer/sink context selection
               └── centrally managed security-review skill
@@ -439,7 +439,9 @@ exact source commit and selects:
 - related files sharing changed identifiers, functions, classes, and paths;
 - security-relevant files involving authentication, authorization, routes, and
   permissions;
-- the complete MR diff and MR description.
+- the complete MR diff and MR description; and
+- up to 100 MR commit records, bounded to 32 KB, as untrusted historical
+  context for regression analysis.
 
 The selected LLM is instructed to trace attacker-controlled input through transformations
 and sanitizers to SQL, command, filesystem, template, deserialization, logging,
@@ -457,6 +459,9 @@ at upstream revision `9ce814859eaa473178a1463ee3aa0c54a8860b86` under the
 MIT License, together with Sentry's
 [security-review skill](https://github.com/getsentry/skills/tree/main/skills/security-review)
 at upstream revision `c2f99a5b04b4cd992ec3022d7c2c3e23e938d241` under CC BY-SA
+4.0, and Trail of Bits'
+[differential-review skill](https://github.com/trailofbits/skills/tree/main/plugins/differential-review/skills/differential-review)
+at upstream revision `a6d1b234198d95082523645d2fea8745ca7273bd` under CC BY-SA
 4.0.
 
 The upstream ordered workflow adds technology identification, changed-dependency
@@ -469,7 +474,13 @@ remains read-only. The local report-format reference preserves the headings the
 web console parses. Sentry's method adds an explicit evidence gate, source
 classification, framework-mitigation checks, and stronger false-positive
 controls. Authentication is treated as a risk precondition, not an automatic
-reason to suppress an otherwise evidenced vulnerability.
+reason to suppress an otherwise evidenced vulnerability. The Trail of Bits
+adaptation adds risk-first before/after analysis, regression cues from the MR
+commit timeline, observable blast-radius reasoning, test-gap review, adversarial
+verification, and explicit coverage limits. Commit messages are untrusted and
+corroborative only; missing tests are a limitation rather than a vulnerability,
+and the model may not claim `git blame`, repository-wide caller counts, test
+execution, or coverage measurements that the service did not supply.
 
 The service always loads the approved core references and Sentry-derived
 confidence rules. It loads the redistributed Sentry Python, JavaScript, or
@@ -480,6 +491,10 @@ directory are never loaded. Source attribution, pinned revisions, adaptations,
 and licenses are recorded in `.claude/skills/security-review/UPSTREAM.md`,
 `.claude/skills/security-review/SENTRY-UPSTREAM.md`, and the corresponding
 license files.
+
+Trail of Bits attribution and adaptation details are recorded in
+`.claude/skills/security-review/TRAILOFBITS-UPSTREAM.md` and
+`.claude/skills/security-review/LICENSE.trailofbits-differential-review`.
 
 The default limits keep one review within a manageable input and cost envelope:
 
@@ -493,6 +508,7 @@ The default limits keep one review within a manageable input and cost envelope:
 | Context files | 20 |
 | Individual context file | 100 KB |
 | Total selected context | 350 KB |
+| MR commit context | 100 commits and 32 KB |
 | Anthropic budget per review | USD 5.00 |
 
 Oversized, collapsed, or incomplete changes produce a manual-review-required
