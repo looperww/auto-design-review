@@ -629,7 +629,12 @@ class GitLabClient:
         except json.JSONDecodeError as exc:
             raise ReviewError("GitLab returned invalid JSON.") from exc
 
-    def get_all(self, path: str, query: dict[str, Any] | None = None) -> list[Any]:
+    def get_all(
+        self,
+        path: str,
+        query: dict[str, Any] | None = None,
+        max_results: int = 100_000,
+    ) -> list[Any]:
         page = 1
         results: list[Any] = []
         while page:
@@ -644,7 +649,7 @@ class GitLabClient:
             if not isinstance(body, list):
                 raise ReviewError("GitLab returned an unexpected paginated response.")
             results.extend(body)
-            if len(results) > 100_000:
+            if len(results) > max_results:
                 raise ReviewError("GitLab pagination exceeded the safety limit.")
             try:
                 page = int(next_page) if next_page else 0
@@ -699,6 +704,16 @@ class GitLabClient:
         result = self.get_all(
             f"projects/{project}/merge_requests/{mr_iid}/diffs",
             {"unidiff": "true"},
+        )
+        return [item for item in result if isinstance(item, dict)]
+
+    def get_merge_request_commits(
+        self, project_path: str, mr_iid: int
+    ) -> list[dict[str, Any]]:
+        project = api_project(project_path)
+        result = self.get_all(
+            f"projects/{project}/merge_requests/{mr_iid}/commits",
+            max_results=1_000,
         )
         return [item for item in result if isinstance(item, dict)]
 
