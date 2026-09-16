@@ -757,6 +757,7 @@ class DiscoveryInventoryTests(unittest.TestCase):
                     "id": "abcdef1234567890",
                     "short_id": "abcdef12",
                     "title": "Validate authorization",
+                    "message": "Validate authorization\n\nReject cross-tenant access.",
                     "author_name": "Security Engineer",
                     "committed_date": "2026-09-16T08:00:00Z",
                     "web_url": "https://gitlab.example.com/company/app/-/commit/abcdef1234567890",
@@ -773,6 +774,7 @@ class DiscoveryInventoryTests(unittest.TestCase):
 
         self.assertEqual(len(commits), 2)
         self.assertEqual(commits[0]["short_id"], "abcdef12")
+        self.assertIn("Reject cross-tenant access", commits[0]["message"])
         self.assertIn("gitlab.example.com", commits[0]["web_url"])
         self.assertEqual(commits[1]["web_url"], "")
     class FakeGitLabClient:
@@ -1416,6 +1418,7 @@ class WebAuthenticationTests(unittest.TestCase):
                                 "id": "abcdef1234567890",
                                 "short_id": "abcdef12",
                                 "title": "Validate shell input",
+                                "message": "Validate shell input before command execution",
                                 "author_name": "Security Engineer",
                                 "committed_date": "2026-09-16T08:00:00Z",
                                 "web_url": (
@@ -1469,7 +1472,9 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("The query uses bound parameters", completed)
             self.assertIn("class='expandable-row'", completed)
             self.assertIn("href='/completed' aria-current='page'", completed)
+            self.assertIn("data-lazy-commits", completed)
             self.assertIn("data-commits-url='/mr-commits?", completed)
+            self.assertNotIn("commit-history-button", completed)
             expected_columns = (
                 "<th>Severity</th><th>Finding title</th><th>MR</th>"
                 "<th>Vulnerability details</th>"
@@ -1497,13 +1502,15 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("data-lazy-diff", repository_mrs)
             self.assertIn("<th>Manual review</th>", repository_mrs)
             self.assertIn("All statuses", repository_mrs)
-            self.assertIn("MR commits", repository_mrs)
-            self.assertIn("View commits", repository_mrs)
+            self.assertIn("data-lazy-commits", repository_mrs)
+            self.assertIn("Commit messages and authors load", repository_mrs)
+            self.assertNotIn("View commits", repository_mrs)
             self.assertEqual(stored_diff["source"], "stored")
             self.assertIn("run_shell(user_input)", stored_diff["diff"])
             self.assertEqual(fetched_diff["source"], "gitlab")
             self.assertIn("pending_change = True", fetched_diff["diff"])
             self.assertEqual(mr_commits["commits"][0]["title"], "Validate shell input")
+            self.assertIn("before command execution", mr_commits["commits"][0]["message"])
             self.assertEqual(mr_commits["commits"][0]["short_id"], "abcdef12")
             cached_pending = store.mr_revision(1, 10, "pending-sha")
             self.assertIsNotNone(cached_pending)
