@@ -9,6 +9,40 @@ Perform a read-only, evidence-backed review of the merge-request change. The
 purpose is to identify material security risks early without blocking normal
 development.
 
+This workflow incorporates the detection and self-verification method from
+GitHub's `awesome-copilot` security-review skill. The company-specific scope,
+evidence threshold, report format, and non-negotiable boundaries in this file
+override any conflicting upstream guidance. The application appends the
+approved files under `references/` to these instructions automatically.
+
+## Ordered review workflow
+
+Perform these stages in order:
+
+1. **Resolve scope and technology**: identify the languages, frameworks,
+   dependency manifests, entry points, and trust boundaries present in the MR
+   diff and supplied bounded context.
+2. **Audit changed dependencies**: when a dependency manifest or lock file is
+   changed, evaluate newly introduced or upgraded packages. The static package
+   watchlist is historical detection guidance, not current vulnerability
+   evidence. Do not claim a CVE or safe version unless the supplied evidence
+   supports it.
+3. **Scan secrets and exposure**: inspect changed source, configuration, CI/CD,
+   container, and infrastructure files for real credentials, unsafe logging,
+   or accidental sensitive-data exposure. Distinguish actual secrets from
+   examples and placeholders.
+4. **Deep vulnerability review**: apply the relevant language and vulnerability
+   category guidance, reasoning about application behavior rather than merely
+   matching a dangerous API name.
+5. **Cross-file data-flow analysis**: trace attacker-controlled sources across
+   the supplied files through validation, authorization, transformation, and
+   sanitization to sensitive sinks.
+6. **Self-verification pass**: re-read every candidate finding, look for
+   framework protections or upstream safeguards, confirm exploitability, and
+   discard or downgrade false positives.
+7. **Generate the report** using the exact format below. Do not modify code or
+   apply a proposed remediation.
+
 ## Review scope
 
 1. Review the supplied merge-request diff, metadata, complete changed files,
@@ -43,6 +77,12 @@ Examine relevant changes for newly introduced weaknesses involving:
   unsafe configuration.
 - High-risk business flows, such as payments, account recovery, privileged
   actions, and data export.
+- CSRF, BOLA/IDOR, privilege escalation, JWT validation, session fixation,
+  missing rate limits on sensitive endpoints, and unsafe mass assignment.
+- XSS, XXE, LDAP/header/log injection, insecure deserialization, and unsafe
+  use of language- or framework-specific execution APIs.
+- Dependency and supply-chain risks introduced by changed manifests or lock
+  files, when supported by concrete version or advisory evidence.
 - End-to-end data flow from HTTP parameters, request bodies, headers, uploaded
   files, messages, database content, or other attacker-controlled sources to
   database, command, filesystem, template, deserialization, redirect, logging,
@@ -53,6 +93,11 @@ Examine relevant changes for newly introduced weaknesses involving:
 Report a finding only when the changed code provides concrete evidence of the
 issue. Do not report speculative concerns, code-style suggestions, generic best
 practices, or missing tests as security findings.
+
+For every finding, include a confidence rating of `High`, `Medium`, or `Low`.
+Confidence measures the strength of the evidence, not the business impact.
+Low-confidence suspicions that cannot meet the concrete-evidence threshold must
+be omitted or stated as a review limitation rather than reported as a finding.
 
 Assign severity by plausible business impact:
 
@@ -75,7 +120,10 @@ Return concise Markdown with these sections:
 3. `## Findings`: begin every finding with exactly
    `### [SEVERITY] Short title`, where `SEVERITY` is `CRITICAL`, `HIGH`,
    `MEDIUM`, or `LOW`. Then give file and line reference, changed behaviour,
-   credible exploitation path, business impact, and a specific remediation.
+   category, confidence, credible exploitation path, business impact, and a
+   specific remediation. For Critical and High findings, provide a concise
+   proposed before/after patch when the supplied context is sufficient, and
+   state that it requires human review and has not been applied.
 4. If there are no evidence-backed findings, write under `## Findings` exactly:
    `No high-confidence security findings.`
 5. `## Overall severity rationale`: explain why the highest assigned severity is
