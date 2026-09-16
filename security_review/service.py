@@ -158,6 +158,7 @@ SECURITY_SKILL_REFERENCE_FILES = (
     "vuln-categories.md",
     "report-format.md",
     "sentry-confidence.md",
+    "differential-review.md",
 )
 SENTRY_SECURITY_SKILL_REFERENCES = {
     "python": "sentry/languages/python.md",
@@ -189,6 +190,8 @@ DOCKER_SECURITY_FILENAMES = {
     "dockerfile",
 }
 MAX_SECURITY_SKILL_BYTES = 512_000
+MAX_REVIEW_COMMIT_CONTEXT_COMMITS = 100
+MAX_REVIEW_COMMIT_CONTEXT_BYTES = 32_000
 
 
 class ReviewError(RuntimeError):
@@ -1035,6 +1038,62 @@ def render_diffs(diffs: list[dict[str, Any]], config: Config) -> str:
     return rendered
 
 
+def render_commit_context(
+    commits: list[dict[str, Any]],
+    *,
+    unavailable_reason: str = "",
+    max_commits: int = MAX_REVIEW_COMMIT_CONTEXT_COMMITS,
+    max_bytes: int = MAX_REVIEW_COMMIT_CONTEXT_BYTES,
+) -> str:
+    """Render bounded, explicitly untrusted MR commit metadata for the reviewer."""
+    if unavailable_reason:
+        return f"Commit timeline unavailable: {unavailable_reason}"
+    if not commits:
+        return "GitLab returned no commit timeline for this merge request."
+
+    if max_commits <= 0 or max_bytes <= 0:
+        return "Commit context omitted because its configured safety limit is zero."
+    if len(commits) <= max_commits:
+        selected = commits
+    elif max_commits == 1:
+        selected = commits[-1:]
+    else:
+        oldest_count = max(1, min(20, max_commits // 5))
+        newest_count = max_commits - oldest_count
+        selected = commits[:oldest_count] + commits[-newest_count:]
+
+    header = (
+        f"GitLab returned {len(commits)} MR commit(s); "
+        f"up to {max_commits} bounded entries are supplied below."
+    )
+    rendered = [header]
+    used_bytes = len((header + "\n").encode("utf-8"))
+    included = 0
+    for raw_commit in selected:
+        record = {
+            "id": str(raw_commit.get("id") or "")[:64],
+            "short_id": str(raw_commit.get("short_id") or "")[:20],
+            "title": str(raw_commit.get("title") or "")[:500],
+            "message": str(raw_commit.get("message") or "")[:4_000],
+            "author_name": str(raw_commit.get("author_name") or "")[:200],
+            "committed_date": str(raw_commit.get("committed_date") or "")[:100],
+        }
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        line_bytes = len((line + "\n").encode("utf-8"))
+        if used_bytes + line_bytes > max_bytes:
+            break
+        rendered.append(line)
+        used_bytes += line_bytes
+        included += 1
+
+    omitted = len(commits) - included
+    if omitted > 0:
+        rendered.append(
+            f"[Commit context truncated: {omitted} commit(s) omitted by safety limits.]"
+        )
+    return "\n".join(rendered)
+
+
 def normalized_archive_path(name: str) -> str | None:
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts or len(path.parts) < 2:
@@ -1201,8 +1260,12 @@ def build_prompt(
     mr: dict[str, Any],
     rendered_diffs: str,
     context: ContextBundle,
+    commit_context: str,
 ) -> str:
     notes = "\n".join(f"- {note}" for note in context.notes) or "- None"
+    diff_refs = mr.get("diff_refs")
+    if not isinstance(diff_refs, dict):
+        diff_refs = {}
     return f"""<approved_security_review_instructions>
 {skill}
 </approved_security_review_instructions>
@@ -1213,12 +1276,18 @@ Merge request: !{target.mr_iid}
 URL: {target.web_url}
 Title: {mr.get('title', '')}
 Description: {mr.get('description') or ''}
+Base commit: {diff_refs.get('base_sha') or ''}
+Start commit: {diff_refs.get('start_sha') or ''}
 Head commit: {target.head_sha}
 </merge_request_metadata>
 
 <context_collection_notes>
 {notes}
 </context_collection_notes>
+
+<untrusted_merge_request_commit_timeline>
+{commit_context}
+</untrusted_merge_request_commit_timeline>
 
 <untrusted_merge_request_diff>
 {rendered_diffs}
@@ -1665,6 +1734,18 @@ def review_target(
         if current_sha != target.head_sha:
             raise ManualReviewRequired("A newer MR revision exists; this review is stale.")
 
+        commit_context_error = ""
+        try:
+            commits = client.get_merge_request_commits(
+                target.project_path, target.mr_iid
+            )
+        except ReviewError as exc:
+            commits = []
+            commit_context_error = str(exc)
+        commit_context = render_commit_context(
+            commits,
+            unavailable_reason=commit_context_error,
+        )
         diffs = client.get_merge_request_diffs(target.project_path, target.mr_iid)
         rendered_diffs = render_diffs(diffs, config)
         source_project_id = int(mr.get("source_project_id") or target.project_id)
@@ -1675,7 +1756,14 @@ def review_target(
             for diff in diffs
         )
         skill = load_security_skill(config.skill_path, changed_paths)
-        prompt_input = build_prompt(skill, target, mr, rendered_diffs, context)
+        prompt_input = build_prompt(
+            skill,
+            target,
+            mr,
+            rendered_diffs,
+            context,
+            commit_context,
+        )
         report, llm_result = run_llm(prompt_input, config)
         high = bool(HIGH_SEVERITY_PATTERN.search(report))
         status = "high_severity" if high else "completed"
@@ -1684,6 +1772,8 @@ def review_target(
                 "status": status,
                 "completed_at": utc_now(),
                 "changed_files": len(diffs),
+                "commit_context_count": len(commits),
+                "commit_context_error": commit_context_error,
                 "context_files": list(context.files),
                 "context_bytes": context.bytes_used,
                 "context_notes": list(context.notes),

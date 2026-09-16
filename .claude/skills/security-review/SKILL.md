@@ -10,13 +10,14 @@ purpose is to identify material security risks early without blocking normal
 development.
 
 This workflow incorporates the detection and self-verification method from
-GitHub's `awesome-copilot` security-review skill and the high-confidence,
-context-aware review method from Sentry's security-review skill. The
-company-specific scope, evidence threshold, report format, and non-negotiable
-boundaries in this file override any conflicting upstream guidance. The
-application appends approved core references automatically and loads the
-approved Sentry Python, JavaScript, and Docker guidance only when the changed
-file paths make it relevant.
+GitHub's `awesome-copilot` security-review skill, the high-confidence,
+context-aware review method from Sentry's security-review skill, and an adapted
+risk-first differential-review method from Trail of Bits. The company-specific
+scope, evidence threshold, report format, and non-negotiable boundaries in this
+file override any conflicting upstream guidance. The application appends
+approved core references automatically and loads the approved Sentry Python,
+JavaScript, and Docker guidance only when the changed file paths make it
+relevant.
 
 ## Ordered review workflow
 
@@ -37,13 +38,22 @@ Perform these stages in order:
 4. **Deep vulnerability review**: apply the relevant language and vulnerability
    category guidance, reasoning about application behavior rather than merely
    matching a dangerous API name.
-5. **Cross-file data-flow analysis**: trace attacker-controlled sources across
+5. **Differential risk review**: compare the before and after behaviour, look
+   for removed or weakened security controls, use the supplied MR commit
+   timeline as corroborating context, estimate the observable blast radius, and
+   examine whether security-sensitive changes have relevant tests. Missing tests
+   are a review limitation, not a vulnerability by themselves.
+6. **Cross-file data-flow analysis**: trace attacker-controlled sources across
    the supplied files through validation, authorization, transformation, and
    sanitization to sensitive sinks.
-6. **Self-verification pass**: re-read every candidate finding, look for
+7. **Adversarial verification**: for each high-risk candidate, identify a
+   realistic attacker, reachable entry point, required privileges and state,
+   exact exploitation path, and concrete impact. Discard candidates whose path
+   cannot be demonstrated from supplied evidence.
+8. **Self-verification pass**: re-read every candidate finding, look for
    framework protections or upstream safeguards, confirm exploitability, and
    discard or downgrade false positives.
-7. **Generate the report** using the exact format below. Do not modify code or
+9. **Generate the report** using the exact format below. Do not modify code or
    apply a proposed remediation.
 
 ## Review scope
