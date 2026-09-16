@@ -157,7 +157,37 @@ SECURITY_SKILL_REFERENCE_FILES = (
     "secret-patterns.md",
     "vuln-categories.md",
     "report-format.md",
+    "sentry-confidence.md",
 )
+SENTRY_SECURITY_SKILL_REFERENCES = {
+    "python": "sentry/languages/python.md",
+    "javascript": "sentry/languages/javascript.md",
+    "docker": "sentry/infrastructure/docker.md",
+}
+PYTHON_SECURITY_SUFFIXES = {".py", ".pyi", ".pyw"}
+JAVASCRIPT_SECURITY_SUFFIXES = {
+    ".cjs",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".ts",
+    ".tsx",
+    ".vue",
+}
+JAVASCRIPT_SECURITY_FILENAMES = {
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+}
+DOCKER_SECURITY_FILENAMES = {
+    ".dockerignore",
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+    "dockerfile",
+}
 MAX_SECURITY_SKILL_BYTES = 512_000
 
 
@@ -176,7 +206,35 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def load_security_skill(skill_path: Path) -> str:
+def routed_security_skill_references(changed_paths: Iterable[str]) -> tuple[str, ...]:
+    selected: set[str] = set()
+    for raw_path in changed_paths:
+        path = PurePosixPath(str(raw_path).replace("\\", "/"))
+        filename = path.name.lower()
+        suffix = path.suffix.lower()
+        if suffix in PYTHON_SECURITY_SUFFIXES:
+            selected.add(SENTRY_SECURITY_SKILL_REFERENCES["python"])
+        if (
+            suffix in JAVASCRIPT_SECURITY_SUFFIXES
+            or filename in JAVASCRIPT_SECURITY_FILENAMES
+        ):
+            selected.add(SENTRY_SECURITY_SKILL_REFERENCES["javascript"])
+        if (
+            filename in DOCKER_SECURITY_FILENAMES
+            or filename.startswith("dockerfile.")
+        ):
+            selected.add(SENTRY_SECURITY_SKILL_REFERENCES["docker"])
+    return tuple(
+        reference
+        for reference in SENTRY_SECURITY_SKILL_REFERENCES.values()
+        if reference in selected
+    )
+
+
+def load_security_skill(
+    skill_path: Path,
+    changed_paths: Iterable[str] = (),
+) -> str:
     try:
         if skill_path.stat().st_size > MAX_SECURITY_SKILL_BYTES:
             raise ReviewError("The security-review skill exceeds the approved size limit.")
@@ -186,14 +244,17 @@ def load_security_skill(skill_path: Path) -> str:
     total_bytes = len(skill_content.encode("utf-8"))
 
     sections = [skill_content.rstrip()]
-    reference_root = (skill_path.resolve().parent / "references").resolve()
-    for reference_name in SECURITY_SKILL_REFERENCE_FILES:
-        candidate_path = reference_root / reference_name
+    skill_root = skill_path.resolve().parent
+    reference_names = tuple(
+        f"references/{reference_name}" for reference_name in SECURITY_SKILL_REFERENCE_FILES
+    ) + routed_security_skill_references(changed_paths)
+    for reference_name in reference_names:
+        candidate_path = skill_root / reference_name
         if not candidate_path.is_file():
             continue
         try:
             reference_path = candidate_path.resolve(strict=True)
-            reference_path.relative_to(reference_root)
+            reference_path.relative_to(skill_root)
             if total_bytes + reference_path.stat().st_size > MAX_SECURITY_SKILL_BYTES:
                 raise ReviewError(
                     "The security-review skill and references exceed the approved size limit."
@@ -201,15 +262,16 @@ def load_security_skill(skill_path: Path) -> str:
             reference_content = reference_path.read_text(encoding="utf-8")
         except ValueError as exc:
             raise ReviewError(
-                f"Security-review reference {reference_name} escapes its approved directory."
+                f"Security-review reference {reference_name} escapes its approved skill directory."
             ) from exc
         except (OSError, UnicodeError) as exc:
             raise ReviewError(
                 f"Could not read security-review reference {reference_name}: {exc}"
             ) from exc
         total_bytes += len(reference_content.encode("utf-8"))
+        reference_label = reference_name.removeprefix("references/")
         sections.append(
-            f"<approved_security_reference name={json.dumps(reference_name)}>\n"
+            f"<approved_security_reference name={json.dumps(reference_label)}>\n"
             f"{reference_content.rstrip()}\n"
             "</approved_security_reference>"
         )
@@ -1593,7 +1655,11 @@ def review_target(
         source_project_id = int(mr.get("source_project_id") or target.project_id)
         archive = client.download_archive(source_project_id, target.head_sha, config.max_archive_bytes)
         context = build_context_bundle(archive, diffs, config)
-        skill = load_security_skill(config.skill_path)
+        changed_paths = (
+            str(diff.get("new_path") or diff.get("old_path") or "")
+            for diff in diffs
+        )
+        skill = load_security_skill(config.skill_path, changed_paths)
         prompt_input = build_prompt(skill, target, mr, rendered_diffs, context)
         report, llm_result = run_llm(prompt_input, config)
         high = bool(HIGH_SEVERITY_PATTERN.search(report))
