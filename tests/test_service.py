@@ -985,7 +985,16 @@ class DiscoveryInventoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "state.sqlite3"
             state = ReviewState(database)
-            state.record_visible_projects(self.FakeGitLabClient().list_projects())
+            state.record_visible_projects(
+                self.FakeGitLabClient().list_projects()
+                + [
+                    {
+                        "id": 3,
+                        "path_with_namespace": "company/no-mrs",
+                        "web_url": "https://gitlab.example.com/company/no-mrs",
+                    }
+                ]
+            )
             state.record_project_check(1, "up")
             state.record_project_check(2, "down", "Access failed")
             state.queue(
@@ -1008,10 +1017,24 @@ class DiscoveryInventoryTests(unittest.TestCase):
                     "2026-09-15T08:30:00Z",
                 )
             )
+            state.queue(
+                ReviewTarget(
+                    2,
+                    "company/second",
+                    8,
+                    "second-project-sha",
+                    "",
+                    "2026-09-15T09:30:00Z",
+                )
+            )
             rows, start, end = WebStore(database).repository_activity(
                 "week", "2026-09-15", "2026-09-15"
             )
             by_project = {row["project_path"]: row for row in rows}
+            self.assertEqual(
+                [row["project_path"] for row in rows],
+                ["company/second", "company/first", "company/no-mrs"],
+            )
             self.assertEqual(start.isoformat(), "2026-09-15T00:00:00+00:00")
             self.assertEqual(end.isoformat(), "2026-09-16T00:00:00+00:00")
             self.assertEqual(by_project["company/first"]["mr_count"], 1)
@@ -1020,8 +1043,9 @@ class DiscoveryInventoryTests(unittest.TestCase):
                 "2026-09-15T08:30:00Z",
             )
             self.assertEqual(by_project["company/first"]["last_check_status"], "up")
-            self.assertEqual(by_project["company/second"]["mr_count"], 0)
+            self.assertEqual(by_project["company/second"]["mr_count"], 1)
             self.assertEqual(by_project["company/second"]["last_check_status"], "down")
+            self.assertEqual(by_project["company/no-mrs"]["mr_count"], 0)
             self.assertEqual(
                 len(WebStore(database).repository_mrs(1, start, end)), 1
             )

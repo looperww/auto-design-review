@@ -344,6 +344,10 @@ selectors and the Previous/Next controls preserve the active rolling period or
 custom UTC date range. Repository totals continue to cover all visible
 repositories, not only the current page.
 
+Repositories are ordered by their latest MR in the selected period, newest
+first. Repositories without an MR in that period appear last in alphabetical
+order.
+
 Click a non-zero MR count to open that repository's filtered MR list and its
 available security reports. The repository-specific MR page has the same Day,
 Week, Month, and inclusive UTC date-range filters as the repository inventory.

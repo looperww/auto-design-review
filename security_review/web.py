@@ -1506,7 +1506,10 @@ class WebStore:
                 FROM visible_projects AS projects
                 LEFT JOIN activity ON activity.project_id = projects.project_id
                 WHERE projects.is_visible = 1
-                ORDER BY projects.project_path COLLATE NOCASE
+                ORDER BY
+                    CASE WHEN activity.latest_mr_at IS NULL THEN 1 ELSE 0 END,
+                    activity.latest_mr_at DESC,
+                    projects.project_path COLLATE NOCASE
                 """,
                 (start.isoformat(), end.isoformat()),
             ).fetchall()
