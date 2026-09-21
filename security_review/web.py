@@ -50,6 +50,7 @@ FINDING_HEADING_PATTERN = re.compile(
 )
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 REPOSITORIES_PER_PAGE = 10
+REPOSITORY_PAGE_SIZES = (10, 25, 50, 100)
 COMPLETED_ROWS_PER_PAGE = 20
 COMPLETED_SEVERITIES = {"all", "critical", "high", "medium", "low", "safe"}
 MANUAL_REVIEW_STATUSES = {"open", "in_progress", "done"}
@@ -670,22 +671,32 @@ def inline_commit_summary(
     )
 
 
+def normalize_repository_page_size(requested_page_size: str) -> int:
+    try:
+        page_size = int(requested_page_size)
+    except ValueError:
+        return REPOSITORIES_PER_PAGE
+    return page_size if page_size in REPOSITORY_PAGE_SIZES else REPOSITORIES_PER_PAGE
+
+
 def paginate_repositories(
-    repositories: list[Any], requested_page: str
+    repositories: list[Any], requested_page: str, page_size: int = REPOSITORIES_PER_PAGE
 ) -> tuple[list[Any], int, int]:
+    if page_size not in REPOSITORY_PAGE_SIZES:
+        page_size = REPOSITORIES_PER_PAGE
     try:
         page_number = int(requested_page)
     except ValueError:
         page_number = 1
     total_pages = max(
         1,
-        (len(repositories) + REPOSITORIES_PER_PAGE - 1)
-        // REPOSITORIES_PER_PAGE,
+        (len(repositories) + page_size - 1)
+        // page_size,
     )
     page_number = min(max(page_number, 1), total_pages)
-    start = (page_number - 1) * REPOSITORIES_PER_PAGE
+    start = (page_number - 1) * page_size
     return (
-        repositories[start : start + REPOSITORIES_PER_PAGE],
+        repositories[start : start + page_size],
         page_number,
         total_pages,
     )
@@ -2732,38 +2743,48 @@ def handler_factory(
             )
             fetched_mrs = sum(int(project["mr_count"]) for project in projects)
             total_repositories = len(projects)
+            page_size = normalize_repository_page_size(
+                query.get("page_size", [str(REPOSITORIES_PER_PAGE)])[0]
+            )
             paged_projects, page_number, page_count = paginate_repositories(
-                projects, query.get("repo_page", ["1"])[0]
+                projects, query.get("repo_page", ["1"])[0], page_size
             )
             activity_query = context["activity_query"]
+            navigation_query = {**activity_query, "page_size": page_size}
             page_options = "".join(
                 f"<option value='{number}' {'selected' if number == page_number else ''}>{number}</option>"
                 for number in range(1, page_count + 1)
+            )
+            page_size_options = "".join(
+                f"<option value='{size}' {'selected' if size == page_size else ''}>{size}</option>"
+                for size in REPOSITORY_PAGE_SIZES
             )
             hidden_fields = "".join(
                 f"<input type='hidden' name='{html.escape(str(key))}' value='{html.escape(str(value))}'>"
                 for key, value in activity_query.items()
             )
             previous_page = (
-                f"<a class='button secondary' href='/repositories?{urllib.parse.urlencode({**activity_query, 'repo_page': page_number - 1})}'>Previous</a>"
+                f"<a class='button secondary' href='/repositories?{urllib.parse.urlencode({**navigation_query, 'repo_page': page_number - 1})}'>Previous</a>"
                 if page_number > 1
                 else ""
             )
             next_page = (
-                f"<a class='button secondary' href='/repositories?{urllib.parse.urlencode({**activity_query, 'repo_page': page_number + 1})}'>Next</a>"
+                f"<a class='button secondary' href='/repositories?{urllib.parse.urlencode({**navigation_query, 'repo_page': page_number + 1})}'>Next</a>"
                 if page_number < page_count
                 else ""
             )
             if total_repositories:
-                first = (page_number - 1) * REPOSITORIES_PER_PAGE + 1
-                last = min(page_number * REPOSITORIES_PER_PAGE, total_repositories)
+                first = (page_number - 1) * page_size + 1
+                last = min(page_number * page_size, total_repositories)
                 repository_range = f"Showing {first}–{last} of {total_repositories} repositories"
             else:
                 repository_range = "No repositories to display"
             pagination = f"""
             <div class='pagination'><p class='sub'>{repository_range}</p><div class='actions'>{previous_page}
-            <form class='page-selector' method='get' action='/repositories'>{hidden_fields}<label for='repo_page'>Page</label>
-            <select id='repo_page' name='repo_page'>{page_options}</select><span>of {page_count}</span><button class='secondary' type='submit'>Go</button></form>{next_page}</div></div>"""
+            <form class='page-selector' method='get' action='/repositories'>{hidden_fields}
+            <label for='repo_page_size'>Rows per page</label><select id='repo_page_size' name='page_size'>{page_size_options}</select>
+            <label for='repo_page'>Page</label><select id='repo_page' name='repo_page'>{page_options}</select>
+            <span>of {page_count}</span><button class='secondary' type='submit'>Apply</button></form>{next_page}</div></div>"""
             rows = []
             for project in paged_projects:
                 project_path = html.escape(str(project["project_path"]))
@@ -2820,7 +2841,7 @@ def handler_factory(
             body = f"""
             {date_notice}{self.vault_notice()}
             <section class='card'><div class='section-heading'><div><h2>Repositories and MRs</h2><p class='sub'>Visible repositories and MRs first discovered after {html.escape(deployment_time + ' UTC' if deployment_time else 'initialization')}. Current filter: {html.escape(str(context['filter_label']))}.</p></div></div>
-            {self.filter_controls(context, '/repositories')}
+            {self.filter_controls(context, '/repositories', {'page_size': page_size})}
             <div class='grid'><div class='metric'>Visible repositories<strong>{total_repositories}</strong></div><div class='metric'>Fetched MRs<strong>{fetched_mrs}</strong></div><div class='metric'>Findings<strong>{len(findings)}</strong></div></div>
             <div class='table-wrap'><table><thead><tr><th>Repository</th><th>ID</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>"""
             self.application_response(

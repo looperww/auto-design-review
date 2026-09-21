@@ -58,6 +58,7 @@ from security_review.web import (  # noqa: E402
     decrypt_credentials,
     encrypt_credentials,
     normalize_gitlab_commits,
+    normalize_repository_page_size,
     paginate_repositories,
     parse_security_findings,
     password_record,
@@ -1058,12 +1059,15 @@ class DiscoveryInventoryTests(unittest.TestCase):
             self.assertEqual(store.mr_activity("month")[0], 3)
             state.close()
 
-    def test_repository_pagination_uses_ten_rows_and_clamps_page_number(self):
+    def test_repository_pagination_supports_allowed_page_sizes_and_clamps_page(self):
         repositories = list(range(23))
         first, first_page, page_count = paginate_repositories(repositories, "1")
         second, second_page, _ = paginate_repositories(repositories, "2")
         last, last_page, _ = paginate_repositories(repositories, "99")
         invalid, invalid_page, _ = paginate_repositories(repositories, "invalid")
+        twenty_five, large_page, large_page_count = paginate_repositories(
+            repositories, "2", 25
+        )
 
         self.assertEqual(first, list(range(10)))
         self.assertEqual(second, list(range(10, 20)))
@@ -1073,6 +1077,14 @@ class DiscoveryInventoryTests(unittest.TestCase):
         self.assertEqual(invalid, first)
         self.assertEqual(invalid_page, 1)
         self.assertEqual(paginate_repositories([], "1"), ([], 1, 1))
+        self.assertEqual(twenty_five, repositories)
+        self.assertEqual((large_page, large_page_count), (1, 1))
+        self.assertEqual(normalize_repository_page_size("10"), 10)
+        self.assertEqual(normalize_repository_page_size("25"), 25)
+        self.assertEqual(normalize_repository_page_size("50"), 50)
+        self.assertEqual(normalize_repository_page_size("100"), 100)
+        self.assertEqual(normalize_repository_page_size("500"), 10)
+        self.assertEqual(normalize_repository_page_size("invalid"), 10)
 
 
 class WebAuthenticationTests(unittest.TestCase):
@@ -1457,6 +1469,12 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("href='/' aria-current='page'", dashboard)
             self.assertIn("<h1>Repositories</h1>", repositories)
             self.assertIn("<h2>Repositories and MRs</h2>", repositories)
+            self.assertIn("Rows per page", repositories)
+            self.assertIn("name='page_size'", repositories)
+            self.assertIn("<option value='10' selected>10</option>", repositories)
+            self.assertIn("<option value='25' >25</option>", repositories)
+            self.assertIn("<option value='50' >50</option>", repositories)
+            self.assertIn("<option value='100' >100</option>", repositories)
             self.assertNotIn("<h2>Review status</h2>", repositories)
             self.assertNotIn("<h2>GitLab connection</h2>", repositories)
             self.assertIn(
