@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -34,6 +35,7 @@ from .service import (
     Config,
     ReviewError,
     effective_runtime_settings,
+    initial_mr_discovery_started_at,
     list_llm_models,
     normalize_gitlab_group_path,
     normalize_runtime_setting,
@@ -1316,10 +1318,13 @@ class WebStore:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
-            connection.execute(
-                "INSERT OR IGNORE INTO metadata (key, value) VALUES ('deployment_started_at', ?)",
-                (now_iso(),),
-            )
+            if connection.execute(
+                "SELECT 1 FROM metadata WHERE key = 'deployment_started_at'"
+            ).fetchone() is None:
+                connection.execute(
+                    "INSERT INTO metadata (key, value) VALUES ('deployment_started_at', ?)",
+                    (initial_mr_discovery_started_at(),),
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS visible_projects (
@@ -3769,7 +3774,11 @@ def run_web(managed: bool = False) -> int:
         "yes",
         "on",
     }
-    store = WebStore(state_db)
+    try:
+        store = WebStore(state_db)
+    except ReviewError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr, flush=True)
+        return 1
     invalidated_sessions = store.delete_all_sessions()
     vault = MemoryVault()
     if managed:

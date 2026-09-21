@@ -560,6 +560,28 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def initial_mr_discovery_started_at() -> str:
+    """Return the persistent MR cutoff to seed into a new state database."""
+    raw = os.environ.get("MR_DISCOVERY_START_AT", "").strip()
+    if not raw:
+        return utc_now()
+    candidate = (
+        f"{raw}T00:00:00+00:00"
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw)
+        else raw
+    )
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ReviewError(
+            "MR_DISCOVERY_START_AT must be a date such as 2026-09-14 or an "
+            "ISO 8601 timestamp with a timezone."
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ReviewError("MR_DISCOVERY_START_AT timestamps must include a timezone.")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def parse_gitlab_timestamp(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
@@ -815,10 +837,13 @@ class ReviewState:
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
-        self.connection.execute(
-            "INSERT OR IGNORE INTO metadata (key, value) VALUES ('deployment_started_at', ?)",
-            (utc_now(),),
-        )
+        if self.connection.execute(
+            "SELECT 1 FROM metadata WHERE key = 'deployment_started_at'"
+        ).fetchone() is None:
+            self.connection.execute(
+                "INSERT INTO metadata (key, value) VALUES ('deployment_started_at', ?)",
+                (initial_mr_discovery_started_at(),),
+            )
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS visible_projects (

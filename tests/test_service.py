@@ -34,6 +34,7 @@ from security_review.service import (  # noqa: E402
     env_bool,
     effective_runtime_settings,
     is_context_candidate,
+    initial_mr_discovery_started_at,
     list_llm_models,
     load_security_skill,
     normalize_gitlab_group_path,
@@ -1885,9 +1886,15 @@ class WebAuthenticationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             first_database = Path(directory) / "first.sqlite3"
             second_database = Path(directory) / "second.sqlite3"
-            with patch("security_review.web.now_iso", return_value="2026-09-15T10:00:00+00:00"):
+            with patch(
+                "security_review.service.utc_now",
+                return_value="2026-09-15T10:00:00+00:00",
+            ):
                 first = WebStore(first_database)
-            with patch("security_review.web.now_iso", return_value="2026-09-16T10:00:00+00:00"):
+            with patch(
+                "security_review.service.utc_now",
+                return_value="2026-09-16T10:00:00+00:00",
+            ):
                 second = WebStore(second_database)
             self.assertEqual(
                 first.scan_status()["deployment_started_at"],
@@ -1897,12 +1904,50 @@ class WebAuthenticationTests(unittest.TestCase):
                 second.scan_status()["deployment_started_at"],
                 "2026-09-16T10:00:00+00:00",
             )
-            with patch("security_review.web.now_iso", return_value="2026-09-17T10:00:00+00:00"):
+            with patch(
+                "security_review.service.utc_now",
+                return_value="2026-09-17T10:00:00+00:00",
+            ):
                 WebStore(first_database)
             self.assertEqual(
                 first.scan_status()["deployment_started_at"],
                 "2026-09-15T10:00:00+00:00",
             )
+
+    def test_explicit_mr_discovery_start_date_is_saved_once_in_sqlite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            with patch.dict(
+                os.environ, {"MR_DISCOVERY_START_AT": "2026-09-14"}, clear=False
+            ):
+                store = WebStore(database)
+            self.assertEqual(
+                store.scan_status()["deployment_started_at"],
+                "2026-09-14T00:00:00+00:00",
+            )
+
+            with patch.dict(
+                os.environ,
+                {"MR_DISCOVERY_START_AT": "2026-09-20T12:00:00+02:00"},
+                clear=False,
+            ):
+                WebStore(database)
+            self.assertEqual(
+                store.scan_status()["deployment_started_at"],
+                "2026-09-14T00:00:00+00:00",
+            )
+
+    def test_mr_discovery_start_requires_a_valid_date_or_zoned_timestamp(self):
+        with patch.dict(
+            os.environ, {"MR_DISCOVERY_START_AT": "14 September 2026"}, clear=False
+        ):
+            with self.assertRaisesRegex(ReviewError, "MR_DISCOVERY_START_AT"):
+                initial_mr_discovery_started_at()
+        with patch.dict(
+            os.environ, {"MR_DISCOVERY_START_AT": "2026-09-14T12:00:00"}, clear=False
+        ):
+            with self.assertRaisesRegex(ReviewError, "timezone"):
+                initial_mr_discovery_started_at()
 
     def test_review_data_reset_preserves_admin_credentials_and_settings(self):
         with tempfile.TemporaryDirectory() as directory:

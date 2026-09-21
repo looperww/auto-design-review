@@ -126,9 +126,24 @@ company security-review records.
 
 ### 3. Build and start
 
+For a fresh production deployment that should include currently open MRs created
+on or after 14 September 2026 (UTC), seed the initial discovery cutoff while
+starting the container:
+
 ```bash
-docker compose up --detach --build
+MR_DISCOVERY_START_AT=2026-09-14 docker compose up --detach --build
 ```
+
+`MR_DISCOVERY_START_AT` accepts a UTC date (`YYYY-MM-DD`) or an ISO 8601
+timestamp with a timezone. A date represents midnight UTC. The value is used
+only when the SQLite database is first created and is saved as
+`deployment_started_at`; rebuilding or restarting the container does not change
+it. When the variable is omitted, a new database uses its first-start time.
+
+If `data/state/reviews.sqlite3` already exists, the stored cutoff takes
+precedence. Do not delete a production database merely to change the cutoff,
+because that also deletes review history. Use a fresh `data/` directory for a
+genuinely new deployment.
 
 The image installs Claude Code from Anthropic's stable channel and the pinned
 GitHub Copilot Python SDK and runtime during the build. Direct OpenAI requests
@@ -414,11 +429,12 @@ inherits access to them. To exclude a project, remove that service account's
 access to the project or place the project outside the token's resource boundary.
 
 The first application start creates a persistent `deployment_started_at` cutoff
-in SQLite. GitLab may return open MRs that were created before the reviewer was
-deployed, but those MRs are not queued, counted, or reviewed. Only MRs whose
-GitLab `created_at` timestamp is on or after the cutoff are included. Rebuilding
-or replacing the container does not reset the cutoff because it is stored in the
-host `data/` folder.
+in SQLite. By default it is the first-start time; a fresh deployment can seed an
+earlier cutoff with `MR_DISCOVERY_START_AT`. GitLab may return open MRs created
+before the cutoff, but those MRs are not queued, counted, or reviewed. Only MRs
+whose GitLab `created_at` timestamp is on or after the cutoff are included.
+Rebuilding or replacing the container does not reset the cutoff because it is
+stored in the host `data/` folder.
 
 A deployment on another server with a newly created, empty `data/` folder gets a
 new cutoff based on that server deployment's start time. Intentionally copying
