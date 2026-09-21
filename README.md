@@ -336,11 +336,12 @@ The Repositories page combines visible repositories and fetched-MR activity in o
   those MRs; and
 - the latest MR creation date and time in that period.
 
-The table displays 10 repositories per page by default. The administrator can
-select 10, 25, 50, or 100 rows per page. The row limit, page-number selector,
-and Previous/Next controls preserve the active rolling period or custom UTC
-date range. Repository totals continue to cover all visible repositories, not
-only the current page.
+The table displays 50 repositories per page by default. A selector above the
+table allows 10, 25, 50, or 100 rows per page. Changing either the row limit or
+the page number applies immediately without an additional button. These
+selectors and the Previous/Next controls preserve the active rolling period or
+custom UTC date range. Repository totals continue to cover all visible
+repositories, not only the current page.
 
 Click a non-zero MR count to open that repository's filtered MR list and its
 available security reports. The repository-specific MR page has the same Day,

@@ -1061,10 +1061,10 @@ class DiscoveryInventoryTests(unittest.TestCase):
 
     def test_repository_pagination_supports_allowed_page_sizes_and_clamps_page(self):
         repositories = list(range(23))
-        first, first_page, page_count = paginate_repositories(repositories, "1")
-        second, second_page, _ = paginate_repositories(repositories, "2")
-        last, last_page, _ = paginate_repositories(repositories, "99")
-        invalid, invalid_page, _ = paginate_repositories(repositories, "invalid")
+        first, first_page, page_count = paginate_repositories(repositories, "1", 10)
+        second, second_page, _ = paginate_repositories(repositories, "2", 10)
+        last, last_page, _ = paginate_repositories(repositories, "99", 10)
+        invalid, invalid_page, _ = paginate_repositories(repositories, "invalid", 10)
         twenty_five, large_page, large_page_count = paginate_repositories(
             repositories, "2", 25
         )
@@ -1077,14 +1077,15 @@ class DiscoveryInventoryTests(unittest.TestCase):
         self.assertEqual(invalid, first)
         self.assertEqual(invalid_page, 1)
         self.assertEqual(paginate_repositories([], "1"), ([], 1, 1))
+        self.assertEqual(paginate_repositories(repositories, "1")[0], repositories)
         self.assertEqual(twenty_five, repositories)
         self.assertEqual((large_page, large_page_count), (1, 1))
         self.assertEqual(normalize_repository_page_size("10"), 10)
         self.assertEqual(normalize_repository_page_size("25"), 25)
         self.assertEqual(normalize_repository_page_size("50"), 50)
         self.assertEqual(normalize_repository_page_size("100"), 100)
-        self.assertEqual(normalize_repository_page_size("500"), 10)
-        self.assertEqual(normalize_repository_page_size("invalid"), 10)
+        self.assertEqual(normalize_repository_page_size("500"), 50)
+        self.assertEqual(normalize_repository_page_size("invalid"), 50)
 
 
 class WebAuthenticationTests(unittest.TestCase):
@@ -1471,10 +1472,19 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("<h2>Repositories and MRs</h2>", repositories)
             self.assertIn("Rows per page", repositories)
             self.assertIn("name='page_size'", repositories)
-            self.assertIn("<option value='10' selected>10</option>", repositories)
+            self.assertIn("class='table-controls'", repositories)
+            self.assertIn("class='page-selector auto-submit-selector'", repositories)
+            self.assertGreaterEqual(repositories.count("auto-submit-selector"), 2)
+            self.assertLess(
+                repositories.index("Rows per page"),
+                repositories.index("<div class='table-wrap'>"),
+            )
+            self.assertIn("<option value='10' >10</option>", repositories)
             self.assertIn("<option value='25' >25</option>", repositories)
-            self.assertIn("<option value='50' >50</option>", repositories)
+            self.assertIn("<option value='50' selected>50</option>", repositories)
             self.assertIn("<option value='100' >100</option>", repositories)
+            self.assertNotIn(">Apply</button>", repositories)
+            self.assertIn("form.requestSubmit()", APP_JAVASCRIPT.decode("utf-8"))
             self.assertNotIn("<h2>Review status</h2>", repositories)
             self.assertNotIn("<h2>GitLab connection</h2>", repositories)
             self.assertIn(
