@@ -24,6 +24,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 
 from .service import (
+    COMPARISON_PROFILES,
+    COMPARISON_PROFILE_LABELS,
     GitLabClient,
     LLM_DEFAULT_MODELS,
     LLM_PROVIDER_LABELS,
@@ -225,31 +227,15 @@ APP_JAVASCRIPT = b"""(() => {
       if (event.target === reviewDialog) reviewDialog.close();
     });
   }
-  const provider = document.getElementById('llm_provider');
-  const customField = document.getElementById('custom_api_url_field');
-  const customInput = document.getElementById('llm_api_url');
   const credentialForm = document.getElementById('credential_form');
-  const modelInput = document.getElementById('llm_model');
-  const modelPicker = document.getElementById('available_models');
-  const fetchButton = document.getElementById('fetch_models');
-  const modelStatus = document.getElementById('model_status');
-  if (!provider || !customField || !customInput) return;
-  const updateCustomField = () => {
-    const visible = provider.value === 'custom';
-    customField.hidden = !visible;
-    customInput.disabled = !visible;
-  };
-  provider.addEventListener('change', () => {
-    updateCustomField();
-    if (modelPicker) modelPicker.hidden = true;
-    if (modelStatus) modelStatus.textContent = 'Fetch models after selecting a provider.';
-  });
-  if (modelPicker && modelInput) {
+  for (const fetchButton of document.querySelectorAll('.fetch-models')) {
+    const modelInput = document.getElementById(fetchButton.dataset.modelField || '');
+    const modelPicker = document.getElementById(fetchButton.dataset.picker || '');
+    const modelStatus = document.getElementById(fetchButton.dataset.status || '');
+    if (!credentialForm || !modelInput || !modelPicker || !modelStatus) continue;
     modelPicker.addEventListener('change', () => {
       if (modelPicker.value) modelInput.value = modelPicker.value;
     });
-  }
-  if (fetchButton && credentialForm && modelPicker && modelInput && modelStatus) {
     fetchButton.addEventListener('click', async () => {
       fetchButton.disabled = true;
       modelPicker.hidden = true;
@@ -257,9 +243,10 @@ APP_JAVASCRIPT = b"""(() => {
       try {
         const formData = new FormData(credentialForm);
         const requestData = new URLSearchParams();
-        for (const name of ['csrf', 'llm_provider', 'llm_api_key', 'llm_api_url']) {
-          if (formData.has(name)) requestData.set(name, String(formData.get(name) || ''));
-        }
+        requestData.set('csrf', String(formData.get('csrf') || ''));
+        requestData.set('model_provider', fetchButton.dataset.provider || '');
+        const keyField = fetchButton.dataset.keyField || '';
+        if (keyField) requestData.set(keyField, String(formData.get(keyField) || ''));
         const response = await fetch('/credentials/models', {
           method: 'POST',
           headers: {'Accept': 'application/json'},
@@ -281,7 +268,6 @@ APP_JAVASCRIPT = b"""(() => {
       }
     });
   }
-  updateCustomField();
 })();
 """
 
@@ -388,6 +374,7 @@ def collect_security_findings(
     findings: list[dict[str, Any]] = []
     counts: dict[int, int] = {}
     for report in reports:
+        review_profile = str(report.get("review_profile", ""))
         project_id = int(report["project_id"])
         project_path = str(report["project_path"])
         mr_iid = int(report["mr_iid"])
@@ -404,9 +391,27 @@ def collect_security_findings(
                 head_sha = str(report["head_sha"] or "")
             except (KeyError, IndexError):
                 head_sha = ""
-            item_key = str(finding["item_key"])
+            raw_item_key = str(finding["item_key"])
+            item_key = (
+                hashlib.sha256(
+                    f"{review_profile}\0{raw_item_key}".encode("utf-8")
+                ).hexdigest()
+                if review_profile
+                else raw_item_key
+            )
+            mr_item_key = (
+                hashlib.sha256(
+                    f"{review_profile}\0{MR_MANUAL_REVIEW_KEY}".encode("utf-8")
+                ).hexdigest()
+                if review_profile
+                else MR_MANUAL_REVIEW_KEY
+            )
             decision = decisions.get(
                 (project_id, mr_iid, head_sha, item_key)
+            ) or decisions.get(
+                (project_id, mr_iid, head_sha, mr_item_key)
+            ) or decisions.get(
+                (project_id, mr_iid, head_sha, raw_item_key)
             ) or decisions.get(
                 (project_id, mr_iid, head_sha, MR_MANUAL_REVIEW_KEY)
             )
@@ -423,6 +428,8 @@ def collect_security_findings(
             findings.append(
                 {
                     **finding,
+                    "item_key": item_key,
+                    "review_profile": review_profile,
                     "severity": severity,
                     "project_id": project_id,
                     "project_path": project_path,
@@ -453,6 +460,7 @@ def completed_review_entries(
     decisions = manual_reviews or {}
     entries: list[dict[str, Any]] = []
     for review in reviews:
+        review_profile = str(review.get("review_profile", ""))
         report = str(review["report_content"] or "")
         summary = report_section(report, "Summary") or "Security review completed."
         overall_rationale = report_section(report, "Overall severity rationale")
@@ -475,9 +483,25 @@ def completed_review_entries(
             "summary": summary,
             "diff_content": str(review["diff_content"] or ""),
             "reviewed_at": str(review["reviewed_at"]),
+            "review_profile": review_profile,
+            "llm_model": str(review.get("llm_model", "")),
         }
+        mr_item_key = (
+            hashlib.sha256(
+                f"{review_profile}\0{MR_MANUAL_REVIEW_KEY}".encode("utf-8")
+            ).hexdigest()
+            if review_profile
+            else MR_MANUAL_REVIEW_KEY
+        )
         if not findings:
             decision = decisions.get(
+                (
+                    int(review["project_id"]),
+                    mr_iid,
+                    str(review["head_sha"]),
+                    mr_item_key,
+                )
+            ) or decisions.get(
                 (
                     int(review["project_id"]),
                     mr_iid,
@@ -508,7 +532,7 @@ def completed_review_entries(
                         if severity != "SAFE"
                         else overall_rationale or SEVERITY_EXPLANATIONS["SAFE"]
                     ),
-                    "item_key": MR_MANUAL_REVIEW_KEY,
+                    "item_key": mr_item_key,
                     "manual_status": workflow_status,
                     "manual_resolution": resolution,
                     "manual_severity": str(decision["severity"] or "") if decision else "",
@@ -517,13 +541,34 @@ def completed_review_entries(
             )
             continue
         for finding in findings:
-            item_key = str(finding["item_key"])
+            raw_item_key = str(finding["item_key"])
+            item_key = (
+                hashlib.sha256(
+                    f"{review_profile}\0{raw_item_key}".encode("utf-8")
+                ).hexdigest()
+                if review_profile
+                else raw_item_key
+            )
             decision = decisions.get(
                 (
                     int(review["project_id"]),
                     mr_iid,
                     str(review["head_sha"]),
                     item_key,
+                )
+            ) or decisions.get(
+                (
+                    int(review["project_id"]),
+                    mr_iid,
+                    str(review["head_sha"]),
+                    mr_item_key,
+                )
+            ) or decisions.get(
+                (
+                    int(review["project_id"]),
+                    mr_iid,
+                    str(review["head_sha"]),
+                    raw_item_key,
                 )
             ) or decisions.get(
                 (
@@ -716,6 +761,18 @@ class Credentials:
     llm_api_url: str = ""
     llm_model: str = ""
     gitlab_group_path: str = ""
+    openai_api_key: str = ""
+    openai_model: str = ""
+    copilot_api_key: str = ""
+    copilot_anthropic_model: str = "claude-sonnet-5"
+    copilot_openai_model: str = "gpt-5.4"
+
+    def comparison_ready(self) -> bool:
+        return bool(
+            self.llm_api_key.strip()
+            and self.openai_api_key.strip()
+            and self.copilot_api_key.strip()
+        )
 
 
 def credential_key(password: str, salt: bytes) -> bytes:
@@ -734,6 +791,13 @@ def credential_payload(credentials: Credentials) -> bytes:
             "llm_api_url": credentials.llm_api_url,
             "llm_model": credentials.llm_model,
             "gitlab_group_path": credentials.gitlab_group_path,
+            "anthropic_api_key": credentials.llm_api_key,
+            "anthropic_model": credentials.llm_model,
+            "openai_api_key": credentials.openai_api_key,
+            "openai_model": credentials.openai_model,
+            "copilot_api_key": credentials.copilot_api_key,
+            "copilot_anthropic_model": credentials.copilot_anthropic_model,
+            "copilot_openai_model": credentials.copilot_openai_model,
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -764,17 +828,39 @@ def decrypt_credentials_with_key(
         ciphertext = bytes.fromhex(ciphertext_hex)
         plaintext = AESGCM(key).decrypt(nonce, ciphertext, VAULT_ASSOCIATED_DATA)
         payload = json.loads(plaintext)
+        legacy_provider = str(payload.get("llm_provider", "anthropic"))
+        legacy_key = str(
+            payload.get("llm_api_key", payload.get("anthropic_api_key", ""))
+        )
+        legacy_model = str(payload.get("llm_model", ""))
+        anthropic_key = str(payload.get("anthropic_api_key", ""))
+        anthropic_model = str(payload.get("anthropic_model", ""))
+        openai_key = str(payload.get("openai_api_key", ""))
+        openai_model = str(payload.get("openai_model", ""))
+        if not anthropic_key and legacy_provider == "anthropic":
+            anthropic_key = legacy_key
+            anthropic_model = anthropic_model or legacy_model
+        if not openai_key and legacy_provider == "openai":
+            openai_key = legacy_key
+            openai_model = openai_model or legacy_model
         credentials = Credentials(
             gitlab_url=str(payload["gitlab_url"]),
             gitlab_token=str(payload["gitlab_token"]),
-            llm_api_key=str(
-                payload.get("llm_api_key", payload.get("anthropic_api_key", ""))
-            ),
-            llm_provider=str(payload.get("llm_provider", "anthropic")),
+            llm_api_key=anthropic_key,
+            llm_provider="anthropic",
             llm_api_url=str(payload.get("llm_api_url", "")),
-            llm_model=str(payload.get("llm_model", "")),
+            llm_model=anthropic_model,
             gitlab_group_path=normalize_gitlab_group_path(
                 str(payload.get("gitlab_group_path", ""))
+            ),
+            openai_api_key=openai_key,
+            openai_model=openai_model,
+            copilot_api_key=str(payload.get("copilot_api_key", "")),
+            copilot_anthropic_model=str(
+                payload.get("copilot_anthropic_model", "claude-sonnet-5")
+            ),
+            copilot_openai_model=str(
+                payload.get("copilot_openai_model", "gpt-5.4")
             ),
         )
     except (ValueError, KeyError, TypeError, json.JSONDecodeError, InvalidTag) as exc:
@@ -796,6 +882,105 @@ def decrypt_credentials(
     return decrypt_credentials_with_key(
         nonce_hex, ciphertext_hex, credential_key(password, salt)
     )
+
+
+def review_row_for_profile(
+    row: Mapping[str, Any], profile: str
+) -> dict[str, Any] | None:
+    """Project one stored MR revision into a single comparison profile."""
+    try:
+        comparison = json.loads(str(row["comparison_json"] or "{}"))
+    except (KeyError, TypeError, json.JSONDecodeError):
+        comparison = {}
+    if isinstance(comparison, dict) and isinstance(comparison.get(profile), dict):
+        result = comparison[profile]
+        projected = dict(row)
+        projected.update(
+            {
+                "status": str(result.get("status", "failed")),
+                "report_content": str(result.get("report_content", "")),
+                "metadata_json": json.dumps(result.get("metadata", {}), sort_keys=True),
+                "review_profile": profile,
+                "llm_provider": str(result.get("provider", "")),
+                "llm_model": str(result.get("model", "")),
+            }
+        )
+        return projected
+    try:
+        metadata = json.loads(str(row["metadata_json"] or "{}"))
+    except (KeyError, TypeError, json.JSONDecodeError):
+        metadata = {}
+    legacy_provider = str(metadata.get("llm_provider", "anthropic"))
+    legacy_profile = legacy_provider if legacy_provider in {"anthropic", "openai"} else ""
+    if legacy_profile != profile or not str(row["report_content"] or ""):
+        return None
+    projected = dict(row)
+    projected.update(
+        {
+            "review_profile": profile,
+            "llm_provider": legacy_provider,
+            "llm_model": str(metadata.get("llm_model", "")),
+        }
+    )
+    return projected
+
+
+def profile_usage_summary(
+    reports: Iterable[Mapping[str, Any]], profile: str
+) -> dict[str, Any]:
+    """Summarize comparable operational metrics without inventing provider prices."""
+    review_count = 0
+    durations: list[float] = []
+    input_tokens = 0
+    output_tokens = 0
+    reported_usd = 0.0
+    has_reported_usd = False
+    premium_requests = 0.0
+    has_premium_requests = False
+    for report in reports:
+        try:
+            metadata = json.loads(str(report.get("metadata_json", "{}") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        review_count += 1
+        elapsed = metadata.get("elapsed_ms") or metadata.get("llm_duration_ms")
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+            durations.append(float(elapsed))
+        cost = metadata.get("llm_cost_usd")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            reported_usd += float(cost)
+            has_reported_usd = True
+        usage = metadata.get("llm_usage")
+        if not isinstance(usage, dict):
+            continue
+        raw_input = usage.get("input_tokens", usage.get("lastCallInputTokens"))
+        raw_output = usage.get("output_tokens", usage.get("lastCallOutputTokens"))
+        if isinstance(raw_input, int) and not isinstance(raw_input, bool):
+            input_tokens += raw_input
+        if isinstance(raw_output, int) and not isinstance(raw_output, bool):
+            output_tokens += raw_output
+        raw_premium = usage.get("totalPremiumRequestCost")
+        if isinstance(raw_premium, (int, float)) and not isinstance(raw_premium, bool):
+            premium_requests += float(raw_premium)
+            has_premium_requests = True
+    average_ms = sum(durations) / len(durations) if durations else None
+    if profile.startswith("copilot_"):
+        cost_display = (
+            f"{premium_requests:,.2f} premium requests"
+            if has_premium_requests
+            else "Not reported"
+        )
+    else:
+        cost_display = f"${reported_usd:,.4f}" if has_reported_usd else "Provider billing"
+    return {
+        "reviews": review_count,
+        "average_ms": average_ms,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_display": cost_display,
+    }
 
 
 class MemoryVault:
@@ -898,6 +1083,12 @@ def validated_credentials(
     llm_api_url: str = "",
     llm_model: str = "",
     gitlab_group_path: str = "",
+    *,
+    openai_api_key: str = "",
+    openai_model: str = "",
+    copilot_api_key: str = "",
+    copilot_anthropic_model: str = "claude-sonnet-5",
+    copilot_openai_model: str = "gpt-5.4",
 ) -> Credentials:
     url = gitlab_url.strip().rstrip("/")
     parsed = urllib.parse.urlparse(url)
@@ -912,6 +1103,13 @@ def validated_credentials(
         raise ReviewError("GitLab token is missing or has an invalid length.")
     if llm_provider not in LLM_PROVIDERS:
         raise ReviewError("Select a supported LLM provider.")
+    if llm_provider == "openai" and llm_api_key and not openai_api_key:
+        openai_api_key, openai_model, llm_api_key = (
+            llm_api_key,
+            openai_model or llm_model,
+            "",
+        )
+        llm_model = LLM_DEFAULT_MODELS["anthropic"]
     if llm_api_key and not 8 <= len(llm_api_key) <= 4096:
         raise ReviewError("LLM API key has an invalid length.")
     if llm_model and len(llm_model) > 256:
@@ -934,14 +1132,33 @@ def validated_credentials(
         llm_api_url = ""
     if len(llm_api_url) > 2048:
         raise ReviewError("Custom LLM API URL is too long.")
+    openai_api_key = openai_api_key.strip()
+    copilot_api_key = copilot_api_key.strip()
+    openai_model = openai_model.strip() or LLM_DEFAULT_MODELS["openai"]
+    copilot_anthropic_model = copilot_anthropic_model.strip() or "claude-sonnet-5"
+    copilot_openai_model = copilot_openai_model.strip() or "gpt-5.4"
+    for label, secret in (
+        ("OpenAI API key", openai_api_key),
+        ("GitHub Copilot token", copilot_api_key),
+    ):
+        if secret and not 8 <= len(secret) <= 4096:
+            raise ReviewError(f"{label} has an invalid length.")
+    for model in (openai_model, copilot_anthropic_model, copilot_openai_model):
+        if len(model) > 256:
+            raise ReviewError("LLM model name is too long.")
     return Credentials(
         gitlab_url=url,
         gitlab_token=gitlab_token,
         llm_api_key=llm_api_key,
-        llm_provider=llm_provider,
+        llm_provider="anthropic",
         llm_api_url=llm_api_url,
         llm_model=llm_model,
         gitlab_group_path=normalize_gitlab_group_path(gitlab_group_path),
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+        copilot_api_key=copilot_api_key,
+        copilot_anthropic_model=copilot_anthropic_model,
+        copilot_openai_model=copilot_openai_model,
     )
 
 
@@ -1035,9 +1252,10 @@ class WebStore:
                     status TEXT NOT NULL,
                     report_path TEXT,
                     report_content TEXT,
-                    diff_content TEXT,
-                    metadata_json TEXT,
-                    discovered_at TEXT NOT NULL,
+                diff_content TEXT,
+                metadata_json TEXT,
+                comparison_json TEXT NOT NULL DEFAULT '{}',
+                discovered_at TEXT NOT NULL,
                     mr_created_at TEXT NOT NULL,
                     reviewed_at TEXT NOT NULL,
                     PRIMARY KEY (project_id, mr_iid, head_sha)
@@ -1053,6 +1271,10 @@ class WebStore:
                 connection.execute("ALTER TABLE reviews ADD COLUMN diff_content TEXT")
             if "metadata_json" not in review_columns:
                 connection.execute("ALTER TABLE reviews ADD COLUMN metadata_json TEXT")
+            if "comparison_json" not in review_columns:
+                connection.execute(
+                    "ALTER TABLE reviews ADD COLUMN comparison_json TEXT NOT NULL DEFAULT '{}'"
+                )
             if "discovered_at" not in review_columns:
                 connection.execute("ALTER TABLE reviews ADD COLUMN discovered_at TEXT")
                 connection.execute(
@@ -1572,15 +1794,17 @@ class WebStore:
             return cursor.rowcount == 1
 
     def latest_review_reports(
-        self, start: datetime, end: datetime
-    ) -> list[sqlite3.Row]:
+        self, start: datetime, end: datetime, review_profile: str = "anthropic"
+    ) -> list[dict[str, Any]]:
         with self.connect() as connection:
-            return connection.execute(
+            rows = connection.execute(
                 """
                 WITH ranked AS (
                     SELECT reviews.project_id, reviews.project_path,
                            reviews.mr_iid, reviews.head_sha, reviews.status,
                            reviews.report_content, reviews.reviewed_at,
+                           reviews.diff_content, reviews.metadata_json,
+                           reviews.comparison_json,
                            projects.web_url AS project_web_url,
                            ROW_NUMBER() OVER (
                                PARTITION BY reviews.project_id, reviews.mr_iid
@@ -1591,26 +1815,35 @@ class WebStore:
                       ON projects.project_id = reviews.project_id
                     WHERE COALESCE(NULLIF(reviews.mr_created_at, ''), reviews.discovered_at) >= ?
                       AND COALESCE(NULLIF(reviews.mr_created_at, ''), reviews.discovered_at) < ?
-                      AND reviews.report_content IS NOT NULL
-                      AND reviews.report_content != ''
+                      AND (
+                          (reviews.report_content IS NOT NULL AND reviews.report_content != '')
+                          OR reviews.comparison_json != '{}'
+                      )
                 )
                 SELECT project_id, project_path, mr_iid, head_sha, status,
-                       report_content, reviewed_at, project_web_url
+                       report_content, diff_content, metadata_json, comparison_json,
+                       reviewed_at, project_web_url
                 FROM ranked
                 WHERE revision_rank = 1
                 """,
                 (start.isoformat(), end.isoformat()),
             ).fetchall()
+        return [
+            projected
+            for row in rows
+            if (projected := review_row_for_profile(row, review_profile)) is not None
+        ]
 
-    def completed_reviews(self) -> list[sqlite3.Row]:
+    def completed_reviews(self, review_profile: str = "anthropic") -> list[dict[str, Any]]:
         with self.connect() as connection:
-            return connection.execute(
+            rows = connection.execute(
                 """
                 WITH ranked AS (
                     SELECT reviews.project_id, reviews.project_path,
                            reviews.mr_iid, reviews.head_sha, reviews.status,
                            reviews.report_content, reviews.diff_content,
                            reviews.metadata_json, reviews.reviewed_at,
+                           reviews.comparison_json,
                            projects.web_url AS project_web_url,
                            ROW_NUMBER() OVER (
                                PARTITION BY reviews.project_id, reviews.mr_iid
@@ -1619,18 +1852,30 @@ class WebStore:
                     FROM reviews
                     LEFT JOIN visible_projects AS projects
                       ON projects.project_id = reviews.project_id
-                    WHERE reviews.status IN ('completed', 'high_severity')
-                      AND reviews.report_content IS NOT NULL
-                      AND reviews.report_content != ''
+                    WHERE reviews.status IN ('completed', 'high_severity', 'failed')
+                      AND (
+                          (reviews.report_content IS NOT NULL AND reviews.report_content != '')
+                          OR reviews.comparison_json != '{}'
+                      )
                 )
                 SELECT project_id, project_path, mr_iid, head_sha, status,
-                       report_content, diff_content, metadata_json, reviewed_at,
+                       report_content, diff_content, metadata_json, comparison_json, reviewed_at,
                        project_web_url
                 FROM ranked
                 WHERE revision_rank = 1
                 ORDER BY reviewed_at DESC, project_path COLLATE NOCASE, mr_iid DESC
                 """
             ).fetchall()
+        projected = [
+            result
+            for row in rows
+            if (result := review_row_for_profile(row, review_profile)) is not None
+        ]
+        return [
+            row
+            for row in projected
+            if str(row["status"]) in {"completed", "high_severity"}
+        ]
 
     def mr_activity(self, period: str) -> tuple[int, list[sqlite3.Row]]:
         durations = {
@@ -1666,7 +1911,7 @@ class WebStore:
             return connection.execute(
                 """
                 SELECT project_path, mr_iid, head_sha, status, report_path, reviewed_at
-                       , report_content, metadata_json
+                       , report_content, metadata_json, comparison_json
                 FROM reviews WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
                 """,
                 (project_id, mr_iid, head_sha),
@@ -1679,8 +1924,9 @@ STYLE = """
 .severity-safe{background:var(--green-soft);color:var(--green)}.severity-filter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}.severity-filter .button{padding:8px 12px}.expandable-row{cursor:pointer}.expandable-row:focus{outline:3px solid #bed4ff;outline-offset:-3px}.row-toggle,.manual-review-button{padding:7px 10px;font-size:13px;white-space:nowrap}.review-state{font-weight:800}.review-state-open{color:var(--blue-dark)}.review-state-in_progress{color:var(--amber)}.review-state-done{color:var(--green)}.expanded-review td{padding:0 11px 18px;background:#f8fafc}.review-details{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px}.review-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}.review-section{border:1px solid var(--line);border-radius:10px;padding:16px}.review-section+.review-section{margin-top:16px}.review-section h3{font-size:14px;margin:0 0 8px}.review-copy{white-space:pre-wrap;margin:0;color:var(--ink)}.diff-view{max-height:520px;overflow:auto;margin:8px 0 0;padding:8px 0;background:#fff;color:#344054;border:1px solid #d0d5dd;border-radius:10px;font-size:12px;line-height:1.55;white-space:pre}.diff-view code{display:block;min-width:max-content}.diff-line{display:block;padding:0 14px;min-height:1.55em}.diff-context{color:#344054}.diff-add{color:#067647;background:#ecfdf3}.diff-delete{color:#b42318;background:#fff1f0}.diff-hunk{color:#175cd3;background:#eff8ff}.diff-meta{color:#6941c6;background:#f9f5ff;font-weight:650}.historical-note{color:var(--muted);font-style:italic}.review-meta{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-top:14px}.inline-commit-summary{margin:0 0 12px;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:#f8fafc;color:var(--muted)}.commit-summary-list{display:grid;gap:8px}.commit-summary-item{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}.commit-message{font-weight:750;color:var(--ink);white-space:pre-wrap}.commit-author{font-size:13px;color:var(--muted)}.manual-review-dialog{width:min(620px,calc(100vw - 32px));border:0;border-radius:16px;padding:24px;box-shadow:0 24px 80px rgba(17,24,39,.28)}.manual-review-dialog::backdrop{background:rgba(15,23,42,.55)}.dialog-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:20px}.dialog-heading h2{margin:0}.manual-review-dialog fieldset{display:flex;gap:18px;border:1px solid var(--line);border-radius:10px;margin:18px 0;padding:14px}.manual-review-dialog legend{font-weight:750;padding:0 6px}.manual-review-dialog textarea{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;font:inherit;resize:vertical}.manual-decision{margin-top:12px;padding:12px;border-radius:9px;background:#f8fafc;border:1px solid var(--line)}
 .grid+.table-wrap{margin-top:22px}
 .table-controls{display:flex;justify-content:flex-end;margin:22px 0 10px}
+.model-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 18px;border-bottom:1px solid var(--line)}.model-tab{display:inline-flex;padding:10px 14px;color:var(--muted);font-weight:750;text-decoration:none;border-bottom:3px solid transparent;margin-bottom:-1px}.model-tab:hover{color:var(--blue)}.model-tab[aria-selected=true]{color:var(--blue-dark);border-bottom-color:var(--blue)}.comparison-summary{display:grid;grid-template-columns:minmax(180px,1.5fr) repeat(5,minmax(110px,1fr));gap:10px;margin:0 0 18px}.comparison-model,.comparison-stat{padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#f8fafc;min-width:0}.comparison-model span,.comparison-stat span{display:block;color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.04em}.comparison-model strong,.comparison-stat strong{display:block;margin-top:5px;overflow-wrap:anywhere}.comparison-stat strong{font-size:16px}
 @media(max-width:900px){.app-shell{grid-template-columns:1fr}.sidebar{position:relative;height:auto;padding:14px 18px}.brand{padding:0 4px 14px}.side-nav{display:flex;overflow:auto;padding:12px 0 0}.side-nav a{white-space:nowrap}.sidebar-footer{display:flex;align-items:center;gap:14px;margin:12px 0 0;padding:12px 4px 0}.service-state{margin:0;margin-right:auto}.user-row{margin:0}.signout{width:auto}.app-main{padding:26px 20px 56px}.page-header{margin-bottom:22px}}
-@media(max-width:680px){.grid,.form-grid,.review-detail-grid{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination,.page-header,.section-heading{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}.page-header h1{font-size:28px}.app-main{padding:22px 14px 48px}.card{padding:18px}.sidebar-footer{align-items:stretch;flex-wrap:wrap}.service-state{width:100%}.table-wrap{overflow:auto}}
+@media(max-width:1100px){.comparison-summary{grid-template-columns:repeat(3,minmax(140px,1fr))}}@media(max-width:680px){.grid,.form-grid,.review-detail-grid,.comparison-summary{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination,.page-header,.section-heading{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}.page-header h1{font-size:28px}.app-main{padding:22px 14px 48px}.card{padding:18px}.sidebar-footer{align-items:stretch;flex-wrap:wrap}.service-state{width:100%}.table-wrap{overflow:auto}}
 """
 
 
@@ -2102,9 +2348,9 @@ def handler_factory(
             store.save_encrypted_credentials(credentials, salt, encryption_key)
             vault.set(credentials)
             message = (
-                "Credentials saved; GitLab discovery and LLM reviews are active."
-                if credentials.llm_api_key
-                else "GitLab access saved; MR discovery is active. Add an LLM API key later to review queued MRs."
+                "Credentials saved; four-model comparison reviews are active."
+                if credentials.comparison_ready()
+                else "Credentials saved; MR discovery is active. Add all three model credentials to start four-model reviews."
             )
             self.redirect("/settings?message=" + urllib.parse.quote(message))
 
@@ -2131,15 +2377,36 @@ def handler_factory(
             review = store.report(project_id, mr_iid, head_sha)
             if review is None:
                 raise ReviewError("The merge-request revision no longer exists.")
-            if item_key != MR_MANUAL_REVIEW_KEY:
-                valid_keys = {
-                    finding["item_key"]
-                    for finding in parse_security_findings(
-                        str(review["report_content"] or "")
+            valid_keys = {MR_MANUAL_REVIEW_KEY}
+            valid_keys.update(
+                finding["item_key"]
+                for finding in parse_security_findings(
+                    str(review["report_content"] or "")
+                )
+            )
+            try:
+                comparison = json.loads(str(review["comparison_json"] or "{}"))
+            except (KeyError, TypeError, json.JSONDecodeError):
+                comparison = {}
+            if isinstance(comparison, dict):
+                for profile, result in comparison.items():
+                    if not isinstance(result, dict):
+                        continue
+                    valid_keys.add(
+                        hashlib.sha256(
+                            f"{profile}\0{MR_MANUAL_REVIEW_KEY}".encode("utf-8")
+                        ).hexdigest()
                     )
-                }
-                if item_key not in valid_keys:
-                    raise ReviewError("The security finding no longer exists.")
+                    for finding in parse_security_findings(
+                        str(result.get("report_content", ""))
+                    ):
+                        valid_keys.add(
+                            hashlib.sha256(
+                                f"{profile}\0{finding['item_key']}".encode("utf-8")
+                            ).hexdigest()
+                        )
+            if item_key not in valid_keys:
+                raise ReviewError("The design-review item no longer exists.")
 
             workflow_status = form.get("workflow_status", "").strip()
             if workflow_status not in MANUAL_REVIEW_STATUSES:
@@ -2198,21 +2465,33 @@ def handler_factory(
         ) -> Credentials:
             submitted_gitlab_url = form.get("gitlab_url", "").strip()
             submitted_gitlab_token = form.get("gitlab_token", "").strip()
-            submitted_provider = form.get("llm_provider", "anthropic").strip().lower()
-            submitted_llm_key = form.get("llm_api_key", "").strip()
-            retained_llm_key = (
-                existing.llm_api_key
-                if submitted_provider == existing.llm_provider
-                else ""
-            )
             return validated_credentials(
                 submitted_gitlab_url or existing.gitlab_url,
                 submitted_gitlab_token or existing.gitlab_token,
-                submitted_llm_key or retained_llm_key,
-                submitted_provider,
-                form.get("llm_api_url", "").strip(),
-                form.get("llm_model", "").strip(),
+                form.get("anthropic_api_key", "").strip() or existing.llm_api_key,
+                "anthropic",
+                "",
+                form.get("anthropic_model", "").strip() or existing.llm_model,
                 gitlab_group_path=form.get("gitlab_group_path", "").strip(),
+                openai_api_key=(
+                    form.get("openai_api_key", "").strip()
+                    or existing.openai_api_key
+                ),
+                openai_model=(
+                    form.get("openai_model", "").strip() or existing.openai_model
+                ),
+                copilot_api_key=(
+                    form.get("copilot_api_key", "").strip()
+                    or existing.copilot_api_key
+                ),
+                copilot_anthropic_model=(
+                    form.get("copilot_anthropic_model", "").strip()
+                    or existing.copilot_anthropic_model
+                ),
+                copilot_openai_model=(
+                    form.get("copilot_openai_model", "").strip()
+                    or existing.copilot_openai_model
+                ),
             )
 
         def test_gitlab_credentials(self, form: dict[str, str]) -> None:
@@ -2245,22 +2524,32 @@ def handler_factory(
                 raise ReviewError("Invalid form token.")
             existing, _, _ = self.credential_context()
             credentials = self.merged_credentials(form, existing)
-            config = Config.from_credentials(
-                credentials.gitlab_url,
-                credentials.gitlab_token,
-                credentials.llm_api_key,
-                store.settings(),
-                llm_provider=credentials.llm_provider,
-                llm_api_url=credentials.llm_api_url,
-                llm_model=credentials.llm_model,
-                gitlab_group_path=credentials.gitlab_group_path,
+            if not credentials.comparison_ready():
+                raise ReviewError(
+                    "Save the Anthropic key, OpenAI key, and GitHub Copilot token before testing all models."
+                )
+            configs = (
+                ("Anthropic", "anthropic", credentials.llm_api_key, credentials.llm_model),
+                ("OpenAI", "openai", credentials.openai_api_key, credentials.openai_model),
+                ("Copilot · Anthropic", "copilot", credentials.copilot_api_key, credentials.copilot_anthropic_model),
+                ("Copilot · OpenAI", "copilot", credentials.copilot_api_key, credentials.copilot_openai_model),
             )
-            test_llm_connection(config)
-            provider_label = LLM_PROVIDER_LABELS[credentials.llm_provider]
+            for profile, provider, key, model in configs:
+                config = Config.from_credentials(
+                    credentials.gitlab_url,
+                    credentials.gitlab_token,
+                    key,
+                    store.settings(),
+                    llm_provider=provider,
+                    llm_model=model,
+                    gitlab_group_path=credentials.gitlab_group_path,
+                    review_profile=profile,
+                )
+                test_llm_connection(config)
             self.redirect(
                 "/settings?message="
                 + urllib.parse.quote(
-                    f"LLM connection test succeeded with {provider_label} using the {config.llm_model} model."
+                    "All four model connection tests succeeded."
                 )
             )
 
@@ -2275,28 +2564,21 @@ def handler_factory(
                 return
             try:
                 existing, _, _ = self.credential_context()
-                provider = form.get("llm_provider", "anthropic").strip().lower()
-                submitted_key = form.get("llm_api_key", "").strip()
-                api_key = submitted_key or (
-                    existing.llm_api_key if provider == existing.llm_provider else ""
-                )
-                submitted_url = form.get("llm_api_url", "").strip()
-                api_url = submitted_url or (
-                    existing.llm_api_url if provider == existing.llm_provider else ""
-                )
-                validated = validated_credentials(
-                    "https://model-discovery.invalid",
-                    "model-discovery-token",
-                    api_key,
-                    provider,
-                    api_url,
-                    "model-discovery",
-                )
-                models = list_llm_models(
-                    validated.llm_provider,
-                    validated.llm_api_key,
-                    validated.llm_api_url,
-                )
+                provider = form.get("model_provider", "").strip().lower()
+                key_field = {
+                    "anthropic": "anthropic_api_key",
+                    "openai": "openai_api_key",
+                    "copilot": "copilot_api_key",
+                }.get(provider)
+                if key_field is None:
+                    raise ReviewError("Select a supported model provider.")
+                stored_key = {
+                    "anthropic": existing.llm_api_key,
+                    "openai": existing.openai_api_key,
+                    "copilot": existing.copilot_api_key,
+                }[provider]
+                api_key = form.get(key_field, "").strip() or stored_key
+                models = list_llm_models(provider, api_key)
             except ReviewError as exc:
                 self.send_json(400, {"error": str(exc)})
                 return
@@ -2312,7 +2594,7 @@ def handler_factory(
             if running and active_credentials is not None:
                 return (
                     "Reviews active"
-                    if active_credentials.llm_api_key
+                    if active_credentials.comparison_ready()
                     else "GitLab discovery active",
                     "completed",
                 )
@@ -2422,6 +2704,47 @@ def handler_factory(
             <div><label for='activity_end_date'>End date (UTC)</label><input id='activity_end_date' name='end_date' type='date' value='{html.escape(str(context['end_date']))}' max='{maximum_date}' required></div>
             <button class='secondary' type='submit'>Apply range</button></form></div>"""
 
+        def model_tabs(
+            self,
+            action: str,
+            active_profile: str,
+            query: Mapping[str, Any],
+        ) -> str:
+            tabs = "".join(
+                f"<a class='model-tab' role='tab' aria-selected='{'true' if profile == active_profile else 'false'}' "
+                f"href='{html.escape(action + '?' + urllib.parse.urlencode({**dict(query), 'profile': profile, 'page': 1}))}'>"
+                f"{html.escape(COMPARISON_PROFILE_LABELS[profile])}</a>"
+                for profile in COMPARISON_PROFILES
+            )
+            return f"<nav class='model-tabs' role='tablist' aria-label='Review model'>{tabs}</nav>"
+
+        def usage_tiles(
+            self, reports: Iterable[Mapping[str, Any]], profile: str
+        ) -> str:
+            report_list = list(reports)
+            summary = profile_usage_summary(report_list, profile)
+            model = (
+                str(report_list[0].get("llm_model", ""))
+                if report_list
+                else ""
+            )
+            average_ms = summary["average_ms"]
+            average_display = (
+                f"{float(average_ms) / 1000:,.1f} s"
+                if average_ms is not None
+                else "Not reported"
+            )
+            model_text = html.escape(model or "No completed reviews")
+            return f"""
+            <div class='comparison-summary' aria-label='Selected model performance and cost'>
+              <div class='comparison-model'><span>Selected model</span><strong>{model_text}</strong></div>
+              <div class='comparison-stat'><span>Reviews</span><strong>{int(summary['reviews']):,}</strong></div>
+              <div class='comparison-stat'><span>Average runtime</span><strong>{html.escape(average_display)}</strong></div>
+              <div class='comparison-stat'><span>Input tokens</span><strong>{int(summary['input_tokens']):,}</strong></div>
+              <div class='comparison-stat'><span>Output tokens</span><strong>{int(summary['output_tokens']):,}</strong></div>
+              <div class='comparison-stat'><span>Reported cost</span><strong>{html.escape(str(summary['cost_display']))}</strong></div>
+            </div>"""
+
         def findings_rows(
             self, findings: list[dict[str, Any]], return_to: str
         ) -> str:
@@ -2464,10 +2787,9 @@ def handler_factory(
                     "<p class='error'>GitLab access is not configured. "
                     "<a href='/settings'>Open Settings</a> to start MR discovery.</p>"
                 )
-            if not active_credentials.llm_api_key:
+            if not active_credentials.comparison_ready():
                 return ""
-            provider = html.escape(LLM_PROVIDER_LABELS[active_credentials.llm_provider])
-            return f"<p class='notice'>GitLab discovery and {provider} security reviews are active.</p>"
+            return "<p class='notice'>GitLab discovery and four-model comparison reviews are active.</p>"
 
         def gitlab_connection_status(self) -> tuple[str, str]:
             scan_status = store.scan_status()
@@ -2489,14 +2811,15 @@ def handler_factory(
                 return
             _, user = session
             context = self.activity_window(query)
+            selected_profile = query.get("profile", ["anthropic"])[0]
+            if selected_profile not in COMPARISON_PROFILES:
+                selected_profile = "anthropic"
             counts, _ = store.dashboard()
             manual_reviews = store.manual_review_map()
-            findings, _ = collect_security_findings(
-                store.latest_review_reports(
-                    context["activity_start"], context["activity_end"]
-                ),
-                manual_reviews,
+            profile_reports = store.latest_review_reports(
+                context["activity_start"], context["activity_end"], selected_profile
             )
+            findings, _ = collect_security_findings(profile_reports, manual_reviews)
             findings = [
                 finding
                 for finding in findings
@@ -2517,8 +2840,10 @@ def handler_factory(
               <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
               <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div>
             </div></section>
-            <section class='card'><div class='section-heading'><div><h2>High-severity findings</h2><p class='sub'>Critical and High findings from the latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
-            {self.filter_controls(context, '/')}
+            <section class='card'><div class='section-heading'><div><h2>High-severity findings</h2><p class='sub'>Critical and High findings from {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} for the latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
+            {self.model_tabs('/', selected_profile, context['activity_query'])}
+            {self.usage_tiles(profile_reports, selected_profile)}
+            {self.filter_controls(context, '/', {'profile': selected_profile})}
             <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th><th>Manual review</th></tr></thead><tbody>{self.findings_rows(findings, self.path)}</tbody></table></div></section>
             {manual_review_dialog(str(user['csrf_token']))}<script src='/app.js' defer></script>"""
             connection_status = self.gitlab_connection_status()
@@ -2541,7 +2866,10 @@ def handler_factory(
             if session is None:
                 return
             _, user = session
-            reviews = store.completed_reviews()
+            selected_profile = query.get("profile", ["anthropic"])[0]
+            if selected_profile not in COMPARISON_PROFILES:
+                selected_profile = "anthropic"
+            reviews = store.completed_reviews(selected_profile)
             manual_reviews = store.manual_review_map()
             entries = completed_review_entries(reviews, manual_reviews)
             selected_severity = query.get("severity", ["all"])[0].lower()
@@ -2584,7 +2912,7 @@ def handler_factory(
             }
             filter_links = "".join(
                 f"<a class='button {'primary' if value == selected_severity else 'secondary'}' "
-                f"href='/completed?{urllib.parse.urlencode({'severity': value, 'manual_status': selected_status})}'>{label} ({len(entries) if value == 'all' else severity_counts[value]})</a>"
+                f"href='/completed?{urllib.parse.urlencode({'profile': selected_profile, 'severity': value, 'manual_status': selected_status})}'>{label} ({len(entries) if value == 'all' else severity_counts[value]})</a>"
                 for value, label in (
                     ("all", "All"),
                     ("critical", "Critical"),
@@ -2602,7 +2930,7 @@ def handler_factory(
             }
             status_filter_links = "".join(
                 f"<a class='button {'primary' if value == selected_status else 'secondary'}' "
-                f"href='/completed?{urllib.parse.urlencode({'severity': selected_severity, 'manual_status': value})}'>{label} ({len(entries) if value == 'all' else status_counts[value]})</a>"
+                f"href='/completed?{urllib.parse.urlencode({'profile': selected_profile, 'severity': selected_severity, 'manual_status': value})}'>{label} ({len(entries) if value == 'all' else status_counts[value]})</a>"
                 for value, label in (
                     ("all", "All statuses"),
                     ("open", "Open"),
@@ -2634,6 +2962,7 @@ def handler_factory(
                         "project_id": int(entry["project_id"]),
                         "mr_iid": int(entry["mr_iid"]),
                         "sha": str(entry["head_sha"]),
+                        "profile": selected_profile,
                     }
                 )
                 evidence_heading = "Review result" if severity == "SAFE" else "Finding evidence"
@@ -2700,7 +3029,7 @@ def handler_factory(
             table_rows = "".join(rows) or (
                 "<tr><td class='empty-state' colspan='5'>No completed reviews match these filters.</td></tr>"
             )
-            page_query = {"severity": selected_severity, "manual_status": selected_status}
+            page_query = {"profile": selected_profile, "severity": selected_severity, "manual_status": selected_status}
             previous_page = (
                 f"<a class='button secondary' href='/completed?{urllib.parse.urlencode({**page_query, 'page': page_number - 1})}'>Previous</a>"
                 if page_number > 1
@@ -2719,7 +3048,9 @@ def handler_factory(
                 result_range = "No review results to display"
             pagination = f"<div class='pagination'><p class='sub'>{result_range}</p><div class='actions'>{previous_page}<span>Page {page_number} of {page_count}</span>{next_page}</div></div>"
             body = f"""
-            <section class='card'><div class='section-heading'><div><h2>Completed review results</h2><p class='sub'>Latest completed revision of every reviewed MR, including reviews with no findings. Select a row to inspect the evidence.</p></div><span class='severity severity-safe'>{len(reviews)} MRs</span></div>
+            <section class='card'><div class='section-heading'><div><h2>Completed review results</h2><p class='sub'>Latest {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} result for every reviewed MR, including reviews with no findings. Select a row to inspect the evidence.</p></div><span class='severity severity-safe'>{len(reviews)} MRs</span></div>
+            {self.model_tabs('/completed', selected_profile, {'severity': selected_severity, 'manual_status': selected_status})}
+            {self.usage_tiles(reviews, selected_profile)}
             <nav class='severity-filter' aria-label='Filter completed reviews by severity'>{filter_links}</nav>
             <nav class='severity-filter' aria-label='Filter completed reviews by manual-review status'>{status_filter_links}</nav>
             <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th><th>Manual review</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>
@@ -2910,37 +3241,43 @@ def handler_factory(
                     if displayed_credentials.gitlab_token
                     else "Enter GitLab token"
                 )
-                llm_key_placeholder = (
+                anthropic_key_placeholder = (
                     "•••••••••••• (stored)"
                     if displayed_credentials.llm_api_key
-                    else "Enter LLM API key"
+                    else "Enter Anthropic API key"
                 )
-                provider_options = "".join(
-                    f"<option value='{provider}' {'selected' if displayed_credentials.llm_provider == provider else ''}>"
-                    f"{html.escape(LLM_PROVIDER_LABELS[provider])}</option>"
-                    for provider in LLM_PROVIDERS
+                openai_key_placeholder = (
+                    "•••••••••••• (stored)"
+                    if displayed_credentials.openai_api_key
+                    else "Enter OpenAI API key"
                 )
-                llm_model = displayed_credentials.llm_model or LLM_DEFAULT_MODELS[
-                    displayed_credentials.llm_provider
-                ]
-                custom_url_hidden = (
-                    "" if displayed_credentials.llm_provider == "custom" else " hidden"
+                copilot_key_placeholder = (
+                    "•••••••••••• (stored)"
+                    if displayed_credentials.copilot_api_key
+                    else "Enter GitHub Copilot token"
                 )
+                anthropic_model = displayed_credentials.llm_model or LLM_DEFAULT_MODELS["anthropic"]
+                openai_model = displayed_credentials.openai_model or LLM_DEFAULT_MODELS["openai"]
+                copilot_anthropic_model = displayed_credentials.copilot_anthropic_model or "claude-sonnet-5"
+                copilot_openai_model = displayed_credentials.copilot_openai_model or "gpt-5.4"
                 credential_panel = f"""
                 <section class='card'><h2>Configure or rotate encrypted credentials</h2>
-                <p class='sub'>Save GitLab access first to test discovery. The LLM API key is optional and can be added later. Existing secrets are kept when their fields are left blank and the provider is unchanged.</p>
+                <p class='sub'>GitLab discovery can run independently. Four-model reviews start only after the Anthropic key, OpenAI key, and GitHub Copilot token are all stored. Blank secret fields retain their encrypted values.</p>
                 <form id='credential_form' method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
                 <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
                 <div class='field'><label for='gitlab_group_path'>GitLab group path (optional)</label><input id='gitlab_group_path' name='gitlab_group_path' value='{html.escape(gitlab_group_path)}' placeholder='maas' maxlength='512'><small>Enter a namespace path such as maas or company/platform, not a URL. Subgroups are included automatically. Leave blank for user-wide discovery.</small></div>
                 <div class='field'><label for='rotate_gitlab_token'>GitLab token</label><input id='rotate_gitlab_token' name='gitlab_token' type='password' autocomplete='off' placeholder='{html.escape(gitlab_token_placeholder)}'><small>Required the first time; leave blank later to keep the stored token.</small></div>
-                <div class='field'><label for='llm_provider'>LLM provider</label><select id='llm_provider' name='llm_provider'>{provider_options}</select><small>Anthropic is the default. Custom means an OpenAI-compatible Chat Completions endpoint.</small></div>
-                <div class='field'><label for='llm_model'>Model</label><div class='inline-control'><input id='llm_model' name='llm_model' value='{html.escape(llm_model)}' maxlength='256'><button class='secondary' id='fetch_models' type='button'>Fetch models</button></div><select class='model-picker' id='available_models' aria-label='Available models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='model_status' aria-live='polite'>Use a model available to the selected provider account.</small></div>
-                <div class='field' id='custom_api_url_field'{custom_url_hidden}><label for='llm_api_url'>Custom API URL</label><input id='llm_api_url' name='llm_api_url' type='url' value='{html.escape(displayed_credentials.llm_api_url)}' placeholder='https://llm.example.com/v1/chat/completions'><small>Enter the exact HTTPS Chat Completions endpoint.</small></div>
-                <div class='field'><label for='llm_api_key'>LLM API key (optional)</label><input id='llm_api_key' name='llm_api_key' type='password' autocomplete='off' placeholder='{html.escape(llm_key_placeholder)}'><small>Leave blank for discovery only. When changing provider, enter that provider's key.</small></div>
+                <div class='field'><label for='anthropic_api_key'>Anthropic API key</label><input id='anthropic_api_key' name='anthropic_api_key' type='password' autocomplete='off' placeholder='{html.escape(anthropic_key_placeholder)}'><small>Used for the direct Anthropic comparison.</small></div>
+                <div class='field'><label for='anthropic_model'>Direct Anthropic model</label><div class='inline-control'><input id='anthropic_model' name='anthropic_model' value='{html.escape(anthropic_model)}' maxlength='256'><button class='secondary fetch-models' type='button' data-provider='anthropic' data-key-field='anthropic_api_key' data-model-field='anthropic_model' data-picker='anthropic_models' data-status='anthropic_model_status'>Fetch models</button></div><select class='model-picker' id='anthropic_models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='anthropic_model_status'>Billed directly by Anthropic.</small></div>
+                <div class='field'><label for='openai_api_key'>OpenAI API key</label><input id='openai_api_key' name='openai_api_key' type='password' autocomplete='off' placeholder='{html.escape(openai_key_placeholder)}'><small>Used for the direct OpenAI comparison.</small></div>
+                <div class='field'><label for='openai_model'>Direct OpenAI model</label><div class='inline-control'><input id='openai_model' name='openai_model' value='{html.escape(openai_model)}' maxlength='256'><button class='secondary fetch-models' type='button' data-provider='openai' data-key-field='openai_api_key' data-model-field='openai_model' data-picker='openai_models' data-status='openai_model_status'>Fetch models</button></div><select class='model-picker' id='openai_models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='openai_model_status'>Billed directly by OpenAI.</small></div>
+                <div class='field'><label for='copilot_api_key'>GitHub Copilot token</label><input id='copilot_api_key' name='copilot_api_key' type='password' autocomplete='off' placeholder='{html.escape(copilot_key_placeholder)}'><small>One GitHub token is used for both Copilot-hosted comparisons and must have Copilot access.</small></div>
+                <div class='field'><label for='copilot_anthropic_model'>Copilot Anthropic model</label><div class='inline-control'><input id='copilot_anthropic_model' name='copilot_anthropic_model' value='{html.escape(copilot_anthropic_model)}' maxlength='256'><button class='secondary fetch-models' type='button' data-provider='copilot' data-key-field='copilot_api_key' data-model-field='copilot_anthropic_model' data-picker='copilot_anthropic_models' data-status='copilot_anthropic_status'>Fetch models</button></div><select class='model-picker' id='copilot_anthropic_models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='copilot_anthropic_status'>Select an Anthropic model enabled in Copilot policy.</small></div>
+                <div class='field'><label for='copilot_openai_model'>Copilot OpenAI model</label><div class='inline-control'><input id='copilot_openai_model' name='copilot_openai_model' value='{html.escape(copilot_openai_model)}' maxlength='256'><button class='secondary fetch-models' type='button' data-provider='copilot' data-key-field='copilot_api_key' data-model-field='copilot_openai_model' data-picker='copilot_openai_models' data-status='copilot_openai_status'>Fetch models</button></div><select class='model-picker' id='copilot_openai_models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='copilot_openai_status'>Select an OpenAI model enabled in Copilot policy.</small></div>
                 </div><div class='actions'><button type='submit'>Save encrypted credentials</button>
                 <button class='secondary' type='submit' formaction='/credentials/test-gitlab'>Test GitLab access</button>
-                <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test LLM connection</button></div>
-                <p class='sub'>Tests do not save the entered values. The LLM test sends one minimal request using the selected provider and model and may incur a very small API charge.</p></form></section>"""
+                <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test all four model connections</button></div>
+                <p class='sub'>Tests do not save entered values. The model test sends one minimal request to each configured comparison and may incur API or Copilot usage charges.</p></form></section>"""
             body = f"""
             {notice}<section class='card'><h2>Runtime settings</h2><p class='sub'>Saved in SQLite and applied automatically at the next polling cycle.</p>
             <form method='post' action='/settings'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>{fields}</div><div class='actions'><button type='submit'>Save settings</button></div></form></section>
@@ -3375,10 +3712,24 @@ def handler_factory(
                 self.send_page(400, page("Invalid report", "<div class='card'><h1>Invalid report reference</h1></div>"))
                 return
             row = store.report(project_id, mr_iid, head_sha)
-            if row is None or not (row["report_content"] or row["report_path"]):
+            selected_profile = query.get("profile", [""])[0]
+            comparison_content = ""
+            if row is not None and selected_profile in COMPARISON_PROFILES:
+                try:
+                    comparison = json.loads(str(row["comparison_json"] or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    comparison = {}
+                result = comparison.get(selected_profile) if isinstance(comparison, dict) else None
+                if isinstance(result, dict):
+                    comparison_content = str(result.get("report_content", ""))
+            if row is None or not (
+                comparison_content or row["report_content"] or row["report_path"]
+            ):
                 self.send_page(404, page("Report not found", "<div class='card'><h1>Report not found</h1></div>"))
                 return
-            if row["report_content"]:
+            if comparison_content:
+                content = comparison_content[:1_000_000]
+            elif row["report_content"]:
                 content = str(row["report_content"])[:1_000_000]
             else:
                 path = Path(str(row["report_path"])).resolve()

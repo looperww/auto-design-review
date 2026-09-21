@@ -62,6 +62,7 @@ from security_review.web import (  # noqa: E402
     paginate_repositories,
     parse_security_findings,
     password_record,
+    profile_usage_summary,
     report_section,
     render_diff_html,
     handler_factory,
@@ -648,6 +649,64 @@ class DifferentialReviewTests(unittest.TestCase):
             self.assertIn("Commit timeline unavailable", run_llm.call_args.args[0])
             state.close()
 
+    def test_comparison_reviews_all_four_profiles_from_one_fetched_context(self):
+        target = ReviewTarget(1, "company/app", 9, "head-sha", "https://example/mr/9")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "SKILL.md").write_text("# Approved workflow\n", encoding="utf-8")
+            state = ReviewState(root / "state.sqlite3")
+            profiles = [
+                config_for_test(root, review_profile="anthropic"),
+                config_for_test(
+                    root,
+                    llm_provider="openai",
+                    llm_model="gpt-test",
+                    review_profile="openai",
+                ),
+                config_for_test(
+                    root,
+                    llm_provider="copilot",
+                    llm_model="claude-test",
+                    review_profile="copilot_anthropic",
+                ),
+                config_for_test(
+                    root,
+                    llm_provider="copilot",
+                    llm_model="gpt-test",
+                    review_profile="copilot_openai",
+                ),
+            ]
+
+            def result_for_profile(_prompt, config):
+                severity = "HIGH" if config.review_profile == "openai" else "LOW"
+                return (
+                    f"# Design review\n\n## Findings\n### [{severity}] {config.review_profile}\nEvidence.\n",
+                    {"usage": {"input_tokens": 10, "output_tokens": 2}},
+                )
+
+            client = self.FakeGitLabClient()
+            with patch("security_review.service.run_llm", side_effect=result_for_profile) as run_llm:
+                result = review_target(
+                    client,
+                    state,
+                    profiles[0],
+                    target,
+                    comparison_configs=profiles,
+                )
+
+            self.assertEqual(result, "high_severity")
+            self.assertEqual(run_llm.call_count, 4)
+            comparison = json.loads(
+                state.connection.execute(
+                    "SELECT comparison_json FROM reviews WHERE head_sha = ?",
+                    ("head-sha",),
+                ).fetchone()[0]
+            )
+            self.assertEqual(set(comparison), {config.review_profile for config in profiles})
+            self.assertEqual(comparison["openai"]["status"], "high_severity")
+            self.assertEqual(comparison["anthropic"]["status"], "completed")
+            state.close()
+
 
 class StateTests(unittest.TestCase):
     def test_review_revision_is_recorded_once(self):
@@ -677,6 +736,36 @@ class StateTests(unittest.TestCase):
             state = ReviewState(Path(directory) / "state.sqlite3")
             state.record(first, "completed")
             self.assertFalse(state.has(second))
+            state.close()
+
+    def test_web_store_projects_comparison_results_by_profile(self):
+        target = ReviewTarget(1, "company/app", 3, "abc123", "https://example/mr/3")
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            store = WebStore(database)
+            state = ReviewState(database)
+            results = {
+                profile: {
+                    "status": "high_severity" if profile == "copilot_openai" else "completed",
+                    "provider": "copilot" if profile.startswith("copilot_") else profile,
+                    "model": f"{profile}-model",
+                    "report_content": f"# Design review\n\n## Summary\n{profile}\n",
+                    "metadata": {"review_profile": profile, "elapsed_ms": 100},
+                }
+                for profile in (
+                    "anthropic",
+                    "openai",
+                    "copilot_anthropic",
+                    "copilot_openai",
+                )
+            }
+            state.record_comparison(target, results, "+secure_change", "{}")
+            for profile, expected in results.items():
+                reviews = store.completed_reviews(profile)
+                self.assertEqual(len(reviews), 1)
+                self.assertEqual(reviews[0]["review_profile"], profile)
+                self.assertEqual(reviews[0]["llm_model"], expected["model"])
+                self.assertIn(profile, reviews[0]["report_content"])
             state.close()
 
 
@@ -752,6 +841,43 @@ class CycleLimitTests(unittest.TestCase):
 
 
 class DiscoveryInventoryTests(unittest.TestCase):
+    def test_profile_usage_summary_keeps_provider_native_cost_units(self):
+        direct = profile_usage_summary(
+            [
+                {
+                    "metadata_json": json.dumps(
+                        {
+                            "elapsed_ms": 1500,
+                            "llm_cost_usd": 0.125,
+                            "llm_usage": {"input_tokens": 100, "output_tokens": 20},
+                        }
+                    )
+                }
+            ],
+            "anthropic",
+        )
+        copilot = profile_usage_summary(
+            [
+                {
+                    "metadata_json": json.dumps(
+                        {
+                            "elapsed_ms": 500,
+                            "llm_usage": {
+                                "lastCallInputTokens": 80,
+                                "lastCallOutputTokens": 10,
+                                "totalPremiumRequestCost": 1.5,
+                            },
+                        }
+                    )
+                }
+            ],
+            "copilot_openai",
+        )
+        self.assertEqual(direct["cost_display"], "$0.1250")
+        self.assertEqual(direct["average_ms"], 1500)
+        self.assertEqual(copilot["cost_display"], "1.50 premium requests")
+        self.assertEqual(copilot["input_tokens"], 80)
+
     def test_commit_normalization_rejects_invalid_ids_and_external_links(self):
         commits = normalize_gitlab_commits(
             [
@@ -1311,6 +1437,7 @@ class WebAuthenticationTests(unittest.TestCase):
             )
             session_token, _ = store.create_session(user_id)
             vault = MemoryVault()
+            vault.prepare("a secure test password")
             vault.set(Credentials("https://gitlab.example.com", "test-token", ""))
             state = ReviewState(root / "state.sqlite3")
             state.record_visible_projects(
@@ -1403,6 +1530,10 @@ class WebAuthenticationTests(unittest.TestCase):
                 ) as response:
                     completed = response.read().decode("utf-8")
                 with urllib.request.urlopen(
+                    urllib.request.Request(base_url + "/settings", headers=headers)
+                ) as response:
+                    settings_page = response.read().decode("utf-8")
+                with urllib.request.urlopen(
                     urllib.request.Request(
                         base_url + "/repository?project_id=1&period=week",
                         headers=headers,
@@ -1483,6 +1614,11 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("<h1>Review dashboard</h1>", dashboard)
             self.assertIn("<h2>Review status</h2>", dashboard)
             self.assertIn("<h2>High-severity findings</h2>", dashboard)
+            self.assertEqual(dashboard.count("role='tab'"), 4)
+            self.assertIn("Copilot · Anthropic", dashboard)
+            self.assertIn("Copilot · OpenAI", dashboard)
+            self.assertIn("Selected model", dashboard)
+            self.assertIn("Reported cost", dashboard)
             self.assertIn("Command injection", dashboard)
             self.assertNotIn("Information disclosure", dashboard)
             self.assertNotIn("No evidence-backed findings", dashboard)
@@ -1517,6 +1653,8 @@ class WebAuthenticationTests(unittest.TestCase):
             )
             self.assertIn("<h1>Completed MRs</h1>", completed)
             self.assertIn("<h2>Completed review results</h2>", completed)
+            self.assertEqual(completed.count("role='tab'"), 4)
+            self.assertIn("Average runtime", completed)
             self.assertIn("Command injection", completed)
             self.assertIn("Information disclosure", completed)
             self.assertIn("No evidence-backed findings", completed)
@@ -1537,6 +1675,12 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn(expected_columns, completed)
             self.assertIn("<th>Manual review</th>", dashboard)
             self.assertIn("<th>Manual review</th>", completed)
+            self.assertIn("name='anthropic_api_key'", settings_page)
+            self.assertIn("name='openai_api_key'", settings_page)
+            self.assertIn("name='copilot_api_key'", settings_page)
+            self.assertIn("name='copilot_anthropic_model'", settings_page)
+            self.assertIn("name='copilot_openai_model'", settings_page)
+            self.assertIn("Test all four model connections", settings_page)
             self.assertIn("id='manual-review-dialog'", dashboard)
             self.assertIn(
                 "aria-label='Filter completed reviews by manual-review status'",
@@ -1678,6 +1822,26 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertEqual(restored, credentials)
         self.assertEqual(restored.gitlab_group_path, "maas")
 
+    def test_all_three_comparison_credentials_are_encrypted(self):
+        credentials = validated_credentials(
+            "https://gitlab.example.com",
+            "gitlab-test-token",
+            "anthropic-test-key",
+            llm_model="claude-test",
+            openai_api_key="openai-test-key",
+            openai_model="gpt-direct",
+            copilot_api_key="github-copilot-token",
+            copilot_anthropic_model="claude-copilot",
+            copilot_openai_model="gpt-copilot",
+        )
+        salt, nonce, ciphertext = encrypt_credentials(credentials, "correct password")
+        restored = decrypt_credentials(salt, nonce, ciphertext, "correct password")
+        self.assertEqual(restored, credentials)
+        self.assertTrue(restored.comparison_ready())
+        self.assertNotIn("anthropic-test-key", ciphertext)
+        self.assertNotIn("openai-test-key", ciphertext)
+        self.assertNotIn("github-copilot-token", ciphertext)
+
     def test_non_anthropic_provider_configuration_is_encrypted(self):
         credentials = validated_credentials(
             "https://gitlab.example.com",
@@ -1690,7 +1854,9 @@ class WebAuthenticationTests(unittest.TestCase):
         salt, nonce, ciphertext = encrypt_credentials(credentials, "correct password")
         restored = decrypt_credentials(salt, nonce, ciphertext, "correct password")
         self.assertEqual(restored, credentials)
-        self.assertEqual(restored.llm_provider, "openai")
+        self.assertEqual(restored.llm_provider, "anthropic")
+        self.assertEqual(restored.openai_api_key, "openai-test-key")
+        self.assertEqual(restored.openai_model, "gpt-company")
         self.assertNotIn("openai-test-key", ciphertext)
 
     def test_custom_provider_requires_an_https_endpoint_when_key_is_present(self):

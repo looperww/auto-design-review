@@ -2,11 +2,11 @@
 
 This repository is a self-contained, read-only security checkpoint for GitLab.
 Clone it onto any Docker host and start it with Docker Compose. The authenticated
-setup page stores the GitLab token, selected LLM provider, model, API key,
-optional custom endpoint, GitLab URL, optional GitLab group path, and all review
-settings in SQLite. It automatically discovers the selected group's projects
-or all projects visible to the GitLab token, reviews new merge requests and new
-MR revisions, and keeps reports locally.
+console stores the GitLab token, three model credentials, four selected models,
+GitLab URL, optional GitLab group path, and all review settings in SQLite. It
+automatically discovers the selected group's projects or all projects visible
+to the GitLab token, reviews every eligible MR revision with four comparison
+profiles, and keeps reports locally.
 
 No GitLab Runner, webhook listener, pipeline trigger, or `.gitlab-ci.yml` change
 is required in product repositories.
@@ -26,11 +26,15 @@ GitLab projects visible to the token
               └── centrally managed security-review skill
               │
               ▼
-  selected LLM provider
-  (Anthropic by default)
+ one immutable prompt and context bundle
+     ┌────────┼────────┬───────────────┐
+     ▼        ▼        ▼               ▼
+ Anthropic  OpenAI  Copilot         Copilot
+  direct    direct  Anthropic model OpenAI model
+     └────────┼────────┴───────────────┘
               │
               ▼
-     local reports and review state
+ local reports, model usage, timing, and review state
               │
               ▼
  authenticated local web console
@@ -38,20 +42,24 @@ GitLab projects visible to the token
 
 The service never builds, imports, installs dependencies from, or executes
 product code. Repository archives are processed as untrusted data in memory.
-The selected LLM receives the MR diff plus a bounded selection of full changed
-files and related files. When Anthropic is selected, all Claude Code tools are
-disabled. OpenAI and Gemini are called through their official HTTPS APIs;
-custom providers use an administrator-supplied OpenAI-compatible Chat
-Completions endpoint.
+Each comparison receives the same MR diff, approved instructions, and bounded
+selection of full changed and related files. The four calls run concurrently
+after GitLab context is fetched once. The direct Anthropic profile uses Claude
+Code with all tools disabled, the direct OpenAI profile uses the Responses API,
+and the two GitHub Copilot profiles use the official Copilot SDK with one shared
+GitHub token and two separately selected models. One model failure is recorded
+for that profile without discarding successful results from the other profiles.
 
 ## Requirements
 
 - Docker with the Compose plugin.
-- Network access to the GitLab API, Docker image sources, and the selected LLM
-  provider. Anthropic also requires access to Claude Code download endpoints.
+- Network access to the GitLab API, Docker image sources, Anthropic, OpenAI,
+  GitHub, and GitHub Copilot endpoints. Image builds also require access to the
+  Claude Code and Copilot SDK runtime download endpoints.
 - At least 4 GB RAM for the Docker host.
-- An API key and billing controls for the selected LLM provider when reviews are
-  enabled. GitLab discovery can be tested before this key is added.
+- An Anthropic API key, OpenAI API key, and GitHub token entitled to GitHub
+  Copilot. Reviews begin only when all three are configured; GitLab discovery
+  can be tested before then.
 - A GitLab fine-grained personal access token or service-account token.
 
 ## GitLab token permissions
@@ -122,9 +130,9 @@ company security-review records.
 docker compose up --detach --build
 ```
 
-The image installs Claude Code from Anthropic's stable channel during the build
-so Anthropic remains available as the default provider. OpenAI, Gemini, and
-custom providers use direct HTTPS requests and require no additional SDK.
+The image installs Claude Code from Anthropic's stable channel and the pinned
+GitHub Copilot Python SDK and runtime during the build. Direct OpenAI requests
+use the Responses API.
 The combined reviewer and web-console container is named
 `automated-design-review`. It runs as an unprivileged user with a read-only root
 filesystem, no Linux capabilities, no-new-privileges, and no Docker socket.
@@ -162,78 +170,71 @@ After signing in, select **Settings** in the dashboard header, then configure:
 
 - the GitLab URL;
 - optionally, the GitLab group path associated with a group-scoped token;
-- the read-only GitLab token; and
-- an LLM provider and model (Anthropic, OpenAI, Gemini, or Custom);
-- optionally, the selected provider's API key; and
-- for Custom only, the exact HTTPS OpenAI-compatible Chat Completions URL.
+- the read-only GitLab token;
+- the direct Anthropic API key and model;
+- the direct OpenAI API key and model; and
+- one GitHub Copilot token plus an Anthropic and an OpenAI model available to
+  that Copilot account.
 
-The Custom API URL field is hidden unless **Custom** is selected in the provider
-dropdown.
-
-The GitLab token can be saved without an LLM API key. The service then
+The GitLab token can be saved without the three model credentials. The service then
 checks the GitLab connection, discovers open MR revisions, and records them as
 `pending` in SQLite. It does not download repository archives or diffs and does
-not invoke an LLM in this mode. The dashboard shows the last GitLab connection
+not invoke any model in this mode. The dashboard shows the last GitLab connection
 result, every repository visible to the token, and the queued MR count. This
 allows the administrator to verify the GitLab URL, token, scope, and permissions
-without incurring LLM cost.
+without incurring model cost.
 
-The LLM API key can be added later without re-entering the stored GitLab token.
-Once it is saved, queued open MR revisions are reviewed in order, subject to the
-configured maximum reviews per cycle. Leaving either secret field blank during
-a later update preserves its stored value when the provider remains unchanged.
-Changing provider requires entering the new provider's key so a key is never
-silently reused with a different provider.
+The model credentials can be added later without re-entering the stored GitLab
+token. Once all three are saved, queued open MR revisions are reviewed in order,
+subject to the configured maximum reviews per cycle. Each MR is reviewed once
+by all four profiles. Leaving a secret field blank during a later update
+preserves its stored value.
 
 After a key is saved, its empty password field displays a masked
 `•••••••••••• (stored)` placeholder. This confirms that a value exists without
 returning the secret to the browser or submitting the placeholder as a new key.
 
-The provider dropdown offers these built-in modes:
+The comparison profiles are:
 
-| Provider | Default model | Connection method |
-| --- | --- | --- |
-| Anthropic | `opus` | Claude Code CLI with tools disabled |
-| OpenAI | `gpt-6-astra` | Official Responses API with response storage disabled |
-| Gemini | `gemini-3.8-flash` | Official Generate Content API |
-| Custom | Administrator-supplied | Exact HTTPS OpenAI-compatible Chat Completions endpoint |
+| Dashboard tab | Credential | Default model | Connection method |
+| --- | --- | --- | --- |
+| Anthropic | Anthropic API key | `opus` | Claude Code CLI with tools disabled |
+| OpenAI | OpenAI API key | `gpt-6-astra` | Official Responses API with response storage disabled |
+| Copilot · Anthropic | GitHub Copilot token | `claude-sonnet-5` | Official GitHub Copilot SDK |
+| Copilot · OpenAI | Same GitHub Copilot token | `gpt-5.4` | Official GitHub Copilot SDK |
 
-Model names are editable because availability depends on the provider account
-and models change over time. “Custom” does not mean every possible proprietary
-API protocol: the endpoint must accept the common OpenAI Chat Completions JSON
-request shape and bearer-token authentication.
+Model names remain editable because availability depends on the provider
+account and organization policy and changes over time. The same Copilot token
+is intentionally reused for its two comparison profiles; it is never reused as
+a direct Anthropic or OpenAI credential.
 
 Before saving, use the two credential-test buttons in the web console:
 
 - **Test GitLab access** calls the GitLab Projects API and reports how many
   repositories are visible to the submitted or stored token.
-- **Test LLM connection** sends one minimal request using the selected provider,
-  key, URL, and model. Anthropic uses a USD 0.05 hard budget for this test; other
-  providers receive a 16-token output limit. A very small API charge may occur.
+- **Test all four model connections** sends one minimal request through every
+  configured comparison profile. A small direct-provider or Copilot usage
+  charge may occur.
 
 Testing does not save or replace either credential. Signing in derives and
 unlocks the vault encryption key in memory, so the credential form does not ask
 for the administrator password again. The plaintext password is never retained.
 
-Use **Fetch models** beside the Model field after entering or saving the selected
-provider's API key. The browser asks the local service for the provider's model
-list and displays a dropdown; choosing an item copies its identifier into the
-editable Model field. This operation does not save the key, URL, or model and
-does not invoke a generation request. Anthropic, OpenAI, and Gemini use their
-official model-list endpoints. For a Custom OpenAI-compatible Chat Completions
-URL, the service derives the conventional sibling `/models` endpoint; custom
-providers that do not expose that endpoint require the model name to be entered
-manually.
+Use **Fetch models** beside any model field after entering or saving its
+credential. Anthropic and OpenAI use their official model-list endpoints. Both
+Copilot selectors use the model list available to the stored or entered GitHub
+token. Choosing a returned item copies its identifier into the editable field;
+fetching does not save settings or invoke a generation request.
 
-The GitLab and active LLM API credentials, provider, model, custom URL, and GitLab
-URL are encrypted with AES-GCM using a key derived from the administrator
-password. Password hashes, encrypted credentials, operational settings, review
-state, report content, and report metadata are stored in SQLite under the host's
-`data/` folder, which is mounted inside the container at `/data`.
+The GitLab token, Anthropic key, OpenAI key, Copilot token, four model choices,
+and GitLab URL are encrypted with AES-GCM using a key derived from the
+administrator password. Password hashes, encrypted credentials, operational
+settings, review state, report content, and report metadata are stored in
+SQLite under the host's `data/` folder, mounted inside the container at `/data`.
 
 The service cannot contact GitLab until the encrypted GitLab credentials have
-been saved and unlocked. LLM reviews remain disabled until the encrypted active
-provider key is also present.
+been saved and unlocked. Comparison reviews remain disabled until all three
+encrypted model credentials are present.
 
 The container publishes `0.0.0.0:6789`, so the console is reachable through any
 host interface permitted by the firewall. Do not expose this port directly to
@@ -244,12 +245,16 @@ The authenticated **Design Review** console uses a responsive sidebar with four
 primary pages:
 
 - **Dashboard** is the main operational view. It shows review outcomes and the
-  Critical and High security-finding queue. A compact green/red indicator
-  beneath the page title shows the latest GitLab connection status.
+  Critical and High security-finding queue. Four tabs switch between the direct
+  Anthropic, direct OpenAI, Copilot Anthropic, and Copilot OpenAI findings. A
+  compact summary for the selected tab shows completed reviews, average runtime,
+  input/output tokens, and the cost value reported by that service. A green/red
+  indicator beneath the page title shows the latest GitLab connection status.
 - **Completed MRs** lists the latest completed review for every MR, including
-  SAFE reviews with no findings. Results can be filtered by severity and human
-  review status, and each row expands to show the reviewed diff, review summary,
-  severity rationale, finding evidence, and recorded human decision.
+  SAFE reviews with no findings. The same four tabs keep each model's results
+  separate. Results can be filtered by severity and human review status, and
+  each row expands to show the reviewed diff, review summary, severity rationale,
+  finding evidence, and recorded human decision.
 - **Repositories** provides a focused inventory of repository coverage,
   per-repository access status, MR activity, finding totals, date filters, and
   pagination. Overall GitLab health remains in the compact Dashboard header.
@@ -282,7 +287,7 @@ deletes the repository inventory, every MR revision, report, parsed finding,
 and associated human-review decision,
 clears the previous GitLab scan status, and records the reset time as a new
 deployment cutoff. Administrator accounts, active login sessions, encrypted
-GitLab and LLM credentials, and runtime settings remain unchanged. The reviewer
+GitLab and model credentials, and runtime settings remain unchanged. The reviewer
 is then woken for a fresh discovery cycle; open MRs created before the reset
 time are not imported again.
 
@@ -300,7 +305,7 @@ the service must be initialized again. Fully unattended unlock after a restart
 would require an external secret manager or master key, which this deployment
 intentionally does not store.
 
-When GitLab and LLM credentials are supplied together, choose whether to
+When GitLab and all three model credentials are supplied together, choose whether to
 review existing open MRs before the first scan. The default records them as a
 baseline without spending LLM tokens. Any MR created later, or any new commit
 pushed to an MR, is reviewed automatically. Enabling existing-MR review can
@@ -313,17 +318,19 @@ used to validate GitLab access.
 
 ## Read the reports
 
-Reports can be opened from the authenticated web console. The Markdown report,
-bounded reviewed diff, and metadata are stored directly in SQLite with the MR
-identity, commit, selected context files, prompt size, provider, model, token
-usage when returned, and Anthropic duration and estimated cost when returned.
+Reports can be opened from the authenticated web console. All four Markdown
+reports share one retained bounded diff and are stored atomically in SQLite with
+the MR identity, commit, selected context files, prompt size, profile, provider,
+model, elapsed time, token usage when returned, and provider-reported cost when
+available. Direct API and Copilot billing units are not assumed to be equivalent;
+use the provider billing exports for authoritative financial comparison.
 Reviews created before diff retention was introduced remain visible, but their
 expanded view explains that the historical diff is unavailable.
-Report records never contain either token; API credentials exist in a separate
+Report records never contain credentials; API credentials exist in a separate
 SQLite table only as authenticated ciphertext.
 
-MR revisions discovered before the LLM key is configured appear with a `pending`
-status and have no report until the selected LLM reviews them.
+MR revisions discovered before all three model credentials are configured appear
+with a `pending` status and have no report until the four comparisons run.
 
 The Repositories page combines visible repositories and fetched-MR activity in one
 **Repositories and MRs** table. For each repository it shows:
@@ -431,10 +438,11 @@ MR revisions are found, the default configuration processes five, then five,
 then two over three cycles.
 
 Set the value to `0` in the web console to process all pending revisions in the
-same cycle. This still processes reviews sequentially, and any MRs created while
-that cycle is running are discovered in the next cycle. Unlimited mode can
-create a large and sudden API bill, so a finite limit is recommended for normal
-operation.
+same cycle. MR revisions are still processed sequentially, but the four model
+calls for one MR run concurrently against the same immutable prompt. MRs created
+while a cycle is running are discovered in the next cycle. Unlimited mode can
+create a large and sudden bill across all three services, so a finite limit is
+recommended for normal operation.
 
 Runtime settings saved in the web console are stored in SQLite and apply
 automatically on the next polling cycle. No `.env` file is used.
@@ -452,11 +460,11 @@ exact source commit and selects:
 - up to 100 MR commit records, bounded to 32 KB, as untrusted historical
   context for regression analysis.
 
-The selected LLM is instructed to trace attacker-controlled input through transformations
-and sanitizers to SQL, command, filesystem, template, deserialization, logging,
-redirect, and outbound-request sinks. This is bounded, heuristic contextual
-analysis rather than a formal proof. Production assurance should combine it
-with the company's SAST and dependency-scanning controls.
+All four profiles are instructed to trace attacker-controlled input through
+transformations and sanitizers to SQL, command, filesystem, template,
+deserialization, logging, redirect, and outbound-request sinks. This is bounded,
+heuristic contextual analysis rather than a formal proof. Production assurance
+should combine it with the company's SAST and dependency-scanning controls.
 
 ## Security-review skill
 
@@ -505,7 +513,8 @@ Trail of Bits attribution and adaptation details are recorded in
 `.claude/skills/security-review/TRAILOFBITS-UPSTREAM.md` and
 `.claude/skills/security-review/LICENSE.trailofbits-differential-review`.
 
-The default limits keep one review within a manageable input and cost envelope:
+The default limits keep one four-profile review within a manageable input and
+cost envelope:
 
 | Setting | Default |
 | --- | ---: |
@@ -556,7 +565,7 @@ Store the backup in an approved protected location because it contains company
 security-review records and encrypted credentials. Never delete `data/` unless
 you intentionally want to erase all stored configuration and review history.
 
-Rotate a GitLab or LLM credential from the authenticated, unlocked web console.
+Rotate a GitLab or model credential from the authenticated, unlocked web console.
 The replacement is encrypted in SQLite and the reviewer starts using it without
 a container restart. Re-entering the administrator password is not required;
 only its derived encryption key remains in process memory after sign-in.
@@ -567,14 +576,13 @@ only its derived encryption key remains in process memory after sign-in.
 - Product code is never executed.
 - Repository archives are never written into the container filesystem.
 - Claude Code runs in bare print mode with tools disabled and no session history
-  when Anthropic is selected.
+  for the direct Anthropic comparison.
 - The GitLab token is never sent to or placed in the process environment of an
-  LLM client. Only the active provider's API key is sent to that provider.
+  model client. The Copilot child runtime receives a minimal environment, and
+  each provider receives only its own credential.
 - OpenAI requests set `store` to `false`. Provider-side retention and training
-  terms must still be confirmed contractually for every selected provider.
-- A Custom endpoint receives selected proprietary code and is trusted as an LLM
-  destination; administrators must verify its owner, TLS, retention, and access
-  controls before saving it.
+  terms must still be confirmed contractually for every provider and for GitHub
+  Copilot.
 - Secret-like unchanged files, private keys, dependency directories, generated
   output, binary files, and oversized files are excluded from context.
 - The container cannot modify GitLab, approve an MR, merge code, or read
@@ -588,10 +596,10 @@ only its derived encryption key remains in process memory after sign-in.
   relies on a host/network firewall and an approved HTTPS reverse proxy for
   production access. The container listens internally on port `8080`.
 
-Because selected proprietary source code is sent to the active LLM provider,
-obtain company approval for that provider, data-processing terms, retention
-settings, permitted repositories, and geographic processing before production
-use.
+Because selected proprietary source code is sent independently through
+Anthropic, OpenAI, and GitHub Copilot, obtain company approval for all three
+services, their data-processing terms, retention settings, permitted
+repositories, and geographic processing before production use.
 
 ## Local tests
 
@@ -611,4 +619,5 @@ python3 -m unittest discover -s tests -v
 - [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage)
 - [Claude Code installation](https://code.claude.com/docs/en/setup)
 - [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
-- [Gemini text generation API](https://ai.google.dev/gemini-api/docs/generate-content/text-generation)
+- [GitHub Copilot SDK authentication](https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate)
+- [GitHub Copilot SDK usage and billing](https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/usage-and-billing)

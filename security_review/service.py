@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import concurrent.futures
 import heapq
 import io
 import json
@@ -10,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -132,18 +135,32 @@ STOPWORDS = {
     "while",
 }
 
-LLM_PROVIDERS = ("anthropic", "openai", "gemini", "custom")
+LLM_PROVIDERS = ("anthropic", "openai", "gemini", "custom", "copilot")
 LLM_PROVIDER_LABELS = {
     "anthropic": "Anthropic (Claude Code)",
     "openai": "OpenAI",
     "gemini": "Google Gemini",
     "custom": "Custom (OpenAI-compatible)",
+    "copilot": "GitHub Copilot",
 }
 LLM_DEFAULT_MODELS = {
     "anthropic": "opus",
     "openai": "gpt-6-astra",
     "gemini": "gemini-3.8-flash",
     "custom": "",
+    "copilot": "gpt-5.4",
+}
+COMPARISON_PROFILES = (
+    "anthropic",
+    "openai",
+    "copilot_anthropic",
+    "copilot_openai",
+)
+COMPARISON_PROFILE_LABELS = {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "copilot_anthropic": "Copilot · Anthropic",
+    "copilot_openai": "Copilot · OpenAI",
 }
 LLM_SYSTEM_INSTRUCTION = (
     "Apply only the approved instructions supplied in the input. Trace relevant "
@@ -342,9 +359,9 @@ RUNTIME_SETTINGS = (
     RuntimeSetting("MAX_DIFF_BYTES", "Maximum diff bytes", "Maximum complete MR diff sent for analysis.", "integer", "300000", Decimal(10000), Decimal(5000000)),
     RuntimeSetting("MAX_ARCHIVE_BYTES", "Maximum repository archive bytes", "Maximum in-memory repository snapshot size.", "integer", "100000000", Decimal(1000000), Decimal(1000000000)),
     RuntimeSetting("MAX_ARCHIVE_MEMBERS", "Maximum archive members", "Maximum number of files examined in a repository archive.", "integer", "50000", Decimal(100), Decimal(500000)),
-    RuntimeSetting("MAX_CONTEXT_FILES", "Maximum context files", "Changed and related files supplied to the selected LLM.", "integer", "20", Decimal(1), Decimal(200)),
+    RuntimeSetting("MAX_CONTEXT_FILES", "Maximum context files", "Changed and related files supplied identically to all four comparison profiles.", "integer", "20", Decimal(1), Decimal(200)),
     RuntimeSetting("MAX_CONTEXT_FILE_BYTES", "Maximum bytes per context file", "Oversized files are omitted and reported.", "integer", "100000", Decimal(1000), Decimal(1000000)),
-    RuntimeSetting("MAX_CONTEXT_BYTES", "Maximum total context bytes", "Maximum selected repository context supplied to the selected LLM.", "integer", "350000", Decimal(10000), Decimal(5000000)),
+    RuntimeSetting("MAX_CONTEXT_BYTES", "Maximum total context bytes", "Maximum selected repository context supplied identically to each comparison profile.", "integer", "350000", Decimal(10000), Decimal(5000000)),
     RuntimeSetting("MAX_CONTEXT_SCAN_BYTES", "Maximum context scan bytes", "Maximum repository text scanned when selecting related files.", "integer", "30000000", Decimal(100000), Decimal(500000000)),
 )
 RUNTIME_SETTING_MAP = {setting.key: setting for setting in RUNTIME_SETTINGS}
@@ -409,6 +426,7 @@ class Config:
     llm_provider: str = "anthropic"
     llm_api_url: str = ""
     gitlab_group_path: str = ""
+    review_profile: str = "anthropic"
 
     @classmethod
     def from_env(cls, overrides: Mapping[str, str] | None = None) -> "Config":
@@ -434,6 +452,7 @@ class Config:
         llm_api_url: str = "",
         llm_model: str = "",
         gitlab_group_path: str = "",
+        review_profile: str = "",
     ) -> "Config":
         if not gitlab_url.strip() or not gitlab_token.strip():
             raise ReviewError("GitLab credentials are not configured.")
@@ -486,6 +505,7 @@ class Config:
             llm_provider=llm_provider,
             llm_api_url=llm_api_url.strip(),
             gitlab_group_path=normalize_gitlab_group_path(gitlab_group_path),
+            review_profile=review_profile.strip() or llm_provider,
         )
 
 
@@ -758,6 +778,7 @@ class ReviewState:
                 report_content TEXT,
                 diff_content TEXT,
                 metadata_json TEXT,
+                comparison_json TEXT NOT NULL DEFAULT '{}',
                 discovered_at TEXT NOT NULL,
                 mr_created_at TEXT NOT NULL,
                 reviewed_at TEXT NOT NULL,
@@ -774,6 +795,10 @@ class ReviewState:
             self.connection.execute("ALTER TABLE reviews ADD COLUMN diff_content TEXT")
         if "metadata_json" not in review_columns:
             self.connection.execute("ALTER TABLE reviews ADD COLUMN metadata_json TEXT")
+        if "comparison_json" not in review_columns:
+            self.connection.execute(
+                "ALTER TABLE reviews ADD COLUMN comparison_json TEXT NOT NULL DEFAULT '{}'"
+            )
         if "discovered_at" not in review_columns:
             self.connection.execute("ALTER TABLE reviews ADD COLUMN discovered_at TEXT")
             self.connection.execute(
@@ -908,6 +933,65 @@ class ReviewState:
             ),
         )
         self.connection.commit()
+
+    def record_comparison(
+        self,
+        target: ReviewTarget,
+        results: Mapping[str, Mapping[str, Any]],
+        diff_content: str,
+        metadata_json: str,
+    ) -> str:
+        """Persist all model outcomes for one MR revision as one atomic result."""
+        statuses = {str(result.get("status", "failed")) for result in results.values()}
+        if "high_severity" in statuses:
+            aggregate_status = "high_severity"
+        elif statuses and statuses <= {"failed"}:
+            aggregate_status = "failed"
+        else:
+            aggregate_status = "completed"
+        representative = next(
+            (
+                str(results[profile].get("report_content", ""))
+                for profile in COMPARISON_PROFILES
+                if profile in results
+            ),
+            "",
+        )
+        reviewed_at = utc_now()
+        self.connection.execute(
+            """
+            INSERT INTO reviews
+                (project_id, mr_iid, head_sha, project_path, status, report_path,
+                 report_content, diff_content, metadata_json, comparison_json,
+                 discovered_at, mr_created_at, reviewed_at)
+            VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, mr_iid, head_sha) DO UPDATE SET
+                project_path = excluded.project_path,
+                status = excluded.status,
+                report_content = excluded.report_content,
+                diff_content = excluded.diff_content,
+                metadata_json = excluded.metadata_json,
+                comparison_json = excluded.comparison_json,
+                mr_created_at = excluded.mr_created_at,
+                reviewed_at = excluded.reviewed_at
+            """,
+            (
+                target.project_id,
+                target.mr_iid,
+                target.head_sha,
+                target.project_path,
+                aggregate_status,
+                representative,
+                diff_content,
+                metadata_json,
+                json.dumps(results, sort_keys=True),
+                reviewed_at,
+                target.created_at or reviewed_at,
+                reviewed_at,
+            ),
+        )
+        self.connection.commit()
+        return aggregate_status
 
     def initialized(self) -> bool:
         return (
@@ -1299,6 +1383,27 @@ Head commit: {target.head_sha}
 """
 
 
+def isolated_runtime_env() -> dict[str, str]:
+    """Return a minimal child-process environment with no unrelated secrets."""
+    allowed = (
+        "PATH",
+        "HOME",
+        "USER",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "XDG_CACHE_HOME",
+        "COPILOT_CLI_PATH",
+        "COPILOT_CLI_EXTRACT_DIR",
+    )
+    return {name: os.environ[name] for name in allowed if name in os.environ}
+
+
 def run_claude(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
     command = [
         "claude",
@@ -1320,10 +1425,7 @@ def run_claude(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
         "--max-turns",
         config.claude_max_turns,
     ]
-    claude_env = dict(os.environ)
-    for name in list(claude_env):
-        if name.startswith("GITLAB_"):
-            claude_env.pop(name, None)
+    claude_env = isolated_runtime_env()
     claude_env["ANTHROPIC_API_KEY"] = config.llm_api_key
     claude_env.update(
         {
@@ -1480,6 +1582,8 @@ def list_llm_models(provider: str, api_key: str, api_url: str = "") -> list[str]
                 models.append(name.removeprefix("models/"))
         items = [{"id": model} for model in models]
         name_key = "id"
+    elif provider == "copilot":
+        return list_copilot_models(api_key)
     else:
         if not api_url:
             raise ReviewError("Enter the custom API URL before fetching models.")
@@ -1624,6 +1728,111 @@ def run_custom_llm(
     return custom_response_text(result), dict(result)
 
 
+def _copilot_runtime_env() -> dict[str, str]:
+    # Give the isolated Copilot runtime only the process settings it needs. The
+    # GitHub token is passed through the SDK's dedicated authentication field;
+    # GitLab and other provider credentials must never reach the child runtime.
+    return isolated_runtime_env()
+
+
+async def _run_copilot_async(
+    prompt_input: str, config: Config
+) -> tuple[str, dict[str, Any]]:
+    try:
+        from copilot import CopilotClient
+        from copilot.session_events import AssistantMessageData
+    except ImportError as exc:
+        raise ReviewError("The GitHub Copilot SDK is not installed in the reviewer image.") from exc
+    with tempfile.TemporaryDirectory(prefix="copilot-review-", dir="/tmp") as copilot_home:
+        client = CopilotClient(
+            github_token=config.llm_api_key,
+            use_logged_in_user=False,
+            working_directory="/tmp",
+            base_directory=copilot_home,
+            env=_copilot_runtime_env(),
+            mode="empty",
+        )
+        await client.start()
+        try:
+            session = await client.create_session(
+                model=config.llm_model,
+                system_message={"mode": "replace", "content": LLM_SYSTEM_INSTRUCTION},
+                available_tools=[],
+                enable_session_store=False,
+                enable_skills=False,
+                memory={"enabled": False},
+            )
+            try:
+                response = await session.send_and_wait(prompt_input, timeout=900)
+                if response is None or not isinstance(response.data, AssistantMessageData):
+                    raise ReviewError("GitHub Copilot returned no text report.")
+                report = response.data.content.strip()
+                if not report:
+                    raise ReviewError("GitHub Copilot returned an empty text report.")
+                usage: dict[str, Any] = {}
+                try:
+                    usage = (await session.rpc.usage.get_metrics(timeout=30)).to_dict()
+                except Exception:
+                    # A report remains valid if an experimental usage endpoint is unavailable.
+                    usage = {}
+                return report, {"usage": usage, "copilot_model": response.data.model}
+            finally:
+                await session.disconnect()
+        finally:
+            await client.stop()
+
+
+def run_copilot(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
+    try:
+        return asyncio.run(_run_copilot_async(prompt_input, config))
+    except ReviewError:
+        raise
+    except TimeoutError as exc:
+        raise ReviewError("GitHub Copilot review exceeded the 15-minute timeout.") from exc
+    except Exception as exc:
+        raise ReviewError("GitHub Copilot review failed.") from exc
+
+
+async def _list_copilot_models_async(api_key: str) -> list[str]:
+    try:
+        from copilot import CopilotClient
+    except ImportError as exc:
+        raise ReviewError("The GitHub Copilot SDK is not installed in the reviewer image.") from exc
+    with tempfile.TemporaryDirectory(prefix="copilot-models-", dir="/tmp") as copilot_home:
+        client = CopilotClient(
+            github_token=api_key,
+            use_logged_in_user=False,
+            working_directory="/tmp",
+            base_directory=copilot_home,
+            env=_copilot_runtime_env(),
+            mode="empty",
+        )
+        await client.start()
+        try:
+            return sorted(
+                {
+                    str(model.id).strip()
+                    for model in await client.list_models()
+                    if 0 < len(str(model.id).strip()) <= 256
+                },
+                key=str.casefold,
+            )
+        finally:
+            await client.stop()
+
+
+def list_copilot_models(api_key: str) -> list[str]:
+    try:
+        models = asyncio.run(_list_copilot_models_async(api_key))
+    except ReviewError:
+        raise
+    except Exception as exc:
+        raise ReviewError("Could not list models from GitHub Copilot.") from exc
+    if not models:
+        raise ReviewError("GitHub Copilot returned no selectable models for this token.")
+    return models
+
+
 def run_llm(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
     if config.llm_provider == "anthropic":
         return run_claude(prompt_input, config)
@@ -1633,6 +1842,8 @@ def run_llm(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
         return run_gemini(prompt_input, config)
     if config.llm_provider == "custom":
         return run_custom_llm(prompt_input, config)
+    if config.llm_provider == "copilot":
+        return run_copilot(prompt_input, config)
     raise ReviewError("The selected LLM provider is not supported.")
 
 
@@ -1659,10 +1870,7 @@ def test_claude_api_key(api_key: str, model: str = "opus") -> None:
         "--max-turns",
         "1",
     ]
-    claude_env = dict(os.environ)
-    for name in list(claude_env):
-        if name.startswith("GITLAB_"):
-            claude_env.pop(name, None)
+    claude_env = isolated_runtime_env()
     claude_env["ANTHROPIC_API_KEY"] = api_key.strip()
     claude_env.update(
         {
@@ -1713,7 +1921,64 @@ def test_llm_connection(config: Config) -> None:
     if config.llm_provider == "custom":
         run_custom_llm("Reply with exactly OK.", config, max_output_tokens=16)
         return
+    if config.llm_provider == "copilot":
+        run_copilot("Reply with exactly OK.", config)
+        return
     raise ReviewError("The selected LLM provider is not supported.")
+
+
+def run_comparison_profile(
+    prompt_input: str,
+    config: Config,
+    common_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    started_at = utc_now()
+    started_monotonic = time.monotonic()
+    try:
+        report, llm_result = run_llm(prompt_input, config)
+        status = (
+            "high_severity"
+            if HIGH_SEVERITY_PATTERN.search(report)
+            else "completed"
+        )
+        metadata = {
+            **dict(common_metadata),
+            "started_at": started_at,
+            "completed_at": utc_now(),
+            "status": status,
+            "review_profile": config.review_profile,
+            "llm_provider": config.llm_provider,
+            "llm_model": config.llm_model,
+            "llm_usage": llm_result.get("usage") or llm_result.get("usageMetadata"),
+            "llm_cost_usd": llm_result.get("total_cost_usd"),
+            "llm_duration_ms": llm_result.get("duration_ms"),
+            "elapsed_ms": round((time.monotonic() - started_monotonic) * 1000),
+        }
+        return {
+            "status": status,
+            "provider": config.llm_provider,
+            "model": config.llm_model,
+            "report_content": report.rstrip() + "\n",
+            "metadata": metadata,
+        }
+    except (ReviewError, OSError, ValueError) as exc:
+        return {
+            "status": "failed",
+            "provider": config.llm_provider,
+            "model": config.llm_model,
+            "report_content": f"# Design review failed\n\n{exc}\n",
+            "metadata": {
+                **dict(common_metadata),
+                "started_at": started_at,
+                "completed_at": utc_now(),
+                "status": "failed",
+                "review_profile": config.review_profile,
+                "llm_provider": config.llm_provider,
+                "llm_model": config.llm_model,
+                "reason": str(exc),
+                "elapsed_ms": round((time.monotonic() - started_monotonic) * 1000),
+            },
+        }
 
 
 def review_target(
@@ -1722,6 +1987,7 @@ def review_target(
     config: Config,
     target: ReviewTarget,
     force: bool = False,
+    comparison_configs: Iterable[Config] | None = None,
 ) -> str:
     if state.has(target) and not force:
         return "already_reviewed"
@@ -1764,6 +2030,48 @@ def review_target(
             context,
             commit_context,
         )
+        profiles = list(comparison_configs or [])
+        if profiles:
+            common_metadata = {
+                "target": asdict(target),
+                "changed_files": len(diffs),
+                "commit_context_count": len(commits),
+                "commit_context_error": commit_context_error,
+                "context_files": list(context.files),
+                "context_bytes": context.bytes_used,
+                "context_notes": list(context.notes),
+                "prompt_bytes": len(prompt_input.encode("utf-8")),
+            }
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(profiles), thread_name_prefix="model-review"
+            ) as executor:
+                future_by_profile = {
+                    profile.review_profile: executor.submit(
+                        run_comparison_profile,
+                        prompt_input,
+                        profile,
+                        common_metadata,
+                    )
+                    for profile in profiles
+                }
+                results = {
+                    profile: future.result()
+                    for profile, future in future_by_profile.items()
+                }
+            metadata.update(
+                {
+                    **common_metadata,
+                    "status": "comparison_complete",
+                    "completed_at": utc_now(),
+                    "review_profiles": list(results),
+                }
+            )
+            return state.record_comparison(
+                target,
+                results,
+                rendered_diffs,
+                json.dumps(metadata, sort_keys=True),
+            )
         report, llm_result = run_llm(prompt_input, config)
         high = bool(HIGH_SEVERITY_PATTERN.search(report))
         status = "high_severity" if high else "completed"
@@ -1863,9 +2171,15 @@ def discover_targets(
     return targets
 
 
-def scan_once(client: GitLabClient, state: ReviewState, config: Config) -> dict[str, int]:
+def scan_once(
+    client: GitLabClient,
+    state: ReviewState,
+    config: Config,
+    comparison_configs: Iterable[Config] | None = None,
+) -> dict[str, int]:
     targets = discover_targets(client, state)
-    if not config.llm_api_key:
+    active_comparison_configs = list(comparison_configs or [])
+    if not config.llm_api_key and not active_comparison_configs:
         if not state.initialized():
             state.mark_initialized()
         queued = sum(1 for target in targets if state.queue(target))
@@ -1909,7 +2223,16 @@ def scan_once(client: GitLabClient, state: ReviewState, config: Config) -> dict[
             f"Reviewing {target.project_path}!{target.mr_iid} at {target.head_sha[:12]}...",
             flush=True,
         )
-        status = review_target(client, state, config, target)
+        if active_comparison_configs:
+            status = review_target(
+                client,
+                state,
+                config,
+                target,
+                comparison_configs=active_comparison_configs,
+            )
+        else:
+            status = review_target(client, state, config, target)
         counters[status] = counters.get(status, 0) + 1
         print(f"Review result for {target.project_path}!{target.mr_iid}: {status}", flush=True)
     return counters
@@ -1963,22 +2286,69 @@ def run_managed_poll(
         credentials, vault_version = vault.wait_for_credentials()
         sleep_seconds = 300
         try:
+            comparison_ready = bool(
+                credentials.llm_api_key.strip()
+                and credentials.openai_api_key.strip()
+                and credentials.copilot_api_key.strip()
+            )
             config = Config.from_credentials(
                 credentials.gitlab_url,
                 credentials.gitlab_token,
-                credentials.llm_api_key,
+                credentials.llm_api_key if comparison_ready else "",
                 state.runtime_settings(),
-                llm_provider=credentials.llm_provider,
-                llm_api_url=credentials.llm_api_url,
+                llm_provider="anthropic",
                 llm_model=credentials.llm_model,
                 gitlab_group_path=credentials.gitlab_group_path,
+                review_profile="anthropic",
+            )
+            comparison_configs = (
+                [
+                    config,
+                    Config.from_credentials(
+                        credentials.gitlab_url,
+                        credentials.gitlab_token,
+                        credentials.openai_api_key,
+                        state.runtime_settings(),
+                        llm_provider="openai",
+                        llm_model=credentials.openai_model,
+                        gitlab_group_path=credentials.gitlab_group_path,
+                        review_profile="openai",
+                    ),
+                    Config.from_credentials(
+                        credentials.gitlab_url,
+                        credentials.gitlab_token,
+                        credentials.copilot_api_key,
+                        state.runtime_settings(),
+                        llm_provider="copilot",
+                        llm_model=credentials.copilot_anthropic_model,
+                        gitlab_group_path=credentials.gitlab_group_path,
+                        review_profile="copilot_anthropic",
+                    ),
+                    Config.from_credentials(
+                        credentials.gitlab_url,
+                        credentials.gitlab_token,
+                        credentials.copilot_api_key,
+                        state.runtime_settings(),
+                        llm_provider="copilot",
+                        llm_model=credentials.copilot_openai_model,
+                        gitlab_group_path=credentials.gitlab_group_path,
+                        review_profile="copilot_openai",
+                    ),
+                ]
+                if comparison_ready
+                else []
             )
             sleep_seconds = config.poll_interval_seconds
             client = GitLabClient(
                 config.gitlab_url, config.gitlab_token, config.gitlab_group_path
             )
             with lock:
-                counters = scan_once(client, state, config)
+                counters = scan_once(
+                    client,
+                    state,
+                    config,
+                    comparison_configs=comparison_configs,
+                )
                 state.set_metadata("last_gitlab_check_at", utc_now())
                 state.set_metadata("last_gitlab_check_status", "success")
                 state.set_metadata(
