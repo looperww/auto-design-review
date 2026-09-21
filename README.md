@@ -149,7 +149,7 @@ The image installs Claude Code from Anthropic's stable channel and the pinned
 GitHub Copilot Python SDK and runtime during the build. Direct OpenAI requests
 use the Responses API.
 The combined reviewer and web-console container is named
-`automated-design-review`. It runs as an unprivileged user with a read-only root
+`auto-design-review`. It runs as an unprivileged user with a read-only root
 filesystem, no Linux capabilities, no-new-privileges, and no Docker socket.
 
 ### 4. Check the service

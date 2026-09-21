@@ -1,6 +1,6 @@
 services:
   app:
-    container_name: automated-design-review
+    container_name: auto-design-review
     build:
       context: .
       args:
