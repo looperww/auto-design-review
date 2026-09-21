@@ -240,7 +240,8 @@ host interface permitted by the firewall. Do not expose this port directly to
 the internet. An SSH tunnel remains an option if direct network access is later
 disabled.
 
-The authenticated console uses a responsive sidebar with four primary pages:
+The authenticated **Design Review** console uses a responsive sidebar with four
+primary pages:
 
 - **Dashboard** is the main operational view. It shows review outcomes and the
   Critical and High security-finding queue. A compact green/red indicator

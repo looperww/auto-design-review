@@ -1688,7 +1688,7 @@ def document(title: str, body: str) -> str:
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<title>{html.escape(title)} · Security Review</title><style>{STYLE}</style>"
+        f"<title>{html.escape(title)} · Design Review</title><style>{STYLE}</style>"
         f"</head><body>{body}</body></html>"
     )
 
@@ -1733,8 +1733,8 @@ def application_page(
     shell = f"""
     <div class='app-shell'>
       <aside class='sidebar'>
-        <a class='brand' href='/' aria-label='Security Review home'>
-          <span class='brand-mark'>SR</span><span><strong>Security Review</strong><small>Automated MR assurance</small></span>
+        <a class='brand' href='/' aria-label='Design Review home'>
+          <span class='brand-mark'>DR</span><span><strong>Design Review</strong><small>Automated MR assurance</small></span>
         </a>
         <nav class='side-nav' aria-label='Primary navigation'>{navigation}</nav>
         <div class='sidebar-footer'>
@@ -1744,7 +1744,7 @@ def application_page(
         </div>
       </aside>
       <main class='app-main'><div class='content'>
-        <header class='page-header'><div><p class='eyebrow'>Security operations</p><h1>{html.escape(heading)}</h1>{subtitle_content}</div><div class='header-actions'>{header_actions}</div></header>
+        <header class='page-header'><div><p class='eyebrow'>Design Review</p><h1>{html.escape(heading)}</h1>{subtitle_content}</div><div class='header-actions'>{header_actions}</div></header>
         {body}
       </div></main>
     </div>"""
@@ -2036,7 +2036,7 @@ def handler_factory(
                 else ""
             )
             body = f"""
-            <div class='card auth'><h1>Security Review</h1><p class='sub'>Sign in to manage review settings and see results.</p>
+            <div class='card auth'><h1>Design Review</h1><p class='sub'>Sign in to manage review settings and see results.</p>
             {restart_notice}{error_html}<form method='post' action='/login'>
             <input type='hidden' name='csrf' value='{html.escape(csrf)}'>
             <div class='field'><label for='username'>Username</label><input id='username' name='username' autocomplete='username' required></div><br>
@@ -3432,7 +3432,7 @@ def run_web(managed: bool = False) -> int:
     server = ThreadingHTTPServer(
         (host, port), handler_factory(store, report_dir, secure_cookies, vault)
     )
-    print(f"Security Review web console listening on {host}:{port}", flush=True)
+    print(f"Design Review web console listening on {host}:{port}", flush=True)
     if invalidated_sessions:
         print(
             f"Invalidated {invalidated_sessions} existing web session(s) after restart.",

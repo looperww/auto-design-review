@@ -1596,6 +1596,11 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertNotIn("<admin>", rendered)
         self.assertIn("value='&#x27;csrf-token'", rendered)
         self.assertIn("Reviews active", rendered)
+        self.assertIn("aria-label='Design Review home'", rendered)
+        self.assertIn("<span class='brand-mark'>DR</span>", rendered)
+        self.assertIn("<strong>Design Review</strong>", rendered)
+        self.assertIn("<p class='eyebrow'>Design Review</p>", rendered)
+        self.assertNotIn("Security operations", rendered)
         self.assertIn("class='connection-dot up'", rendered)
         self.assertIn("GitLab connected", rendered)
 
