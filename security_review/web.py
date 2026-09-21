@@ -2854,7 +2854,8 @@ def handler_factory(
             <section class='card'><div class='section-heading'><div><h2>Repositories and MRs</h2><p class='sub'>Visible repositories and MRs first discovered after {html.escape(deployment_time + ' UTC' if deployment_time else 'initialization')}. Current filter: {html.escape(str(context['filter_label']))}.</p></div></div>
             {self.filter_controls(context, '/repositories', {'page_size': page_size})}
             <div class='grid'><div class='metric'>Visible repositories<strong>{total_repositories}</strong></div><div class='metric'>Fetched MRs<strong>{fetched_mrs}</strong></div><div class='metric'>Findings<strong>{len(findings)}</strong></div></div>
-            {page_size_control}<div class='table-wrap'><table><thead><tr><th>Repository</th><th>ID</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>"""
+            {page_size_control}<div class='table-wrap'><table><thead><tr><th>Repository</th><th>ID</th><th>Status</th><th>MRs</th><th>Findings</th><th>Latest MR</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>
+            <script src='/app.js' defer></script>"""
             self.application_response(
                 "Repositories",
                 "Repositories",

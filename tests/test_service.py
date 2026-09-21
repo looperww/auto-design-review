@@ -1484,6 +1484,7 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("<option value='50' selected>50</option>", repositories)
             self.assertIn("<option value='100' >100</option>", repositories)
             self.assertNotIn(">Apply</button>", repositories)
+            self.assertIn("<script src='/app.js' defer></script>", repositories)
             self.assertIn("form.requestSubmit()", APP_JAVASCRIPT.decode("utf-8"))
             self.assertNotIn("<h2>Review status</h2>", repositories)
             self.assertNotIn("<h2>GitLab connection</h2>", repositories)
