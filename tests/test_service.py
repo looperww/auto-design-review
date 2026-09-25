@@ -794,6 +794,29 @@ class StateTests(unittest.TestCase):
             self.assertTrue(state.has(target))
             state.close()
 
+    def test_admin_request_moves_a_queued_mr_to_the_front(self):
+        first = ReviewTarget(1, "company/app", 1, "abc1234", "")
+        second = ReviewTarget(1, "company/app", 2, "def5678", "")
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            store = WebStore(database)
+            state = ReviewState(database)
+            state.queue(first)
+            state.queue(second)
+
+            self.assertTrue(store.request_ai_review(1, 2, "def5678"))
+            queued = store.queued_reviews()
+            self.assertEqual([int(row["mr_iid"]) for row in queued], [2, 1])
+            requested = state.requested_targets()
+            self.assertEqual(len(requested), 1)
+            self.assertEqual(requested[0].mr_iid, 2)
+            self.assertEqual(requested[0].head_sha, "def5678")
+            self.assertEqual(state.prioritize_targets([first, second]), [second, first])
+
+            state.mark_in_progress(second, ["anthropic"])
+            self.assertEqual(str(store.queued_reviews()[0]["head_sha"]), "abc1234")
+            state.close()
+
     def test_web_store_projects_comparison_results_by_profile(self):
         target = ReviewTarget(1, "company/app", 3, "abc123", "https://example/mr/3")
         with tempfile.TemporaryDirectory() as directory:
@@ -835,6 +858,12 @@ class CycleLimitTests(unittest.TestCase):
 
         def has(self, target):
             return False
+
+        def requested_targets(self):
+            return []
+
+        def prioritize_targets(self, targets):
+            return list(targets)
 
         def mark_in_progress(self, target, review_profiles):
             self.in_progress.append((target, list(review_profiles)))
@@ -1502,10 +1531,16 @@ class WebAuthenticationTests(unittest.TestCase):
             user_id = store.create_first_user(
                 "security-admin", "a secure test password"
             )
-            session_token, _ = store.create_session(user_id)
+            session_token, csrf = store.create_session(user_id)
             vault = MemoryVault()
             vault.prepare("a secure test password")
-            vault.set(Credentials("https://gitlab.example.com", "test-token", ""))
+            vault.set(
+                Credentials(
+                    "https://gitlab.example.com",
+                    "test-token",
+                    "anthropic-test-key",
+                )
+            )
             state = ReviewState(root / "state.sqlite3")
             state.record_visible_projects(
                 [
@@ -1571,7 +1606,7 @@ class WebAuthenticationTests(unittest.TestCase):
                     1,
                     "company/app",
                     10,
-                    "pending-sha",
+                    "fedcba9876543210",
                     "https://gitlab.example.com/company/app/-/merge_requests/10",
                 )
             )
@@ -1579,7 +1614,7 @@ class WebAuthenticationTests(unittest.TestCase):
                 1,
                 "company/app",
                 11,
-                "active-sha",
+                "abcdef1234567890",
                 "https://gitlab.example.com/company/app/-/merge_requests/11",
             )
             state.queue(active_target)
@@ -1613,9 +1648,32 @@ class WebAuthenticationTests(unittest.TestCase):
                 ) as response:
                     repositories = response.read().decode("utf-8")
                 with urllib.request.urlopen(
+                    urllib.request.Request(base_url + "/queue", headers=headers)
+                ) as response:
+                    queue_page = response.read().decode("utf-8")
+                with urllib.request.urlopen(
                     urllib.request.Request(base_url + "/completed", headers=headers)
                 ) as response:
                     completed = response.read().decode("utf-8")
+                start_form = urllib.parse.urlencode(
+                    {
+                        "csrf": csrf,
+                        "project_id": "1",
+                        "mr_iid": "10",
+                        "head_sha": "fedcba9876543210",
+                    }
+                ).encode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        base_url + "/queue/start",
+                        data=start_form,
+                        headers={
+                            **headers,
+                            "Content-Type": "application/x-www-form-urlencoded",
+                        },
+                    )
+                ) as response:
+                    queue_after_start = response.read().decode("utf-8")
                 with urllib.request.urlopen(
                     urllib.request.Request(base_url + "/settings", headers=headers)
                 ) as response:
@@ -1639,7 +1697,7 @@ class WebAuthenticationTests(unittest.TestCase):
                     patch.object(
                         GitLabClient,
                         "get_merge_request",
-                        return_value={"sha": "pending-sha"},
+                        return_value={"sha": "fedcba9876543210"},
                     ),
                     patch.object(
                         GitLabClient,
@@ -1655,7 +1713,7 @@ class WebAuthenticationTests(unittest.TestCase):
                     with urllib.request.urlopen(
                         urllib.request.Request(
                             base_url
-                            + "/mr-diff?project_id=1&mr_iid=10&sha=pending-sha",
+                            + "/mr-diff?project_id=1&mr_iid=10&sha=fedcba9876543210",
                             headers=headers,
                         )
                     ) as response:
@@ -1740,12 +1798,19 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn(
                 "href='/repositories' aria-current='page'", repositories
             )
+            self.assertIn("<h1>Queued MRs</h1>", queue_page)
+            self.assertIn("<h2>AI reviews in progress</h2>", queue_page)
+            self.assertIn("company/app !11", queue_page)
+            self.assertIn("abcdef123456", queue_page)
+            self.assertIn("<h2>Queued merge requests</h2>", queue_page)
+            self.assertIn("company/app !10", queue_page)
+            self.assertIn("Start now", queue_page)
+            self.assertIn("href='/queue' aria-current='page'", queue_page)
+            self.assertIn("AI review requested", queue_after_start)
+            self.assertIn("Start requested", queue_after_start)
+            self.assertIn("Waiting for worker", queue_after_start)
             self.assertIn("<h1>Completed MRs</h1>", completed)
-            self.assertIn("<h2>AI reviews in progress</h2>", completed)
-            self.assertIn("company/app !11", completed)
-            self.assertIn("active-sha", completed)
-            self.assertIn("Anthropic", completed)
-            self.assertNotIn("No AI review is running now", completed)
+            self.assertNotIn("<h2>AI reviews in progress</h2>", completed)
             self.assertIn("<h2>Completed review results</h2>", completed)
             self.assertEqual(completed.count("role='tab'"), 4)
             self.assertIn("Average runtime", completed)
@@ -1810,7 +1875,7 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertEqual(mr_commits["commits"][0]["title"], "Validate shell input")
             self.assertIn("before command execution", mr_commits["commits"][0]["message"])
             self.assertEqual(mr_commits["commits"][0]["short_id"], "abcdef12")
-            cached_pending = store.mr_revision(1, 10, "pending-sha")
+            cached_pending = store.mr_revision(1, 10, "fedcba9876543210")
             self.assertIsNotNone(cached_pending)
             self.assertIn("pending_change = True", cached_pending["diff_content"])
 

@@ -1263,6 +1263,7 @@ class WebStore:
                 comparison_json TEXT NOT NULL DEFAULT '{}',
                 discovered_at TEXT NOT NULL,
                     mr_created_at TEXT NOT NULL,
+                    priority_requested_at TEXT NOT NULL DEFAULT '',
                     reviewed_at TEXT NOT NULL,
                     PRIMARY KEY (project_id, mr_iid, head_sha)
                 )
@@ -1294,6 +1295,11 @@ class WebStore:
                 connection.execute(
                     "UPDATE reviews SET mr_created_at = discovered_at "
                     "WHERE mr_created_at = ''"
+                )
+            if "priority_requested_at" not in review_columns:
+                connection.execute(
+                    "ALTER TABLE reviews ADD COLUMN "
+                    "priority_requested_at TEXT NOT NULL DEFAULT ''"
                 )
             connection.execute(
                 """
@@ -1686,6 +1692,41 @@ class WebStore:
                 """
             ).fetchall()
 
+    def queued_reviews(self) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT reviews.project_id, reviews.project_path, reviews.mr_iid,
+                       reviews.head_sha, reviews.discovered_at,
+                       reviews.priority_requested_at,
+                       projects.web_url AS project_web_url
+                FROM reviews
+                LEFT JOIN visible_projects AS projects
+                  ON projects.project_id = reviews.project_id
+                WHERE reviews.status = 'pending'
+                ORDER BY
+                    CASE WHEN reviews.priority_requested_at = '' THEN 1 ELSE 0 END,
+                    reviews.priority_requested_at ASC,
+                    reviews.discovered_at ASC,
+                    reviews.project_path COLLATE NOCASE,
+                    reviews.mr_iid
+                """
+            ).fetchall()
+
+    def request_ai_review(
+        self, project_id: int, mr_iid: int, head_sha: str
+    ) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE reviews SET priority_requested_at = ?
+                WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
+                  AND status = 'pending'
+                """,
+                (now_iso(), project_id, mr_iid, head_sha),
+            )
+            return cursor.rowcount == 1
+
     def scan_status(self) -> dict[str, str]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -1986,6 +2027,7 @@ def application_page(
     navigation_items = []
     for key, href, icon, label in (
         ("dashboard", "/", "D", "Dashboard"),
+        ("queue", "/queue", "Q", "Queued MRs"),
         ("completed", "/completed", "C", "Completed MRs"),
         ("repositories", "/repositories", "R", "Repositories"),
         ("settings", "/settings", "S", "Settings"),
@@ -2207,6 +2249,8 @@ def handler_factory(
                 self.show_settings(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/repositories":
                 self.show_repositories(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/queue":
+                self.show_queue(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/completed":
                 self.show_completed(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/report":
@@ -2246,6 +2290,8 @@ def handler_factory(
                     self.reset_review_data(form)
                 elif parsed.path == "/manual-review":
                     self.update_manual_review(form)
+                elif parsed.path == "/queue/start":
+                    self.start_queued_review(form)
                 else:
                     self.send_page(404, page("Not found", "<div class='card'><h1>Not found</h1></div>"))
             except (ReviewError, UnicodeDecodeError) as exc:
@@ -2481,6 +2527,37 @@ def handler_factory(
             ):
                 return_to = "/"
             self.redirect(return_to)
+
+        def start_queued_review(self, form: dict[str, str]) -> None:
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
+                raise ReviewError("Invalid form token.")
+            credentials, _ = vault.snapshot()
+            if credentials is None or not credentials.review_ready():
+                raise ReviewError(
+                    "Save and unlock an Anthropic API key before starting an AI review."
+                )
+            try:
+                project_id = int(form.get("project_id", ""))
+                mr_iid = int(form.get("mr_iid", ""))
+            except ValueError as exc:
+                raise ReviewError("Invalid merge-request reference.") from exc
+            head_sha = form.get("head_sha", "").strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{7,64}", head_sha):
+                raise ReviewError("Invalid merge-request revision.")
+            if not store.request_ai_review(project_id, mr_iid, head_sha):
+                raise ReviewError(
+                    "This MR revision is no longer queued. Refresh the queue and try again."
+                )
+            vault.notify_change()
+            message = (
+                "AI review requested. It will start now, or immediately after the "
+                "currently running review finishes."
+            )
+            self.redirect("/queue?message=" + urllib.parse.quote(message))
 
         def credential_context(self) -> tuple[Credentials, bytes, bytes]:
             existing, _ = vault.snapshot()
@@ -2895,7 +2972,7 @@ def handler_factory(
                 connection_status,
             )
 
-        def show_completed(self, query: dict[str, list[str]]) -> None:
+        def show_queue(self, query: dict[str, list[str]]) -> None:
             if store.user_count() == 0:
                 self.redirect("/setup")
                 return
@@ -2903,24 +2980,21 @@ def handler_factory(
             if session is None:
                 return
             _, user = session
-            selected_profile = query.get("profile", ["anthropic"])[0]
-            if selected_profile not in COMPARISON_PROFILES:
-                selected_profile = "anthropic"
-            reviews = store.completed_reviews(selected_profile)
-            manual_reviews = store.manual_review_map()
-            entries = completed_review_entries(reviews, manual_reviews)
-            ai_reviews_in_progress = store.ai_reviews_in_progress()
-            ai_progress_rows = []
-            for active_review in ai_reviews_in_progress:
-                mr_label = (
-                    f"{html.escape(str(active_review['project_path']))} "
-                    f"!{int(active_review['mr_iid'])}"
-                )
+            message = query.get("message", [""])[0]
+            notice = (
+                f"<p class='notice'>{html.escape(message)}</p>" if message else ""
+            )
+            active_reviews = store.ai_reviews_in_progress()
+            active_rows = []
+            for active_review in active_reviews:
                 project_url = str(active_review["project_web_url"] or "")
                 parsed_project_url = urllib.parse.urlparse(project_url)
+                mr_iid = int(active_review["mr_iid"])
+                mr_label = (
+                    f"{html.escape(str(active_review['project_path']))} !{mr_iid}"
+                )
                 mr_url = (
-                    project_url.rstrip("/")
-                    + f"/-/merge_requests/{int(active_review['mr_iid'])}"
+                    project_url.rstrip("/") + f"/-/merge_requests/{mr_iid}"
                     if parsed_project_url.scheme == "https"
                     and parsed_project_url.netloc
                     else ""
@@ -2961,7 +3035,7 @@ def handler_factory(
                     COMPARISON_PROFILE_LABELS.get(str(profile), str(profile))
                     for profile in active_profiles
                 ) or "Configured AI reviewer"
-                ai_progress_rows.append(
+                active_rows.append(
                     "<tr>"
                     f"<td>{mr_display}</td><td>{commit_display}</td>"
                     f"<td>{html.escape(profile_display)}</td>"
@@ -2969,9 +3043,104 @@ def handler_factory(
                     "<td><span class='review-state review-state-in_progress'>In Progress</span></td>"
                     "</tr>"
                 )
-            ai_progress_table_rows = "".join(ai_progress_rows) or (
+            active_table_rows = "".join(active_rows) or (
                 "<tr><td class='empty-state' colspan='5'>No AI review is running now. Queued MRs are waiting for their turn.</td></tr>"
             )
+
+            queued_reviews = store.queued_reviews()
+            queued_rows = []
+            for queued_review in queued_reviews:
+                project_url = str(queued_review["project_web_url"] or "")
+                parsed_project_url = urllib.parse.urlparse(project_url)
+                mr_iid = int(queued_review["mr_iid"])
+                mr_label = (
+                    f"{html.escape(str(queued_review['project_path']))} !{mr_iid}"
+                )
+                mr_url = (
+                    project_url.rstrip("/") + f"/-/merge_requests/{mr_iid}"
+                    if parsed_project_url.scheme == "https"
+                    and parsed_project_url.netloc
+                    else ""
+                )
+                mr_display = (
+                    f"<a href='{html.escape(mr_url)}' target='_blank' rel='noopener noreferrer'>{mr_label}</a>"
+                    if mr_url
+                    else mr_label
+                )
+                head_sha = str(queued_review["head_sha"])
+                commit_url = (
+                    project_url.rstrip("/")
+                    + "/-/commit/"
+                    + urllib.parse.quote(head_sha, safe="")
+                    if parsed_project_url.scheme == "https"
+                    and parsed_project_url.netloc
+                    else ""
+                )
+                commit_display = (
+                    f"<a href='{html.escape(commit_url)}' target='_blank' rel='noopener noreferrer'><code>{html.escape(head_sha[:12])}</code></a>"
+                    if commit_url
+                    else f"<code>{html.escape(head_sha[:12])}</code>"
+                )
+                queued_at = (
+                    str(queued_review["discovered_at"])[:19].replace("T", " ")
+                    + " UTC"
+                )
+                requested_at = str(queued_review["priority_requested_at"] or "")
+                if requested_at:
+                    queue_status = (
+                        "<span class='review-state review-state-in_progress'>Start requested</span>"
+                    )
+                    action = "<span class='sub'>Waiting for worker</span>"
+                else:
+                    queue_status = "<span class='review-state review-state-open'>Queued</span>"
+                    action = (
+                        "<form method='post' action='/queue/start'>"
+                        f"<input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'>"
+                        f"<input type='hidden' name='project_id' value='{int(queued_review['project_id'])}'>"
+                        f"<input type='hidden' name='mr_iid' value='{mr_iid}'>"
+                        f"<input type='hidden' name='head_sha' value='{html.escape(head_sha)}'>"
+                        "<button class='secondary' type='submit'>Start now</button></form>"
+                    )
+                queued_rows.append(
+                    "<tr>"
+                    f"<td>{mr_display}</td><td>{commit_display}</td>"
+                    f"<td>{html.escape(queued_at)}</td><td>{queue_status}</td>"
+                    f"<td>{action}</td></tr>"
+                )
+            queued_table_rows = "".join(queued_rows) or (
+                "<tr><td class='empty-state' colspan='5'>No MR revisions are waiting for AI review.</td></tr>"
+            )
+            body = f"""
+            {notice}
+            <section class='card'><div class='section-heading'><div><h2>AI reviews in progress</h2><p class='sub'>Merge requests currently being fetched, analyzed, or reviewed by the configured AI model.</p></div><span class='review-state review-state-in_progress'>{len(active_reviews)} running</span></div>
+            <div class='table-wrap'><table><thead><tr><th>MR</th><th>Commit</th><th>Model review</th><th>Started time</th><th>Status</th></tr></thead><tbody>{active_table_rows}</tbody></table></div></section>
+            <section class='card'><div class='section-heading'><div><h2>Queued merge requests</h2><p class='sub'>Every MR revision waiting for automated review. Start now moves a revision to the front of the queue and wakes the reviewer.</p></div><span class='review-state review-state-open'>{len(queued_reviews)} queued</span></div>
+            <div class='table-wrap'><table><thead><tr><th>MR</th><th>Commit</th><th>Queued time</th><th>Queue status</th><th>Action</th></tr></thead><tbody>{queued_table_rows}</tbody></table></div></section>"""
+            self.application_response(
+                "Queued MRs",
+                "Queued MRs",
+                "Monitor and prioritize pending automated reviews.",
+                body,
+                user,
+                "queue",
+                "<a class='button secondary' href='/completed'>View completed MRs</a>",
+                self.gitlab_connection_status(),
+            )
+
+        def show_completed(self, query: dict[str, list[str]]) -> None:
+            if store.user_count() == 0:
+                self.redirect("/setup")
+                return
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            selected_profile = query.get("profile", ["anthropic"])[0]
+            if selected_profile not in COMPARISON_PROFILES:
+                selected_profile = "anthropic"
+            reviews = store.completed_reviews(selected_profile)
+            manual_reviews = store.manual_review_map()
+            entries = completed_review_entries(reviews, manual_reviews)
             selected_severity = query.get("severity", ["all"])[0].lower()
             if selected_severity not in COMPLETED_SEVERITIES:
                 selected_severity = "all"
@@ -3148,8 +3317,6 @@ def handler_factory(
                 result_range = "No review results to display"
             pagination = f"<div class='pagination'><p class='sub'>{result_range}</p><div class='actions'>{previous_page}<span>Page {page_number} of {page_count}</span>{next_page}</div></div>"
             body = f"""
-            <section class='card'><div class='section-heading'><div><h2>AI reviews in progress</h2><p class='sub'>Merge requests currently being fetched, analyzed, or reviewed by the configured AI model.</p></div><span class='review-state review-state-in_progress'>{len(ai_reviews_in_progress)} running</span></div>
-            <div class='table-wrap'><table><thead><tr><th>MR</th><th>Commit</th><th>Model review</th><th>Started time</th><th>Status</th></tr></thead><tbody>{ai_progress_table_rows}</tbody></table></div></section>
             <section class='card' id='completed-review-results'><div class='section-heading'><div><h2>Completed review results</h2><p class='sub'>Latest {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} result for every reviewed MR, including reviews with no findings. Select a row to inspect the evidence.</p></div><span class='severity severity-safe'>{len(reviews)} MRs</span></div>
             {self.model_tabs('/completed', selected_profile, {'severity': selected_severity, 'manual_status': selected_status})}
             {self.usage_tiles(reviews, selected_profile)}

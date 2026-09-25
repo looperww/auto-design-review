@@ -260,7 +260,7 @@ host interface permitted by the firewall. Do not expose this port directly to
 the internet. An SSH tunnel remains an option if direct network access is later
 disabled.
 
-The authenticated **Design Review** console uses a responsive sidebar with four
+The authenticated **Design Review** console uses a responsive sidebar with five
 primary pages:
 
 - **Dashboard** is the main operational view. It shows automated-review
@@ -270,12 +270,15 @@ primary pages:
   compact summary for the selected tab shows completed reviews, average runtime,
   input/output tokens, and the cost value reported by that service. A green/red
   indicator beneath the page title shows the latest GitLab connection status.
+- **Queued MRs** lists every revision waiting for automated review and the MR
+  currently being processed. An administrator can select **Start now** to move a
+  queued revision to the front, wake the worker, and start it immediately after
+  any already-running review finishes.
 - **Completed MRs** lists the latest completed review for every MR, including
   SAFE reviews with no findings. The same four tabs keep each model's results
-  separate. A dedicated live section lists MRs currently being processed by the
-  automated AI reviewer. Completed results can be filtered by severity and human
-  review status, and each row expands to show the reviewed diff, review summary,
-  severity rationale, finding evidence, and recorded human decision.
+  separate. Results can be filtered by severity and human review status, and
+  each row expands to show the reviewed diff, review summary, severity rationale,
+  finding evidence, and recorded human decision.
 - **Repositories** provides a focused inventory of repository coverage,
   per-repository access status, MR activity, finding totals, date filters, and
   pagination. Overall GitLab health remains in the compact Dashboard header.

@@ -803,6 +803,7 @@ class ReviewState:
                 comparison_json TEXT NOT NULL DEFAULT '{}',
                 discovered_at TEXT NOT NULL,
                 mr_created_at TEXT NOT NULL,
+                priority_requested_at TEXT NOT NULL DEFAULT '',
                 reviewed_at TEXT NOT NULL,
                 PRIMARY KEY (project_id, mr_iid, head_sha)
             )
@@ -833,6 +834,11 @@ class ReviewState:
             self.connection.execute(
                 "UPDATE reviews SET mr_created_at = discovered_at "
                 "WHERE mr_created_at = ''"
+            )
+        if "priority_requested_at" not in review_columns:
+            self.connection.execute(
+                "ALTER TABLE reviews ADD COLUMN "
+                "priority_requested_at TEXT NOT NULL DEFAULT ''"
             )
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -933,6 +939,62 @@ class ReviewState:
             ),
         )
 
+    def requested_targets(self) -> list[ReviewTarget]:
+        rows = self.connection.execute(
+            """
+            SELECT project_id, project_path, mr_iid, head_sha, mr_created_at
+            FROM reviews
+            WHERE status = 'pending' AND priority_requested_at != ''
+            ORDER BY priority_requested_at ASC
+            """
+        ).fetchall()
+        return [
+            ReviewTarget(
+                int(row[0]),
+                str(row[1]),
+                int(row[2]),
+                str(row[3]),
+                "",
+                str(row[4] or ""),
+            )
+            for row in rows
+        ]
+
+    def prioritize_targets(self, targets: Iterable[ReviewTarget]) -> list[ReviewTarget]:
+        requested = {
+            (int(row[0]), int(row[1]), str(row[2])): str(row[3])
+            for row in self.connection.execute(
+                """
+                SELECT project_id, mr_iid, head_sha, priority_requested_at
+                FROM reviews
+                WHERE status = 'pending' AND priority_requested_at != ''
+                """
+            ).fetchall()
+        }
+        indexed = list(enumerate(targets))
+        indexed.sort(
+            key=lambda item: (
+                0
+                if (
+                    item[1].project_id,
+                    item[1].mr_iid,
+                    item[1].head_sha,
+                )
+                in requested
+                else 1,
+                requested.get(
+                    (
+                        item[1].project_id,
+                        item[1].mr_iid,
+                        item[1].head_sha,
+                    ),
+                    "",
+                ),
+                item[0],
+            )
+        )
+        return [target for _, target in indexed]
+
     def record(
         self,
         target: ReviewTarget,
@@ -958,6 +1020,7 @@ class ReviewState:
                 diff_content = excluded.diff_content,
                 metadata_json = excluded.metadata_json,
                 mr_created_at = excluded.mr_created_at,
+                priority_requested_at = '',
                 reviewed_at = excluded.reviewed_at
             """,
             (
@@ -1016,6 +1079,7 @@ class ReviewState:
                 metadata_json = excluded.metadata_json,
                 comparison_json = excluded.comparison_json,
                 mr_created_at = excluded.mr_created_at,
+                priority_requested_at = '',
                 reviewed_at = excluded.reviewed_at
             """,
             (
@@ -2221,6 +2285,18 @@ def scan_once(
     comparison_configs: Iterable[Config] | None = None,
 ) -> dict[str, int]:
     targets = discover_targets(client, state)
+    target_keys = {
+        (target.project_id, target.mr_iid, target.head_sha) for target in targets
+    }
+    for requested_target in state.requested_targets():
+        key = (
+            requested_target.project_id,
+            requested_target.mr_iid,
+            requested_target.head_sha,
+        )
+        if key not in target_keys:
+            targets.append(requested_target)
+            target_keys.add(key)
     active_comparison_configs = list(comparison_configs or [])
     if not config.llm_api_key and not active_comparison_configs:
         if not state.initialized():
@@ -2250,18 +2326,23 @@ def scan_once(
             )
             return {"discovered": len(targets), "baseline": len(targets), "pending": 0}
 
-    pending = [target for target in targets if not state.has(target)]
-    selected = (
-        pending
+    pending = state.prioritize_targets(
+        target for target in targets if not state.has(target)
+    )
+    review_limit = (
+        len(pending)
         if config.max_reviews_per_cycle == 0
-        else pending[: config.max_reviews_per_cycle]
+        else min(config.max_reviews_per_cycle, len(pending))
     )
     counters: dict[str, int] = {
         "discovered": len(targets),
         "pending": len(pending),
-        "deferred": len(pending) - len(selected),
+        "deferred": len(pending) - review_limit,
     }
-    for target in selected:
+    remaining = list(pending)
+    for _ in range(review_limit):
+        remaining = state.prioritize_targets(remaining)
+        target = remaining.pop(0)
         active_profiles = (
             [profile.review_profile for profile in active_comparison_configs]
             if active_comparison_configs
