@@ -263,8 +263,9 @@ disabled.
 The authenticated **Design Review** console uses a responsive sidebar with four
 primary pages:
 
-- **Dashboard** is the main operational view. It shows review outcomes and the
-  Critical and High security-finding queue. Four tabs switch between the direct
+- **Dashboard** is the main operational view. It shows review outcomes, MRs
+  currently under human review, and the Critical and High security-finding
+  queue. Four tabs switch between the direct
   Anthropic, direct OpenAI, Copilot Anthropic, and Copilot OpenAI findings. A
   compact summary for the selected tab shows completed reviews, average runtime,
   input/output tokens, and the cost value reported by that service. A green/red
@@ -402,8 +403,9 @@ confirmed Critical and High findings for the active period. Each row shows the
 finding title, a direct link to the corresponding GitLab MR, an expandable
 vulnerability details panel, and the human-review status control.
 
-The Completed MRs table adds **Manual review** to the common **Severity**,
-**Finding title**, **MR**, and **Vulnerability details** columns. It includes
+The Completed MRs table adds **Completed time** and **Manual review** to the
+common **Severity**, **Finding title**, **MR**, and **Vulnerability details**
+columns. It includes
 Critical, High, Medium, Low, and SAFE results, supports severity and
 human-review-status filters, and displays 20 rows per page. Clicking a result
 row expands a full-width evidence panel with the reviewed diff and the same

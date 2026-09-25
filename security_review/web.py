@@ -611,6 +611,44 @@ def completed_review_entries(
     return entries
 
 
+def in_progress_mr_entries(
+    entries: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return one representative row for every MR under active human review."""
+    grouped: dict[tuple[int, int, str], dict[str, Any]] = {}
+    severity_order = {**SEVERITY_ORDER, "SAFE": len(SEVERITY_ORDER)}
+    for entry in entries:
+        if str(entry.get("manual_status", "")) != "in_progress":
+            continue
+        key = (
+            int(entry["project_id"]),
+            int(entry["mr_iid"]),
+            str(entry["head_sha"]),
+        )
+        current = grouped.get(key)
+        if current is None:
+            current = dict(entry)
+            current["in_progress_items"] = 1
+            grouped[key] = current
+            continue
+        current["in_progress_items"] = int(current["in_progress_items"]) + 1
+        if severity_order.get(str(entry["severity"]), 99) < severity_order.get(
+            str(current["severity"]), 99
+        ):
+            item_count = int(current["in_progress_items"])
+            current.update(entry)
+            current["in_progress_items"] = item_count
+    return sorted(
+        grouped.values(),
+        key=lambda entry: (
+            str(entry.get("reviewed_at", "")),
+            str(entry.get("project_path", "")).casefold(),
+            int(entry.get("mr_iid", 0)),
+        ),
+        reverse=True,
+    )
+
+
 def manual_review_status_for_mr(
     project_id: int,
     mr_iid: int,
@@ -2843,6 +2881,48 @@ def handler_factory(
                 for finding in findings
                 if str(finding["severity"]) in {"CRITICAL", "HIGH"}
             ]
+            in_progress_mrs = in_progress_mr_entries(
+                completed_review_entries(profile_reports, manual_reviews)
+            )
+            in_progress_rows = []
+            for entry in in_progress_mrs:
+                severity = str(entry["severity"])
+                mr_label = (
+                    f"{html.escape(str(entry['project_path']))} !{int(entry['mr_iid'])}"
+                )
+                mr_url = str(entry["mr_url"])
+                mr_display = (
+                    f"<a href='{html.escape(mr_url)}' target='_blank' rel='noopener noreferrer'>{mr_label}</a>"
+                    if mr_url
+                    else mr_label
+                )
+                completed_at = (
+                    str(entry["reviewed_at"])[:19].replace("T", " ") + " UTC"
+                )
+                item_count = int(entry["in_progress_items"])
+                item_label = (
+                    html.escape(str(entry["title"]))
+                    if item_count == 1
+                    else f"{item_count} review items"
+                )
+                completed_query = urllib.parse.urlencode(
+                    {
+                        "profile": selected_profile,
+                        "severity": "all",
+                        "manual_status": "in_progress",
+                    }
+                )
+                in_progress_rows.append(
+                    "<tr>"
+                    f"<td><span class='severity severity-{severity.lower()}'>{html.escape(severity)}</span></td>"
+                    f"<td>{mr_display}</td><td>{item_label}</td>"
+                    f"<td>{html.escape(completed_at)}</td>"
+                    f"<td><a class='button secondary' href='/completed?{html.escape(completed_query)}'>Open review</a></td>"
+                    "</tr>"
+                )
+            in_progress_table_rows = "".join(in_progress_rows) or (
+                "<tr><td class='empty-state' colspan='5'>No MRs are currently in progress for this model and period.</td></tr>"
+            )
             date_notice = (
                 f"<p class='error'>{html.escape(str(context['date_error']))}</p>"
                 if context["date_error"]
@@ -2855,9 +2935,12 @@ def handler_factory(
               <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
               <div class='metric success'>Completed<strong>{counts.get('completed', 0)}</strong></div>
               <div class='metric critical'>High findings<strong>{len(findings)}</strong></div>
+              <div class='metric'>In progress<strong>{len(in_progress_mrs)}</strong></div>
               <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
               <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div>
             </div></section>
+            <section class='card'><div class='section-heading'><div><h2>MRs in progress</h2><p class='sub'>Merge requests currently being verified by the security team for {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} in {html.escape(str(context['filter_label']))}.</p></div><span class='review-state review-state-in_progress'>{len(in_progress_mrs)} MRs</span></div>
+            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>MR</th><th>Review item</th><th>Completed time</th><th>Action</th></tr></thead><tbody>{in_progress_table_rows}</tbody></table></div></section>
             <section class='card'><div class='section-heading'><div><h2>High-severity findings</h2><p class='sub'>Critical and High findings from {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} for the latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
             {self.model_tabs('/', selected_profile, context['activity_query'])}
             {self.usage_tiles(profile_reports, selected_profile)}
@@ -3031,10 +3114,10 @@ def handler_factory(
                 rows.append(
                     f"<tr class='expandable-row' data-details-id='{detail_id}' tabindex='0' role='button' aria-expanded='false'>"
                     f"<td><span class='severity severity-{severity.lower()}'>{html.escape(severity)}</span></td>"
-                    f"<td>{html.escape(str(entry['title']))}</td><td>{mr_display}</td>"
+                    f"<td>{html.escape(str(entry['title']))}</td><td>{mr_display}</td><td>{html.escape(reviewed_at)}</td>"
                     "<td><button class='row-toggle secondary' type='button'>View review</button></td>"
                     f"<td>{action}</td></tr>"
-                    f"<tr class='expanded-review' id='{detail_id}' hidden><td colspan='5'><div class='review-details'>"
+                    f"<tr class='expanded-review' id='{detail_id}' hidden><td colspan='6'><div class='review-details'>"
                     "<div class='review-detail-grid'>"
                     f"<section class='review-section'><h3>Review summary</h3><p class='review-copy'>{html.escape(str(entry['summary']))}</p></section>"
                     f"<section class='review-section'><h3>Severity explanation</h3><p class='review-copy'>{html.escape(str(entry['severity_explanation']))}</p></section>"
@@ -3045,7 +3128,7 @@ def handler_factory(
                     "</div></td></tr>"
                 )
             table_rows = "".join(rows) or (
-                "<tr><td class='empty-state' colspan='5'>No completed reviews match these filters.</td></tr>"
+                "<tr><td class='empty-state' colspan='6'>No completed reviews match these filters.</td></tr>"
             )
             page_query = {"profile": selected_profile, "severity": selected_severity, "manual_status": selected_status}
             previous_page = (
@@ -3071,7 +3154,7 @@ def handler_factory(
             {self.usage_tiles(reviews, selected_profile)}
             <nav class='severity-filter' aria-label='Filter completed reviews by severity'>{filter_links}</nav>
             <nav class='severity-filter' aria-label='Filter completed reviews by manual-review status'>{status_filter_links}</nav>
-            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th><th>Manual review</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>
+            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Completed time</th><th>Vulnerability details</th><th>Manual review</th></tr></thead><tbody>{table_rows}</tbody></table></div>{pagination}</section>
             {manual_review_dialog(str(user['csrf_token']))}<script src='/app.js' defer></script>"""
             self.application_response(
                 "Completed MRs",

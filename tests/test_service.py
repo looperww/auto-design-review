@@ -67,6 +67,7 @@ from security_review.web import (  # noqa: E402
     report_section,
     render_diff_html,
     handler_factory,
+    in_progress_mr_entries,
     validated_credentials,
     verify_password,
 )
@@ -1127,6 +1128,47 @@ class DiscoveryInventoryTests(unittest.TestCase):
         self.assertEqual(completed[0]["manual_resolution"], "false_positive")
         self.assertIn("server-controlled", completed[0]["manual_comments"])
 
+    def test_in_progress_entries_are_grouped_by_mr_and_keep_highest_severity(self):
+        entries = [
+            {
+                "project_id": 1,
+                "project_path": "company/app",
+                "mr_iid": 7,
+                "head_sha": "abcdef",
+                "severity": "MEDIUM",
+                "title": "Information disclosure",
+                "reviewed_at": "2026-09-25T10:00:00+00:00",
+                "manual_status": "in_progress",
+            },
+            {
+                "project_id": 1,
+                "project_path": "company/app",
+                "mr_iid": 7,
+                "head_sha": "abcdef",
+                "severity": "HIGH",
+                "title": "Authorization bypass",
+                "reviewed_at": "2026-09-25T10:00:00+00:00",
+                "manual_status": "in_progress",
+            },
+            {
+                "project_id": 2,
+                "project_path": "company/other",
+                "mr_iid": 8,
+                "head_sha": "123456",
+                "severity": "LOW",
+                "title": "Verbose response",
+                "reviewed_at": "2026-09-25T11:00:00+00:00",
+                "manual_status": "open",
+            },
+        ]
+
+        grouped = in_progress_mr_entries(entries)
+
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped[0]["severity"], "HIGH")
+        self.assertEqual(grouped[0]["title"], "Authorization bypass")
+        self.assertEqual(grouped[0]["in_progress_items"], 2)
+
     def test_diff_html_uses_light_syntax_classes_and_escapes_code(self):
         rendered = render_diff_html(
             "## Changed file: app.py\n@@ -1 +1 @@\n-old <value>\n+new & safe\n context"
@@ -1543,6 +1585,17 @@ class WebAuthenticationTests(unittest.TestCase):
                 )
             )
             state.close()
+            store.save_manual_review(
+                1,
+                7,
+                "high-sha",
+                "mr",
+                "in_progress",
+                "",
+                "",
+                "Investigating the reported command path.",
+                "security-admin",
+            )
             handler = handler_factory(store, root / "reports", False, vault)
             handler.log_message = lambda *_args: None
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -1647,6 +1700,9 @@ class WebAuthenticationTests(unittest.TestCase):
 
             self.assertIn("<h1>Review dashboard</h1>", dashboard)
             self.assertIn("<h2>Review status</h2>", dashboard)
+            self.assertIn("<h2>MRs in progress</h2>", dashboard)
+            self.assertIn("company/app !7", dashboard)
+            self.assertNotIn("No MRs are currently in progress", dashboard)
             self.assertIn("<h2>High-severity findings</h2>", dashboard)
             self.assertEqual(dashboard.count("role='tab'"), 4)
             self.assertIn("Copilot · Anthropic", dashboard)
@@ -1706,7 +1762,11 @@ class WebAuthenticationTests(unittest.TestCase):
                 "<th>Vulnerability details</th>"
             )
             self.assertIn(expected_columns, dashboard)
-            self.assertIn(expected_columns, completed)
+            completed_columns = (
+                "<th>Severity</th><th>Finding title</th><th>MR</th>"
+                "<th>Completed time</th><th>Vulnerability details</th>"
+            )
+            self.assertIn(completed_columns, completed)
             self.assertIn("<th>Manual review</th>", dashboard)
             self.assertIn("<th>Manual review</th>", completed)
             self.assertIn("name='anthropic_api_key'", settings_page)
