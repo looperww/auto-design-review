@@ -272,10 +272,10 @@ primary pages:
   indicator beneath the page title shows the latest GitLab connection status.
 - **Completed MRs** lists the latest completed review for every MR, including
   SAFE reviews with no findings. The same four tabs keep each model's results
-  separate. A dedicated section lists completed MRs currently under manual
-  review. Results can be filtered by severity and human review status, and each
-  row expands to show the reviewed diff, review summary, severity rationale,
-  finding evidence, and recorded human decision.
+  separate. A dedicated live section lists MRs currently being processed by the
+  automated AI reviewer. Completed results can be filtered by severity and human
+  review status, and each row expands to show the reviewed diff, review summary,
+  severity rationale, finding evidence, and recorded human decision.
 - **Repositories** provides a focused inventory of repository coverage,
   per-repository access status, MR activity, finding totals, date filters, and
   pagination. Overall GitLab health remains in the compact Dashboard header.
@@ -285,16 +285,18 @@ primary pages:
 The sidebar also shows the current reviewer state and signed-in administrator.
 Stored secrets are never displayed again.
 
-**Queued** and **In Progress** describe different workflows. Queued means an MR
-revision is waiting for the automated model review. In Progress is a human-review
-status selected by an administrator after opening a completed assessment. The
-automated worker processes queued MRs sequentially, and the active MR remains
-counted as queued until its result is saved. The container log prints `Reviewing
-<project>!<MR>` while that model call is running.
+**Queued** means an MR revision is waiting for the automated model review.
+Immediately before fetching its context and invoking the configured model, the
+service changes it to **In Progress**. It becomes Completed, High Severity,
+Manual Review Required, or Failed when processing finishes. The worker processes
+queued MRs sequentially, so normally only one MR is In Progress at a time. The
+container log also prints `Reviewing <project>!<MR>` while that review is running.
+An interrupted In Progress review remains retryable on the next polling cycle.
 
 Every finding row on the Dashboard and Completed MRs page, and every MR row on
 the repository-specific MR page, has a human-review control. Its default state
-is **Open**. An administrator can change it to **In Progress** or **Done**. A
+is **Open**. An administrator can change it to **Under Verification** or
+**Done**. A
 Done decision requires the administrator to choose **False positive** or
 **Confirmed finding**, select a severity for a confirmed finding, and record
 comments explaining the verification decision. These decisions are stored in
@@ -307,7 +309,7 @@ the original AI evidence, and the human comments, preserving the audit trail.
 An MR-level decision made from the repository MR page applies to the entire MR
 revision; a finding-level decision takes precedence for that individual
 finding. New MR commits start with a fresh Open status. Completed MRs and
-repository MR lists can both be filtered by Open, In Progress, or Done.
+repository MR lists can both be filtered by Open, Under Verification, or Done.
 
 The Settings page also provides a protected **Reset repository and MR data**
 action. The administrator must type `RESET` exactly before it runs. The reset

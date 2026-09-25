@@ -891,7 +891,7 @@ class ReviewState:
             "SELECT status FROM reviews WHERE project_id = ? AND mr_iid = ? AND head_sha = ?",
             (target.project_id, target.mr_iid, target.head_sha),
         ).fetchone()
-        return row is not None and str(row[0]) != "pending"
+        return row is not None and str(row[0]) not in {"pending", "in_progress"}
 
     def queue(self, target: ReviewTarget) -> bool:
         discovered_at = utc_now()
@@ -914,6 +914,24 @@ class ReviewState:
         )
         self.connection.commit()
         return cursor.rowcount > 0
+
+    def mark_in_progress(
+        self, target: ReviewTarget, review_profiles: Iterable[str]
+    ) -> None:
+        """Persist that the automated reviewer is actively processing an MR."""
+        started_at = utc_now()
+        self.record(
+            target,
+            "in_progress",
+            metadata_json=json.dumps(
+                {
+                    "status": "in_progress",
+                    "started_at": started_at,
+                    "review_profiles": list(review_profiles),
+                },
+                sort_keys=True,
+            ),
+        )
 
     def record(
         self,
@@ -2244,6 +2262,12 @@ def scan_once(
         "deferred": len(pending) - len(selected),
     }
     for target in selected:
+        active_profiles = (
+            [profile.review_profile for profile in active_comparison_configs]
+            if active_comparison_configs
+            else [config.review_profile]
+        )
+        state.mark_in_progress(target, active_profiles)
         print(
             f"Reviewing {target.project_path}!{target.mr_iid} at {target.head_sha[:12]}...",
             flush=True,

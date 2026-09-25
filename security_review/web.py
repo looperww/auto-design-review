@@ -611,44 +611,6 @@ def completed_review_entries(
     return entries
 
 
-def in_progress_mr_entries(
-    entries: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Return one representative row for every MR under active human review."""
-    grouped: dict[tuple[int, int, str], dict[str, Any]] = {}
-    severity_order = {**SEVERITY_ORDER, "SAFE": len(SEVERITY_ORDER)}
-    for entry in entries:
-        if str(entry.get("manual_status", "")) != "in_progress":
-            continue
-        key = (
-            int(entry["project_id"]),
-            int(entry["mr_iid"]),
-            str(entry["head_sha"]),
-        )
-        current = grouped.get(key)
-        if current is None:
-            current = dict(entry)
-            current["in_progress_items"] = 1
-            grouped[key] = current
-            continue
-        current["in_progress_items"] = int(current["in_progress_items"]) + 1
-        if severity_order.get(str(entry["severity"]), 99) < severity_order.get(
-            str(current["severity"]), 99
-        ):
-            item_count = int(current["in_progress_items"])
-            current.update(entry)
-            current["in_progress_items"] = item_count
-    return sorted(
-        grouped.values(),
-        key=lambda entry: (
-            str(entry.get("reviewed_at", "")),
-            str(entry.get("project_path", "")).casefold(),
-            int(entry.get("mr_iid", 0)),
-        ),
-        reverse=True,
-    )
-
-
 def manual_review_status_for_mr(
     project_id: int,
     mr_iid: int,
@@ -691,7 +653,7 @@ def manual_review_button(
 ) -> str:
     label = {
         "open": "Open",
-        "in_progress": "In Progress",
+        "in_progress": "Under Verification",
         "done": "Done",
     }.get(workflow_status, "Open")
     return (
@@ -723,7 +685,7 @@ def manual_review_dialog(csrf_token: str) -> str:
         <button class='dialog-close secondary' type='button' aria-label='Close'>Close</button></div>
         <div class='field'><label for='manual_workflow_status'>Status</label>
           <select id='manual_workflow_status' name='workflow_status'>
-            <option value='open'>Open</option><option value='in_progress'>In Progress</option><option value='done'>Done</option>
+            <option value='open'>Open</option><option value='in_progress'>Under Verification</option><option value='done'>Done</option>
           </select>
         </div>
         <div id='manual-resolution-fields' hidden>
@@ -1705,6 +1667,24 @@ class WebStore:
                 """
             ).fetchall()
         return counts, recent
+
+    def ai_reviews_in_progress(self) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT reviews.project_id, reviews.project_path, reviews.mr_iid,
+                       reviews.head_sha, reviews.reviewed_at AS started_at,
+                       reviews.metadata_json,
+                       projects.web_url AS project_web_url
+                FROM reviews
+                LEFT JOIN visible_projects AS projects
+                  ON projects.project_id = reviews.project_id
+                WHERE reviews.status = 'in_progress'
+                ORDER BY reviews.reviewed_at ASC,
+                         reviews.project_path COLLATE NOCASE,
+                         reviews.mr_iid
+                """
+            ).fetchall()
 
     def scan_status(self) -> dict[str, str]:
         with self.connect() as connection:
@@ -2888,9 +2868,10 @@ def handler_factory(
             )
             body = f"""
             {date_notice}{self.vault_notice()}
-            <section class='card'><div class='section-heading'><div><h2>Review status</h2><p class='sub'>Automated-review outcomes across all recorded merge-request revisions. Human-review progress is shown on Completed MRs.</p></div></div>
+            <section class='card'><div class='section-heading'><div><h2>Review status</h2><p class='sub'>Automated-review activity and outcomes across all recorded merge-request revisions.</p></div></div>
             <div class='grid'>
               <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
+              <div class='metric'>In progress<strong>{counts.get('in_progress', 0)}</strong></div>
               <div class='metric success'>Completed<strong>{counts.get('completed', 0)}</strong></div>
               <div class='metric critical'>High findings<strong>{len(findings)}</strong></div>
               <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
@@ -2928,45 +2909,68 @@ def handler_factory(
             reviews = store.completed_reviews(selected_profile)
             manual_reviews = store.manual_review_map()
             entries = completed_review_entries(reviews, manual_reviews)
-            in_progress_mrs = in_progress_mr_entries(entries)
-            in_progress_rows = []
-            for entry in in_progress_mrs:
-                severity = str(entry["severity"])
+            ai_reviews_in_progress = store.ai_reviews_in_progress()
+            ai_progress_rows = []
+            for active_review in ai_reviews_in_progress:
                 mr_label = (
-                    f"{html.escape(str(entry['project_path']))} !{int(entry['mr_iid'])}"
+                    f"{html.escape(str(active_review['project_path']))} "
+                    f"!{int(active_review['mr_iid'])}"
                 )
-                mr_url = str(entry["mr_url"])
+                project_url = str(active_review["project_web_url"] or "")
+                parsed_project_url = urllib.parse.urlparse(project_url)
+                mr_url = (
+                    project_url.rstrip("/")
+                    + f"/-/merge_requests/{int(active_review['mr_iid'])}"
+                    if parsed_project_url.scheme == "https"
+                    and parsed_project_url.netloc
+                    else ""
+                )
                 mr_display = (
                     f"<a href='{html.escape(mr_url)}' target='_blank' rel='noopener noreferrer'>{mr_label}</a>"
                     if mr_url
                     else mr_label
                 )
-                completed_at = (
-                    str(entry["reviewed_at"])[:19].replace("T", " ") + " UTC"
+                head_sha = str(active_review["head_sha"])
+                commit_url = (
+                    project_url.rstrip("/")
+                    + "/-/commit/"
+                    + urllib.parse.quote(head_sha, safe="")
+                    if parsed_project_url.scheme == "https"
+                    and parsed_project_url.netloc
+                    else ""
                 )
-                item_count = int(entry["in_progress_items"])
-                item_label = (
-                    html.escape(str(entry["title"]))
-                    if item_count == 1
-                    else f"{item_count} review items"
+                commit_display = (
+                    f"<a href='{html.escape(commit_url)}' target='_blank' rel='noopener noreferrer'><code>{html.escape(head_sha[:12])}</code></a>"
+                    if commit_url
+                    else f"<code>{html.escape(head_sha[:12])}</code>"
                 )
-                completed_query = urllib.parse.urlencode(
-                    {
-                        "profile": selected_profile,
-                        "severity": "all",
-                        "manual_status": "in_progress",
-                    }
+                started_at = (
+                    str(active_review["started_at"])[:19].replace("T", " ")
+                    + " UTC"
                 )
-                in_progress_rows.append(
+                try:
+                    active_metadata = json.loads(
+                        str(active_review["metadata_json"] or "{}")
+                    )
+                except json.JSONDecodeError:
+                    active_metadata = {}
+                active_profiles = active_metadata.get("review_profiles", [])
+                if not isinstance(active_profiles, list):
+                    active_profiles = []
+                profile_display = ", ".join(
+                    COMPARISON_PROFILE_LABELS.get(str(profile), str(profile))
+                    for profile in active_profiles
+                ) or "Configured AI reviewer"
+                ai_progress_rows.append(
                     "<tr>"
-                    f"<td><span class='severity severity-{severity.lower()}'>{html.escape(severity)}</span></td>"
-                    f"<td>{mr_display}</td><td>{item_label}</td>"
-                    f"<td>{html.escape(completed_at)}</td>"
-                    f"<td><a class='button secondary' href='/completed?{html.escape(completed_query)}#completed-review-results'>Open review</a></td>"
+                    f"<td>{mr_display}</td><td>{commit_display}</td>"
+                    f"<td>{html.escape(profile_display)}</td>"
+                    f"<td>{html.escape(started_at)}</td>"
+                    "<td><span class='review-state review-state-in_progress'>In Progress</span></td>"
                     "</tr>"
                 )
-            in_progress_table_rows = "".join(in_progress_rows) or (
-                "<tr><td class='empty-state' colspan='5'>No completed MRs are currently under manual review.</td></tr>"
+            ai_progress_table_rows = "".join(ai_progress_rows) or (
+                "<tr><td class='empty-state' colspan='5'>No AI review is running now. Queued MRs are waiting for their turn.</td></tr>"
             )
             selected_severity = query.get("severity", ["all"])[0].lower()
             if selected_severity not in COMPLETED_SEVERITIES:
@@ -3030,7 +3034,7 @@ def handler_factory(
                 for value, label in (
                     ("all", "All statuses"),
                     ("open", "Open"),
-                    ("in_progress", "In Progress"),
+                    ("in_progress", "Under Verification"),
                     ("done", "Done"),
                 )
             )
@@ -3144,8 +3148,8 @@ def handler_factory(
                 result_range = "No review results to display"
             pagination = f"<div class='pagination'><p class='sub'>{result_range}</p><div class='actions'>{previous_page}<span>Page {page_number} of {page_count}</span>{next_page}</div></div>"
             body = f"""
-            <section class='card'><div class='section-heading'><div><h2>Manual reviews in progress</h2><p class='sub'>Completed {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} assessments currently being verified by the security team.</p></div><span class='review-state review-state-in_progress'>{len(in_progress_mrs)} MRs</span></div>
-            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>MR</th><th>Review item</th><th>Completed time</th><th>Action</th></tr></thead><tbody>{in_progress_table_rows}</tbody></table></div></section>
+            <section class='card'><div class='section-heading'><div><h2>AI reviews in progress</h2><p class='sub'>Merge requests currently being fetched, analyzed, or reviewed by the configured AI model.</p></div><span class='review-state review-state-in_progress'>{len(ai_reviews_in_progress)} running</span></div>
+            <div class='table-wrap'><table><thead><tr><th>MR</th><th>Commit</th><th>Model review</th><th>Started time</th><th>Status</th></tr></thead><tbody>{ai_progress_table_rows}</tbody></table></div></section>
             <section class='card' id='completed-review-results'><div class='section-heading'><div><h2>Completed review results</h2><p class='sub'>Latest {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} result for every reviewed MR, including reviews with no findings. Select a row to inspect the evidence.</p></div><span class='severity severity-safe'>{len(reviews)} MRs</span></div>
             {self.model_tabs('/completed', selected_profile, {'severity': selected_severity, 'manual_status': selected_status})}
             {self.usage_tiles(reviews, selected_profile)}
@@ -3775,7 +3779,7 @@ def handler_factory(
                 for value, label in (
                     ("all", "All statuses"),
                     ("open", "Open"),
-                    ("in_progress", "In Progress"),
+                    ("in_progress", "Under Verification"),
                     ("done", "Done"),
                 )
             )

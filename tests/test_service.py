@@ -67,7 +67,6 @@ from security_review.web import (  # noqa: E402
     report_section,
     render_diff_html,
     handler_factory,
-    in_progress_mr_entries,
     validated_credentials,
     verify_password,
 )
@@ -773,6 +772,28 @@ class StateTests(unittest.TestCase):
             self.assertFalse(state.has(second))
             state.close()
 
+    def test_in_progress_review_is_visible_and_remains_retryable(self):
+        target = ReviewTarget(1, "company/app", 3, "abc123", "https://example/mr/3")
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            store = WebStore(database)
+            state = ReviewState(database)
+            state.queue(target)
+
+            state.mark_in_progress(target, ["anthropic"])
+
+            active = store.ai_reviews_in_progress()
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0]["mr_iid"], 3)
+            self.assertFalse(state.has(target))
+            metadata = json.loads(active[0]["metadata_json"])
+            self.assertEqual(metadata["review_profiles"], ["anthropic"])
+
+            state.record(target, "completed")
+            self.assertEqual(store.ai_reviews_in_progress(), [])
+            self.assertTrue(state.has(target))
+            state.close()
+
     def test_web_store_projects_comparison_results_by_profile(self):
         target = ReviewTarget(1, "company/app", 3, "abc123", "https://example/mr/3")
         with tempfile.TemporaryDirectory() as directory:
@@ -806,11 +827,17 @@ class StateTests(unittest.TestCase):
 
 class CycleLimitTests(unittest.TestCase):
     class FakeState:
+        def __init__(self):
+            self.in_progress = []
+
         def initialized(self):
             return True
 
         def has(self, target):
             return False
+
+        def mark_in_progress(self, target, review_profiles):
+            self.in_progress.append((target, list(review_profiles)))
 
     def test_zero_limit_processes_every_pending_revision(self):
         targets = [
@@ -818,12 +845,15 @@ class CycleLimitTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory:
             config = config_for_test(Path(directory), max_reviews_per_cycle=0)
+            state = self.FakeState()
             with (
                 patch("security_review.service.discover_targets", return_value=targets),
                 patch("security_review.service.review_target", return_value="completed") as review,
             ):
-                result = scan_once(object(), self.FakeState(), config)
+                result = scan_once(object(), state, config)
         self.assertEqual(review.call_count, 7)
+        self.assertEqual(len(state.in_progress), 7)
+        self.assertEqual(state.in_progress[0][1], ["anthropic"])
         self.assertEqual(result["deferred"], 0)
 
     def test_positive_limit_defers_remainder(self):
@@ -832,12 +862,14 @@ class CycleLimitTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory:
             config = config_for_test(Path(directory), max_reviews_per_cycle=5)
+            state = self.FakeState()
             with (
                 patch("security_review.service.discover_targets", return_value=targets),
                 patch("security_review.service.review_target", return_value="completed") as review,
             ):
-                result = scan_once(object(), self.FakeState(), config)
+                result = scan_once(object(), state, config)
         self.assertEqual(review.call_count, 5)
+        self.assertEqual(len(state.in_progress), 5)
         self.assertEqual(result["deferred"], 2)
 
     def test_gitlab_only_scan_queues_mrs_for_later_review(self):
@@ -1127,47 +1159,6 @@ class DiscoveryInventoryTests(unittest.TestCase):
         self.assertEqual(completed[0]["manual_status"], "done")
         self.assertEqual(completed[0]["manual_resolution"], "false_positive")
         self.assertIn("server-controlled", completed[0]["manual_comments"])
-
-    def test_in_progress_entries_are_grouped_by_mr_and_keep_highest_severity(self):
-        entries = [
-            {
-                "project_id": 1,
-                "project_path": "company/app",
-                "mr_iid": 7,
-                "head_sha": "abcdef",
-                "severity": "MEDIUM",
-                "title": "Information disclosure",
-                "reviewed_at": "2026-09-25T10:00:00+00:00",
-                "manual_status": "in_progress",
-            },
-            {
-                "project_id": 1,
-                "project_path": "company/app",
-                "mr_iid": 7,
-                "head_sha": "abcdef",
-                "severity": "HIGH",
-                "title": "Authorization bypass",
-                "reviewed_at": "2026-09-25T10:00:00+00:00",
-                "manual_status": "in_progress",
-            },
-            {
-                "project_id": 2,
-                "project_path": "company/other",
-                "mr_iid": 8,
-                "head_sha": "123456",
-                "severity": "LOW",
-                "title": "Verbose response",
-                "reviewed_at": "2026-09-25T11:00:00+00:00",
-                "manual_status": "open",
-            },
-        ]
-
-        grouped = in_progress_mr_entries(entries)
-
-        self.assertEqual(len(grouped), 1)
-        self.assertEqual(grouped[0]["severity"], "HIGH")
-        self.assertEqual(grouped[0]["title"], "Authorization bypass")
-        self.assertEqual(grouped[0]["in_progress_items"], 2)
 
     def test_diff_html_uses_light_syntax_classes_and_escapes_code(self):
         rendered = render_diff_html(
@@ -1584,6 +1575,15 @@ class WebAuthenticationTests(unittest.TestCase):
                     "https://gitlab.example.com/company/app/-/merge_requests/10",
                 )
             )
+            active_target = ReviewTarget(
+                1,
+                "company/app",
+                11,
+                "active-sha",
+                "https://gitlab.example.com/company/app/-/merge_requests/11",
+            )
+            state.queue(active_target)
+            state.mark_in_progress(active_target, ["anthropic"])
             state.close()
             store.save_manual_review(
                 1,
@@ -1700,7 +1700,8 @@ class WebAuthenticationTests(unittest.TestCase):
 
             self.assertIn("<h1>Review dashboard</h1>", dashboard)
             self.assertIn("<h2>Review status</h2>", dashboard)
-            self.assertNotIn("<h2>Manual reviews in progress</h2>", dashboard)
+            self.assertIn("In progress<strong>1</strong>", dashboard)
+            self.assertNotIn("<h2>AI reviews in progress</h2>", dashboard)
             self.assertIn("<h2>High-severity findings</h2>", dashboard)
             self.assertEqual(dashboard.count("role='tab'"), 4)
             self.assertIn("Copilot · Anthropic", dashboard)
@@ -1740,9 +1741,11 @@ class WebAuthenticationTests(unittest.TestCase):
                 "href='/repositories' aria-current='page'", repositories
             )
             self.assertIn("<h1>Completed MRs</h1>", completed)
-            self.assertIn("<h2>Manual reviews in progress</h2>", completed)
-            self.assertIn("company/app !7", completed)
-            self.assertNotIn("No completed MRs are currently under manual review", completed)
+            self.assertIn("<h2>AI reviews in progress</h2>", completed)
+            self.assertIn("company/app !11", completed)
+            self.assertIn("active-sha", completed)
+            self.assertIn("Anthropic", completed)
+            self.assertNotIn("No AI review is running now", completed)
             self.assertIn("<h2>Completed review results</h2>", completed)
             self.assertEqual(completed.count("role='tab'"), 4)
             self.assertIn("Average runtime", completed)
@@ -1770,6 +1773,7 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn(completed_columns, completed)
             self.assertIn("<th>Manual review</th>", dashboard)
             self.assertIn("<th>Manual review</th>", completed)
+            self.assertIn("Under Verification", completed)
             self.assertIn("name='anthropic_api_key'", settings_page)
             self.assertIn("name='openai_api_key'", settings_page)
             self.assertIn("name='copilot_api_key'", settings_page)
