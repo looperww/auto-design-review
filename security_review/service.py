@@ -313,8 +313,8 @@ class RuntimeSetting:
 RUNTIME_SETTINGS = (
     RuntimeSetting(
         "REVIEW_EXISTING_MRS",
-        "Review existing open MRs on first start",
-        "Enable this before the first review scan to include MRs that already exist.",
+        "Review existing eligible MRs on first start",
+        "Enable this before the first review scan to include opened and merged MRs that already exist.",
         "choice",
         "false",
         choices=("false", "true"),
@@ -729,13 +729,29 @@ class GitLabClient:
             )
         return [item for item in projects if isinstance(item, dict)]
 
-    def list_open_merge_requests(self, project_path: str) -> list[dict[str, Any]]:
+    def list_merge_requests(
+        self, project_path: str, *, created_after: datetime | None = None
+    ) -> list[dict[str, Any]]:
         project = api_project(project_path)
+        query: dict[str, Any] = {
+            "state": "all",
+            "scope": "all",
+            "order_by": "created_at",
+            "sort": "asc",
+        }
+        if created_after is not None:
+            query["created_after"] = created_after.isoformat()
         result = self.get_all(
             f"projects/{project}/merge_requests",
-            {"state": "opened", "scope": "all", "order_by": "updated_at", "sort": "asc"},
+            query,
         )
         return [item for item in result if isinstance(item, dict)]
+
+    # Kept as a compatibility alias for integrations that used the original
+    # client method name. Discovery itself uses list_merge_requests so that it
+    # can include merged revisions from the configured starting date.
+    def list_open_merge_requests(self, project_path: str) -> list[dict[str, Any]]:
+        return self.list_merge_requests(project_path)
 
     def get_merge_request(self, project_path: str, mr_iid: int) -> dict[str, Any]:
         project = api_project(project_path)
@@ -2101,8 +2117,11 @@ def review_target(
     metadata: dict[str, Any] = {"target": asdict(target), "started_at": utc_now()}
     try:
         mr = client.get_merge_request(target.project_path, target.mr_iid)
-        if mr.get("state") != "opened":
-            raise ManualReviewRequired("The merge request is no longer open.")
+        mr_state = str(mr.get("state") or "").lower()
+        if mr_state not in {"opened", "merged"}:
+            raise ManualReviewRequired(
+                f"The merge request is not open or merged (current state: {mr_state or 'unknown'})."
+            )
         current_sha = str(mr.get("sha") or mr.get("diff_refs", {}).get("head_sha") or "")
         if current_sha != target.head_sha:
             raise ManualReviewRequired("A newer MR revision exists; this review is stale.")
@@ -2252,7 +2271,9 @@ def discover_targets(
         except (KeyError, TypeError, ValueError):
             continue
         try:
-            merge_requests = client.list_open_merge_requests(project_path)
+            merge_requests = client.list_merge_requests(
+                project_path, created_after=deployment_started_at
+            )
         except ReviewError as exc:
             if state is not None:
                 state.record_project_check(project_id, "down", str(exc))
@@ -2261,6 +2282,10 @@ def discover_targets(
         if state is not None:
             state.record_project_check(project_id, "up")
         for mr in merge_requests:
+            # Closed/abandoned MRs are intentionally excluded. Open MRs and
+            # MRs already merged into the production flow are both eligible.
+            if str(mr.get("state") or "").lower() not in {"opened", "merged"}:
+                continue
             target = target_from(project, mr)
             if deployment_started_at is not None:
                 try:

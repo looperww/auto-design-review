@@ -16,7 +16,7 @@ is required in product repositories.
 ```text
 GitLab projects visible to the token
               │
-              │ poll open MRs every five minutes
+              │ poll eligible MRs every five minutes
               ▼
      portable reviewer container
               │
@@ -76,7 +76,7 @@ company group/project boundary:
 | Boundary | Resource | Permission | Why |
 | --- | --- | --- | --- |
 | User | Project | Read | Discover projects visible to the token owner. |
-| Group and project | Merge Request | Read | Read open MRs, metadata, and diffs. |
+| Group and project | Merge Request | Read | Read eligible MRs, metadata, and diffs. |
 | Group and project | Repository | Read | Download a source snapshot at the exact MR commit. |
 
 If the GitLab version offers legacy scopes instead of resource permissions, use
@@ -127,9 +127,9 @@ company security-review records.
 
 ### 3. Build and start
 
-For a fresh production deployment that should include currently open MRs created
-on or after 14 September 2026 (UTC), seed the initial discovery cutoff while
-starting the container:
+For a fresh production deployment that should include MRs created on or after
+14 September 2026 (UTC), seed the initial discovery cutoff while starting the
+container:
 
 ```bash
 MR_DISCOVERY_START_AT=2026-09-14 docker compose up --detach --build
@@ -193,16 +193,18 @@ After signing in, select **Settings** in the dashboard header, then configure:
   that Copilot account.
 
 The GitLab token can be saved without model credentials. The service then checks
-the GitLab connection, discovers open MR revisions, and records them as `pending`
-in SQLite. It does not download repository archives or diffs and does not invoke
-any model in this mode. The dashboard shows the last GitLab connection
+the GitLab connection, discovers eligible MR revisions created on or after the
+cutoff, and records them as `pending` in SQLite. Eligible revisions are MRs that
+are still open or have already been merged. Closed or abandoned MRs are not
+reviewed. The service does not download repository archives or diffs and does not
+invoke any model in this mode. The dashboard shows the last GitLab connection
 result, every repository visible to the token, and the queued MR count. This
 allows the administrator to verify the GitLab URL, token, scope, and permissions
 without incurring model cost.
 
 The model credentials can be added later without re-entering the stored GitLab
-token. Once the Anthropic key is saved, queued open MR revisions can be reviewed
-by Anthropic alone, subject to the configured maximum reviews per cycle. Once
+token. Once the Anthropic key is saved, queued eligible MR revisions can be
+reviewed by Anthropic alone, subject to the configured maximum reviews per cycle. Once
 all three model credentials are saved, queued revisions are reviewed by all four
 profiles. Leaving a secret field blank during a later update
 preserves its stored value.
@@ -339,7 +341,7 @@ would require an external secret manager or master key, which this deployment
 intentionally does not store.
 
 When GitLab and the Anthropic credential are supplied, choose whether to review
-existing open MRs before the first scan. The default records them as a baseline
+existing eligible MRs (opened or merged) before the first scan. The default records them as a baseline
 without spending LLM tokens. Any MR created later, or any new commit pushed to
 an MR, is reviewed automatically. Enabling existing-MR review can create
 significant API cost. If OpenAI and Copilot credentials are later added, queued
@@ -441,7 +443,8 @@ optional group path define the boundary. Every polling cycle:
 1. GitLab returns projects from the configured group and its subgroups, or all
    active projects in which the token owner has at least Reporter access when
    the group path is blank.
-2. The service lists open MRs in those projects.
+2. The service lists MRs in those projects and retains only revisions created
+   on or after the configured cutoff whose state is `opened` or `merged`.
 3. The local SQLite database identifies MR commit SHAs not seen before.
 4. Unseen revisions are queued and reviewed in order.
 
@@ -451,9 +454,11 @@ access to the project or place the project outside the token's resource boundary
 
 The first application start creates a persistent `deployment_started_at` cutoff
 in SQLite. By default it is the first-start time; a fresh deployment can seed an
-earlier cutoff with `MR_DISCOVERY_START_AT`. GitLab may return open MRs created
-before the cutoff, but those MRs are not queued, counted, or reviewed. Only MRs
-whose GitLab `created_at` timestamp is on or after the cutoff are included.
+earlier cutoff with `MR_DISCOVERY_START_AT`. GitLab may return MRs created before
+the cutoff, but those MRs are not queued, counted, or reviewed. Only MRs whose
+GitLab `created_at` timestamp is on or after the cutoff are included. MRs already
+merged after the cutoff remain eligible, so the service can review historical
+changes that reached production. Closed or abandoned MRs remain excluded.
 Rebuilding or replacing the container does not reset the cutoff because it is
 stored in the host `data/` folder.
 
