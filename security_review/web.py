@@ -2881,9 +2881,54 @@ def handler_factory(
                 for finding in findings
                 if str(finding["severity"]) in {"CRITICAL", "HIGH"}
             ]
-            in_progress_mrs = in_progress_mr_entries(
-                completed_review_entries(profile_reports, manual_reviews)
+            date_notice = (
+                f"<p class='error'>{html.escape(str(context['date_error']))}</p>"
+                if context["date_error"]
+                else ""
             )
+            body = f"""
+            {date_notice}{self.vault_notice()}
+            <section class='card'><div class='section-heading'><div><h2>Review status</h2><p class='sub'>Automated-review outcomes across all recorded merge-request revisions. Human-review progress is shown on Completed MRs.</p></div></div>
+            <div class='grid'>
+              <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
+              <div class='metric success'>Completed<strong>{counts.get('completed', 0)}</strong></div>
+              <div class='metric critical'>High findings<strong>{len(findings)}</strong></div>
+              <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
+              <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div>
+            </div></section>
+            <section class='card'><div class='section-heading'><div><h2>High-severity findings</h2><p class='sub'>Critical and High findings from {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} for the latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
+            {self.model_tabs('/', selected_profile, context['activity_query'])}
+            {self.usage_tiles(profile_reports, selected_profile)}
+            {self.filter_controls(context, '/', {'profile': selected_profile})}
+            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th><th>Manual review</th></tr></thead><tbody>{self.findings_rows(findings, self.path)}</tbody></table></div></section>
+            {manual_review_dialog(str(user['csrf_token']))}<script src='/app.js' defer></script>"""
+            connection_status = self.gitlab_connection_status()
+            self.application_response(
+                "Dashboard",
+                "Review dashboard",
+                "",
+                body,
+                user,
+                "dashboard",
+                "<a class='button secondary' href='/repositories'>View repositories</a>",
+                connection_status,
+            )
+
+        def show_completed(self, query: dict[str, list[str]]) -> None:
+            if store.user_count() == 0:
+                self.redirect("/setup")
+                return
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            selected_profile = query.get("profile", ["anthropic"])[0]
+            if selected_profile not in COMPARISON_PROFILES:
+                selected_profile = "anthropic"
+            reviews = store.completed_reviews(selected_profile)
+            manual_reviews = store.manual_review_map()
+            entries = completed_review_entries(reviews, manual_reviews)
+            in_progress_mrs = in_progress_mr_entries(entries)
             in_progress_rows = []
             for entry in in_progress_mrs:
                 severity = str(entry["severity"])
@@ -2917,62 +2962,12 @@ def handler_factory(
                     f"<td><span class='severity severity-{severity.lower()}'>{html.escape(severity)}</span></td>"
                     f"<td>{mr_display}</td><td>{item_label}</td>"
                     f"<td>{html.escape(completed_at)}</td>"
-                    f"<td><a class='button secondary' href='/completed?{html.escape(completed_query)}'>Open review</a></td>"
+                    f"<td><a class='button secondary' href='/completed?{html.escape(completed_query)}#completed-review-results'>Open review</a></td>"
                     "</tr>"
                 )
             in_progress_table_rows = "".join(in_progress_rows) or (
-                "<tr><td class='empty-state' colspan='5'>No MRs are currently in progress for this model and period.</td></tr>"
+                "<tr><td class='empty-state' colspan='5'>No completed MRs are currently under manual review.</td></tr>"
             )
-            date_notice = (
-                f"<p class='error'>{html.escape(str(context['date_error']))}</p>"
-                if context["date_error"]
-                else ""
-            )
-            body = f"""
-            {date_notice}{self.vault_notice()}
-            <section class='card'><div class='section-heading'><div><h2>Review status</h2><p class='sub'>Current outcome across all recorded merge-request revisions.</p></div></div>
-            <div class='grid'>
-              <div class='metric'>Queued<strong>{counts.get('pending', 0)}</strong></div>
-              <div class='metric success'>Completed<strong>{counts.get('completed', 0)}</strong></div>
-              <div class='metric critical'>High findings<strong>{len(findings)}</strong></div>
-              <div class='metric'>In progress<strong>{len(in_progress_mrs)}</strong></div>
-              <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
-              <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div>
-            </div></section>
-            <section class='card'><div class='section-heading'><div><h2>MRs in progress</h2><p class='sub'>Merge requests currently being verified by the security team for {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} in {html.escape(str(context['filter_label']))}.</p></div><span class='review-state review-state-in_progress'>{len(in_progress_mrs)} MRs</span></div>
-            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>MR</th><th>Review item</th><th>Completed time</th><th>Action</th></tr></thead><tbody>{in_progress_table_rows}</tbody></table></div></section>
-            <section class='card'><div class='section-heading'><div><h2>High-severity findings</h2><p class='sub'>Critical and High findings from {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} for the latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
-            {self.model_tabs('/', selected_profile, context['activity_query'])}
-            {self.usage_tiles(profile_reports, selected_profile)}
-            {self.filter_controls(context, '/', {'profile': selected_profile})}
-            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>Finding title</th><th>MR</th><th>Vulnerability details</th><th>Manual review</th></tr></thead><tbody>{self.findings_rows(findings, self.path)}</tbody></table></div></section>
-            {manual_review_dialog(str(user['csrf_token']))}<script src='/app.js' defer></script>"""
-            connection_status = self.gitlab_connection_status()
-            self.application_response(
-                "Dashboard",
-                "Review dashboard",
-                "",
-                body,
-                user,
-                "dashboard",
-                "<a class='button secondary' href='/repositories'>View repositories</a>",
-                connection_status,
-            )
-
-        def show_completed(self, query: dict[str, list[str]]) -> None:
-            if store.user_count() == 0:
-                self.redirect("/setup")
-                return
-            session = self.require_session()
-            if session is None:
-                return
-            _, user = session
-            selected_profile = query.get("profile", ["anthropic"])[0]
-            if selected_profile not in COMPARISON_PROFILES:
-                selected_profile = "anthropic"
-            reviews = store.completed_reviews(selected_profile)
-            manual_reviews = store.manual_review_map()
-            entries = completed_review_entries(reviews, manual_reviews)
             selected_severity = query.get("severity", ["all"])[0].lower()
             if selected_severity not in COMPLETED_SEVERITIES:
                 selected_severity = "all"
@@ -3149,7 +3144,9 @@ def handler_factory(
                 result_range = "No review results to display"
             pagination = f"<div class='pagination'><p class='sub'>{result_range}</p><div class='actions'>{previous_page}<span>Page {page_number} of {page_count}</span>{next_page}</div></div>"
             body = f"""
-            <section class='card'><div class='section-heading'><div><h2>Completed review results</h2><p class='sub'>Latest {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} result for every reviewed MR, including reviews with no findings. Select a row to inspect the evidence.</p></div><span class='severity severity-safe'>{len(reviews)} MRs</span></div>
+            <section class='card'><div class='section-heading'><div><h2>Manual reviews in progress</h2><p class='sub'>Completed {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} assessments currently being verified by the security team.</p></div><span class='review-state review-state-in_progress'>{len(in_progress_mrs)} MRs</span></div>
+            <div class='table-wrap'><table><thead><tr><th>Severity</th><th>MR</th><th>Review item</th><th>Completed time</th><th>Action</th></tr></thead><tbody>{in_progress_table_rows}</tbody></table></div></section>
+            <section class='card' id='completed-review-results'><div class='section-heading'><div><h2>Completed review results</h2><p class='sub'>Latest {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} result for every reviewed MR, including reviews with no findings. Select a row to inspect the evidence.</p></div><span class='severity severity-safe'>{len(reviews)} MRs</span></div>
             {self.model_tabs('/completed', selected_profile, {'severity': selected_severity, 'manual_status': selected_status})}
             {self.usage_tiles(reviews, selected_profile)}
             <nav class='severity-filter' aria-label='Filter completed reviews by severity'>{filter_links}</nav>

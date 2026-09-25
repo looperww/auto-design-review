@@ -1700,9 +1700,7 @@ class WebAuthenticationTests(unittest.TestCase):
 
             self.assertIn("<h1>Review dashboard</h1>", dashboard)
             self.assertIn("<h2>Review status</h2>", dashboard)
-            self.assertIn("<h2>MRs in progress</h2>", dashboard)
-            self.assertIn("company/app !7", dashboard)
-            self.assertNotIn("No MRs are currently in progress", dashboard)
+            self.assertNotIn("<h2>Manual reviews in progress</h2>", dashboard)
             self.assertIn("<h2>High-severity findings</h2>", dashboard)
             self.assertEqual(dashboard.count("role='tab'"), 4)
             self.assertIn("Copilot · Anthropic", dashboard)
@@ -1742,6 +1740,9 @@ class WebAuthenticationTests(unittest.TestCase):
                 "href='/repositories' aria-current='page'", repositories
             )
             self.assertIn("<h1>Completed MRs</h1>", completed)
+            self.assertIn("<h2>Manual reviews in progress</h2>", completed)
+            self.assertIn("company/app !7", completed)
+            self.assertNotIn("No completed MRs are currently under manual review", completed)
             self.assertIn("<h2>Completed review results</h2>", completed)
             self.assertEqual(completed.count("role='tab'"), 4)
             self.assertIn("Average runtime", completed)

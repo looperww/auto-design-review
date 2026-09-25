@@ -263,17 +263,18 @@ disabled.
 The authenticated **Design Review** console uses a responsive sidebar with four
 primary pages:
 
-- **Dashboard** is the main operational view. It shows review outcomes, MRs
-  currently under human review, and the Critical and High security-finding
-  queue. Four tabs switch between the direct
+- **Dashboard** is the main operational view. It shows automated-review
+  outcomes and the Critical and High security-finding queue. Four tabs switch
+  between the direct
   Anthropic, direct OpenAI, Copilot Anthropic, and Copilot OpenAI findings. A
   compact summary for the selected tab shows completed reviews, average runtime,
   input/output tokens, and the cost value reported by that service. A green/red
   indicator beneath the page title shows the latest GitLab connection status.
 - **Completed MRs** lists the latest completed review for every MR, including
   SAFE reviews with no findings. The same four tabs keep each model's results
-  separate. Results can be filtered by severity and human review status, and
-  each row expands to show the reviewed diff, review summary, severity rationale,
+  separate. A dedicated section lists completed MRs currently under manual
+  review. Results can be filtered by severity and human review status, and each
+  row expands to show the reviewed diff, review summary, severity rationale,
   finding evidence, and recorded human decision.
 - **Repositories** provides a focused inventory of repository coverage,
   per-repository access status, MR activity, finding totals, date filters, and
@@ -283,6 +284,13 @@ primary pages:
 
 The sidebar also shows the current reviewer state and signed-in administrator.
 Stored secrets are never displayed again.
+
+**Queued** and **In Progress** describe different workflows. Queued means an MR
+revision is waiting for the automated model review. In Progress is a human-review
+status selected by an administrator after opening a completed assessment. The
+automated worker processes queued MRs sequentially, and the active MR remains
+counted as queued until its result is saved. The container log prints `Reviewing
+<project>!<MR>` while that model call is running.
 
 Every finding row on the Dashboard and Completed MRs page, and every MR row on
 the repository-specific MR page, has a human-review control. Its default state
