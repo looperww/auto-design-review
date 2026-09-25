@@ -776,6 +776,10 @@ class Credentials:
             and self.copilot_api_key.strip()
         )
 
+    def review_ready(self) -> bool:
+        """Whether the direct Anthropic reviewer can run by itself."""
+        return bool(self.llm_api_key.strip())
+
 
 def credential_key(password: str, salt: bytes) -> bytes:
     return hashlib.pbkdf2_hmac(
@@ -2352,11 +2356,15 @@ def handler_factory(
             credentials = self.merged_credentials(form, existing)
             store.save_encrypted_credentials(credentials, salt, encryption_key)
             vault.set(credentials)
-            message = (
-                "Credentials saved; four-model comparison reviews are active."
-                if credentials.comparison_ready()
-                else "Credentials saved; MR discovery is active. Add all three model credentials to start four-model reviews."
-            )
+            if credentials.comparison_ready():
+                message = "Credentials saved; four-model comparison reviews are active."
+            elif credentials.review_ready():
+                message = (
+                    "Credentials saved; Anthropic-only reviews are active. "
+                    "Add OpenAI and Copilot credentials later to enable comparison reviews."
+                )
+            else:
+                message = "Credentials saved; MR discovery is active. Add an Anthropic API key to start reviews."
             self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def update_manual_review(self, form: dict[str, str]) -> None:
@@ -2529,16 +2537,17 @@ def handler_factory(
                 raise ReviewError("Invalid form token.")
             existing, _, _ = self.credential_context()
             credentials = self.merged_credentials(form, existing)
-            if not credentials.comparison_ready():
-                raise ReviewError(
-                    "Save the Anthropic key, OpenAI key, and GitHub Copilot token before testing all models."
+            if not credentials.review_ready():
+                raise ReviewError("Save an Anthropic API key before testing the review model.")
+            if credentials.comparison_ready():
+                configs = (
+                    ("Anthropic", "anthropic", credentials.llm_api_key, credentials.llm_model),
+                    ("OpenAI", "openai", credentials.openai_api_key, credentials.openai_model),
+                    ("Copilot · Anthropic", "copilot", credentials.copilot_api_key, credentials.copilot_anthropic_model),
+                    ("Copilot · OpenAI", "copilot", credentials.copilot_api_key, credentials.copilot_openai_model),
                 )
-            configs = (
-                ("Anthropic", "anthropic", credentials.llm_api_key, credentials.llm_model),
-                ("OpenAI", "openai", credentials.openai_api_key, credentials.openai_model),
-                ("Copilot · Anthropic", "copilot", credentials.copilot_api_key, credentials.copilot_anthropic_model),
-                ("Copilot · OpenAI", "copilot", credentials.copilot_api_key, credentials.copilot_openai_model),
-            )
+            else:
+                configs = (("Anthropic", "anthropic", credentials.llm_api_key, credentials.llm_model),)
             for profile, provider, key, model in configs:
                 config = Config.from_credentials(
                     credentials.gitlab_url,
@@ -2551,12 +2560,12 @@ def handler_factory(
                     review_profile=profile,
                 )
                 test_llm_connection(config)
-            self.redirect(
-                "/settings?message="
-                + urllib.parse.quote(
-                    "All four model connection tests succeeded."
-                )
+            message = (
+                "All four model connection tests succeeded."
+                if credentials.comparison_ready()
+                else "Anthropic model connection test succeeded."
             )
+            self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def fetch_llm_models(self, form: dict[str, str]) -> None:
             session = self.session()
@@ -2600,7 +2609,11 @@ def handler_factory(
                 return (
                     "Reviews active"
                     if active_credentials.comparison_ready()
-                    else "GitLab discovery active",
+                    else (
+                        "Anthropic review active"
+                        if active_credentials.review_ready()
+                        else "GitLab discovery active"
+                    ),
                     "completed",
                 )
             if running:
@@ -3267,7 +3280,7 @@ def handler_factory(
                 copilot_openai_model = displayed_credentials.copilot_openai_model or "gpt-5.4"
                 credential_panel = f"""
                 <section class='card'><h2>Configure or rotate encrypted credentials</h2>
-                <p class='sub'>GitLab discovery can run independently. Four-model reviews start only after the Anthropic key, OpenAI key, and GitHub Copilot token are all stored. Blank secret fields retain their encrypted values.</p>
+                <p class='sub'>GitLab discovery can run independently. Anthropic-only reviews start as soon as the Anthropic key is stored; adding OpenAI and Copilot credentials enables four-model comparisons. Blank secret fields retain their encrypted values.</p>
                 <form id='credential_form' method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
                 <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
                 <div class='field'><label for='gitlab_group_path'>GitLab group path (optional)</label><input id='gitlab_group_path' name='gitlab_group_path' value='{html.escape(gitlab_group_path)}' placeholder='maas' maxlength='512'><small>Enter a namespace path such as maas or company/platform, not a URL. Subgroups are included automatically. Leave blank for user-wide discovery.</small></div>
@@ -3281,8 +3294,8 @@ def handler_factory(
                 <div class='field'><label for='copilot_openai_model'>Copilot OpenAI model</label><div class='inline-control'><input id='copilot_openai_model' name='copilot_openai_model' value='{html.escape(copilot_openai_model)}' maxlength='256'><button class='secondary fetch-models' type='button' data-provider='copilot' data-key-field='copilot_api_key' data-model-field='copilot_openai_model' data-picker='copilot_openai_models' data-status='copilot_openai_status'>Fetch models</button></div><select class='model-picker' id='copilot_openai_models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='copilot_openai_status'>Select an OpenAI model enabled in Copilot policy.</small></div>
                 </div><div class='actions'><button type='submit'>Save encrypted credentials</button>
                 <button class='secondary' type='submit' formaction='/credentials/test-gitlab'>Test GitLab access</button>
-                <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test all four model connections</button></div>
-                <p class='sub'>Tests do not save entered values. The model test sends one minimal request to each configured comparison and may incur API or Copilot usage charges.</p></form></section>"""
+                <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test configured model connection(s)</button></div>
+                <p class='sub'>Tests do not save entered values. The model test sends one minimal request to each configured model and may incur API usage charges.</p></form></section>"""
             body = f"""
             {notice}<section class='card'><h2>Runtime settings</h2><p class='sub'>Saved in SQLite and applied automatically at the next polling cycle.</p>
             <form method='post' action='/settings'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>{fields}</div><div class='actions'><button type='submit'>Save settings</button></div></form></section>

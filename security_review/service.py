@@ -2311,6 +2311,7 @@ def run_managed_poll(
         credentials, vault_version = vault.wait_for_credentials()
         sleep_seconds = 300
         try:
+            anthropic_ready = bool(credentials.llm_api_key.strip())
             comparison_ready = bool(
                 credentials.llm_api_key.strip()
                 and credentials.openai_api_key.strip()
@@ -2319,15 +2320,15 @@ def run_managed_poll(
             config = Config.from_credentials(
                 credentials.gitlab_url,
                 credentials.gitlab_token,
-                credentials.llm_api_key if comparison_ready else "",
+                credentials.llm_api_key if anthropic_ready else "",
                 state.runtime_settings(),
                 llm_provider="anthropic",
                 llm_model=credentials.llm_model,
                 gitlab_group_path=credentials.gitlab_group_path,
                 review_profile="anthropic",
             )
-            comparison_configs = (
-                [
+            if comparison_ready:
+                comparison_configs = [
                     config,
                     Config.from_credentials(
                         credentials.gitlab_url,
@@ -2360,9 +2361,10 @@ def run_managed_poll(
                         review_profile="copilot_openai",
                     ),
                 ]
-                if comparison_ready
-                else []
-            )
+            elif anthropic_ready:
+                comparison_configs = [config]
+            else:
+                comparison_configs = []
             sleep_seconds = config.poll_interval_seconds
             client = GitLabClient(
                 config.gitlab_url, config.gitlab_token, config.gitlab_group_path

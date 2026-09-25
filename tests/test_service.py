@@ -708,6 +708,39 @@ class DifferentialReviewTests(unittest.TestCase):
             self.assertEqual(comparison["anthropic"]["status"], "completed")
             state.close()
 
+    def test_single_anthropic_profile_reviews_with_only_anthropic_key(self):
+        target = ReviewTarget(1, "company/app", 9, "head-sha", "https://example/mr/9")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "SKILL.md").write_text("# Approved workflow\n", encoding="utf-8")
+            state = ReviewState(root / "state.sqlite3")
+            config = config_for_test(root, review_profile="anthropic")
+            with patch(
+                "security_review.service.run_llm",
+                return_value=(
+                    "# Design review\n\n## Findings\nNo high-confidence security findings.\n",
+                    {"usage": {"input_tokens": 10, "output_tokens": 2}},
+                ),
+            ) as run_llm:
+                result = review_target(
+                    self.FakeGitLabClient(),
+                    state,
+                    config,
+                    target,
+                    comparison_configs=[config],
+                )
+
+            self.assertEqual(result, "completed")
+            self.assertEqual(run_llm.call_count, 1)
+            comparison = json.loads(
+                state.connection.execute(
+                    "SELECT comparison_json FROM reviews WHERE head_sha = ?",
+                    ("head-sha",),
+                ).fetchone()[0]
+            )
+            self.assertEqual(set(comparison), {"anthropic"})
+            state.close()
+
 
 class StateTests(unittest.TestCase):
     def test_review_revision_is_recorded_once(self):
@@ -1681,7 +1714,7 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("name='copilot_api_key'", settings_page)
             self.assertIn("name='copilot_anthropic_model'", settings_page)
             self.assertIn("name='copilot_openai_model'", settings_page)
-            self.assertIn("Test all four model connections", settings_page)
+            self.assertIn("Test configured model connection(s)", settings_page)
             self.assertIn("id='manual-review-dialog'", dashboard)
             self.assertIn(
                 "aria-label='Filter completed reviews by manual-review status'",
@@ -1842,6 +1875,13 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertNotIn("anthropic-test-key", ciphertext)
         self.assertNotIn("openai-test-key", ciphertext)
         self.assertNotIn("github-copilot-token", ciphertext)
+
+    def test_anthropic_only_credentials_enable_single_provider_review(self):
+        credentials = Credentials(
+            "https://gitlab.example.com", "gitlab-test-token", "anthropic-test-key"
+        )
+        self.assertTrue(credentials.review_ready())
+        self.assertFalse(credentials.comparison_ready())
 
     def test_non_anthropic_provider_configuration_is_encrypted(self):
         credentials = validated_credentials(

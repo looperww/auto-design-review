@@ -2,7 +2,7 @@
 
 This repository is a self-contained, read-only security checkpoint for GitLab.
 Clone it onto any Docker host and start it with Docker Compose. The authenticated
-console stores the GitLab token, three model credentials, four selected models,
+console stores the GitLab token, model credentials, four selected models,
 GitLab URL, optional GitLab group path, and all review settings in SQLite. It
 automatically discovers the selected group's projects or all projects visible
 to the GitLab token, reviews every eligible MR revision with four comparison
@@ -58,8 +58,9 @@ for that profile without discarding successful results from the other profiles.
   Claude Code and Copilot SDK runtime download endpoints.
 - At least 4 GB RAM for the Docker host.
 - An Anthropic API key, OpenAI API key, and GitHub token entitled to GitHub
-  Copilot. Reviews begin only when all three are configured; GitLab discovery
-  can be tested before then.
+  Copilot. Anthropic-only reviews can be used for functional testing; all three
+  credentials are required for four-model comparison reviews. GitLab discovery
+  can also be tested before any model key is available.
 - A GitLab fine-grained personal access token or service-account token.
 
 ## GitLab token permissions
@@ -191,18 +192,19 @@ After signing in, select **Settings** in the dashboard header, then configure:
 - one GitHub Copilot token plus an Anthropic and an OpenAI model available to
   that Copilot account.
 
-The GitLab token can be saved without the three model credentials. The service then
-checks the GitLab connection, discovers open MR revisions, and records them as
-`pending` in SQLite. It does not download repository archives or diffs and does
-not invoke any model in this mode. The dashboard shows the last GitLab connection
+The GitLab token can be saved without model credentials. The service then checks
+the GitLab connection, discovers open MR revisions, and records them as `pending`
+in SQLite. It does not download repository archives or diffs and does not invoke
+any model in this mode. The dashboard shows the last GitLab connection
 result, every repository visible to the token, and the queued MR count. This
 allows the administrator to verify the GitLab URL, token, scope, and permissions
 without incurring model cost.
 
 The model credentials can be added later without re-entering the stored GitLab
-token. Once all three are saved, queued open MR revisions are reviewed in order,
-subject to the configured maximum reviews per cycle. Each MR is reviewed once
-by all four profiles. Leaving a secret field blank during a later update
+token. Once the Anthropic key is saved, queued open MR revisions can be reviewed
+by Anthropic alone, subject to the configured maximum reviews per cycle. Once
+all three model credentials are saved, queued revisions are reviewed by all four
+profiles. Leaving a secret field blank during a later update
 preserves its stored value.
 
 After a key is saved, its empty password field displays a masked
@@ -227,9 +229,10 @@ Before saving, use the two credential-test buttons in the web console:
 
 - **Test GitLab access** calls the GitLab Projects API and reports how many
   repositories are visible to the submitted or stored token.
-- **Test all four model connections** sends one minimal request through every
-  configured comparison profile. A small direct-provider or Copilot usage
-  charge may occur.
+- **Test configured model connection(s)** sends one minimal request through the
+  Anthropic profile when only the Anthropic key is present, or through every
+  configured comparison profile when all three credentials are present. A small
+  direct-provider or Copilot usage charge may occur.
 
 Testing does not save or replace either credential. Signing in derives and
 unlocks the vault encryption key in memory, so the credential form does not ask
@@ -248,8 +251,9 @@ settings, review state, report content, and report metadata are stored in
 SQLite under the host's `data/` folder, mounted inside the container at `/data`.
 
 The service cannot contact GitLab until the encrypted GitLab credentials have
-been saved and unlocked. Comparison reviews remain disabled until all three
-encrypted model credentials are present.
+been saved and unlocked. Anthropic-only reviews begin when the encrypted
+Anthropic credential is present. Four-model comparison reviews require all three
+encrypted model credentials.
 
 The container publishes `0.0.0.0:6789`, so the console is reachable through any
 host interface permitted by the firewall. Do not expose this port directly to
@@ -320,11 +324,12 @@ the service must be initialized again. Fully unattended unlock after a restart
 would require an external secret manager or master key, which this deployment
 intentionally does not store.
 
-When GitLab and all three model credentials are supplied together, choose whether to
-review existing open MRs before the first scan. The default records them as a
-baseline without spending LLM tokens. Any MR created later, or any new commit
-pushed to an MR, is reviewed automatically. Enabling existing-MR review can
-create significant API cost.
+When GitLab and the Anthropic credential are supplied, choose whether to review
+existing open MRs before the first scan. The default records them as a baseline
+without spending LLM tokens. Any MR created later, or any new commit pushed to
+an MR, is reviewed automatically. Enabling existing-MR review can create
+significant API cost. If OpenAI and Copilot credentials are later added, queued
+revisions can be processed by all four comparison profiles.
 
 When GitLab discovery is deliberately started before the LLM key is
 available, discovered MR revisions are queued instead of baselined. This ensures
@@ -344,8 +349,9 @@ expanded view explains that the historical diff is unavailable.
 Report records never contain credentials; API credentials exist in a separate
 SQLite table only as authenticated ciphertext.
 
-MR revisions discovered before all three model credentials are configured appear
-with a `pending` status and have no report until the four comparisons run.
+MR revisions discovered before a model credential is configured appear with a
+`pending` status. Adding the Anthropic key enables Anthropic-only reports; adding
+the other credentials later enables the remaining comparison profiles.
 
 The Repositories page combines visible repositories and fetched-MR activity in one
 **Repositories and MRs** table. For each repository it shows:
