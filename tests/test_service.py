@@ -112,6 +112,23 @@ def archive_with(files):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_gitlab_client_lists_only_merged_mrs_after_cutoff(self):
+        client = GitLabClient("https://gitlab.example.com", "test-token")
+        cutoff = datetime(2026, 9, 15, tzinfo=timezone.utc)
+        with patch.object(client, "get_all", return_value=[]) as get_all:
+            client.list_merge_requests("company/app", merged_after=cutoff)
+
+        get_all.assert_called_once_with(
+            "projects/company%2Fapp/merge_requests",
+            {
+                "state": "merged",
+                "scope": "all",
+                "order_by": "merged_at",
+                "sort": "asc",
+                "merged_after": "2026-09-15T00:00:00+00:00",
+            },
+        )
+
     def test_gitlab_client_fetches_paginated_mr_commits_with_a_safety_limit(self):
         client = GitLabClient("https://gitlab.example.com", "test-token")
         with patch.object(
@@ -565,7 +582,7 @@ class ContextTests(unittest.TestCase):
 
 class DifferentialReviewTests(unittest.TestCase):
     class FakeGitLabClient:
-        def __init__(self, *, fail_commit_context=False, mr_state="opened"):
+        def __init__(self, *, fail_commit_context=False, mr_state="merged"):
             self.fail_commit_context = fail_commit_context
             self.mr_state = mr_state
 
@@ -806,6 +823,28 @@ class StateTests(unittest.TestCase):
             self.assertFalse(state.has(second))
             state.close()
 
+    def test_pending_non_eligible_revision_can_be_requeued_when_it_is_merged(self):
+        target = ReviewTarget(1, "company/app", 3, "abc123", "https://example/mr/3")
+        with tempfile.TemporaryDirectory() as directory:
+            state = ReviewState(Path(directory) / "state.sqlite3")
+            self.assertTrue(state.queue(target))
+            self.assertEqual(state.mark_pending_not_eligible(set()), 1)
+            self.assertEqual(
+                state.connection.execute(
+                    "SELECT status FROM reviews WHERE head_sha = ?", ("abc123",)
+                ).fetchone()[0],
+                "not_eligible",
+            )
+            self.assertFalse(state.has(target))
+            self.assertTrue(state.queue(target))
+            self.assertEqual(
+                state.connection.execute(
+                    "SELECT status FROM reviews WHERE head_sha = ?", ("abc123",)
+                ).fetchone()[0],
+                "pending",
+            )
+            state.close()
+
     def test_in_progress_review_is_visible_and_remains_retryable(self):
         target = ReviewTarget(1, "company/app", 3, "abc123", "https://example/mr/3")
         with tempfile.TemporaryDirectory() as directory:
@@ -895,6 +934,9 @@ class CycleLimitTests(unittest.TestCase):
 
         def requested_targets(self):
             return []
+
+        def mark_pending_not_eligible(self, eligible_keys, *, healthy_projects_only=False):
+            return 0
 
         def prioritize_targets(self, targets):
             return list(targets)
@@ -1050,27 +1092,37 @@ class DiscoveryInventoryTests(unittest.TestCase):
                 },
             ]
 
-        def list_merge_requests(self, project_path, *, created_after=None):
+        def list_merge_requests(self, project_path, *, merged_after=None):
             if project_path == "company/first":
                 return [
                     {
                         "iid": 1,
                         "sha": "before-deployment",
-                        "state": "opened",
+                        "state": "merged",
                         "web_url": "https://gitlab.example.com/company/first/-/merge_requests/1",
                         "created_at": "2026-09-14T09:00:00Z",
+                        "merged_at": "2026-09-14T09:30:00Z",
                     },
                     {
                         "iid": 2,
                         "sha": "after-deployment",
-                        "state": "opened",
+                        "state": "merged",
                         "web_url": "https://gitlab.example.com/company/first/-/merge_requests/2",
+                        "created_at": "2026-09-01T11:00:00Z",
+                        "merged_at": "2026-09-15T11:00:00Z",
+                    },
+                    {
+                        "iid": 3,
+                        "sha": "open-after-deployment",
+                        "state": "opened",
+                        "web_url": "https://gitlab.example.com/company/first/-/merge_requests/3",
                         "created_at": "2026-09-15T11:00:00Z",
+                        "merged_at": None,
                     },
                 ]
             return []
 
-    def test_visible_projects_are_saved_and_predeployment_mrs_are_excluded(self):
+    def test_visible_projects_are_saved_and_only_post_cutoff_merged_mrs_are_included(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "state.sqlite3"
@@ -1107,22 +1159,24 @@ class DiscoveryInventoryTests(unittest.TestCase):
                     }
                 ]
 
-            def list_merge_requests(self, project_path, *, created_after=None):
-                self.created_after = created_after
+            def list_merge_requests(self, project_path, *, merged_after=None):
+                self.merged_after = merged_after
                 return [
                     {
                         "iid": 3,
                         "sha": "merged-after-cutoff",
                         "state": "merged",
                         "web_url": "https://gitlab.example.com/company/first/-/merge_requests/3",
-                        "created_at": "2026-09-16T08:00:00Z",
+                        "created_at": "2026-09-01T08:00:00Z",
+                        "merged_at": "2026-09-16T08:00:00Z",
                     },
                     {
                         "iid": 4,
-                        "sha": "closed-after-cutoff",
-                        "state": "closed",
+                        "sha": "open-after-cutoff",
+                        "state": "opened",
                         "web_url": "https://gitlab.example.com/company/first/-/merge_requests/4",
                         "created_at": "2026-09-16T09:00:00Z",
+                        "merged_at": None,
                     },
                 ]
 
@@ -1139,7 +1193,7 @@ class DiscoveryInventoryTests(unittest.TestCase):
             self.assertEqual(result["discovered"], 1)
             self.assertEqual(result["queued"], 1)
             self.assertEqual(
-                client.created_after.isoformat(), "2026-09-15T00:00:00+00:00"
+                client.merged_after.isoformat(), "2026-09-15T00:00:00+00:00"
             )
             stored = state.connection.execute(
                 "SELECT mr_iid, head_sha FROM reviews"

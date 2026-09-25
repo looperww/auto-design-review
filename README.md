@@ -5,7 +5,7 @@ Clone it onto any Docker host and start it with Docker Compose. The authenticate
 console stores the GitLab token, model credentials, four selected models,
 GitLab URL, optional GitLab group path, and all review settings in SQLite. It
 automatically discovers the selected group's projects or all projects visible
-to the GitLab token, reviews every eligible MR revision with four comparison
+to the GitLab token, reviews every merged MR revision with four comparison
 profiles, and keeps reports locally.
 
 No GitLab Runner, webhook listener, pipeline trigger, or `.gitlab-ci.yml` change
@@ -16,7 +16,7 @@ is required in product repositories.
 ```text
 GitLab projects visible to the token
               │
-              │ poll eligible MRs every five minutes
+              │ poll merged MRs every five minutes
               ▼
      portable reviewer container
               │
@@ -76,7 +76,7 @@ company group/project boundary:
 | Boundary | Resource | Permission | Why |
 | --- | --- | --- | --- |
 | User | Project | Read | Discover projects visible to the token owner. |
-| Group and project | Merge Request | Read | Read eligible MRs, metadata, and diffs. |
+| Group and project | Merge Request | Read | Read merged MRs, metadata, and diffs. |
 | Group and project | Repository | Read | Download a source snapshot at the exact MR commit. |
 
 If the GitLab version offers legacy scopes instead of resource permissions, use
@@ -127,7 +127,7 @@ company security-review records.
 
 ### 3. Build and start
 
-For a fresh production deployment that should include MRs created on or after
+For a fresh production deployment that should include MRs merged on or after
 14 September 2026 (UTC), seed the initial discovery cutoff while starting the
 container:
 
@@ -193,17 +193,16 @@ After signing in, select **Settings** in the dashboard header, then configure:
   that Copilot account.
 
 The GitLab token can be saved without model credentials. The service then checks
-the GitLab connection, discovers eligible MR revisions created on or after the
-cutoff, and records them as `pending` in SQLite. Eligible revisions are MRs that
-are still open or have already been merged. Closed or abandoned MRs are not
-reviewed. The service does not download repository archives or diffs and does not
-invoke any model in this mode. The dashboard shows the last GitLab connection
-result, every repository visible to the token, and the queued MR count. This
-allows the administrator to verify the GitLab URL, token, scope, and permissions
-without incurring model cost.
+the GitLab connection, discovers merged MR revisions whose `merged_at` timestamp
+is on or after the cutoff, and records them as `pending` in SQLite. Open, closed,
+cancelled, and abandoned MRs are not eligible for review. The service does not
+download repository archives or diffs and does not invoke any model in this mode.
+The dashboard shows the last GitLab connection result, every repository visible
+to the token, and the queued MR count. This allows the administrator to verify
+the GitLab URL, token, scope, and permissions without incurring model cost.
 
 The model credentials can be added later without re-entering the stored GitLab
-token. Once the Anthropic key is saved, queued eligible MR revisions can be
+token. Once the Anthropic key is saved, queued merged MR revisions can be
 reviewed by Anthropic alone, subject to the configured maximum reviews per cycle. Once
 all three model credentials are saved, queued revisions are reviewed by all four
 profiles. Leaving a secret field blank during a later update
@@ -329,8 +328,8 @@ and associated human-review decision,
 clears the previous GitLab scan status, and records the reset time as a new
 deployment cutoff. Administrator accounts, active login sessions, encrypted
 GitLab and model credentials, and runtime settings remain unchanged. The reviewer
-is then woken for a fresh discovery cycle; open MRs created before the reset
-time are not imported again.
+is then woken for a fresh discovery cycle; MRs merged before the reset time are
+not imported again.
 
 After every container or host restart, any existing authenticated web session
 is invalidated and the administrator is redirected to the sign-in page. Signing
@@ -347,9 +346,9 @@ would require an external secret manager or master key, which this deployment
 intentionally does not store.
 
 When GitLab and the Anthropic credential are supplied, choose whether to review
-existing eligible MRs (opened or merged) before the first scan. The default records them as a baseline
-without spending LLM tokens. Any MR created later, or any new commit pushed to
-an MR, is reviewed automatically. Enabling existing-MR review can create
+existing merged MRs before the first scan. The default records them as a baseline
+without spending LLM tokens. Any MR merged later is reviewed automatically;
+additional commits are reviewed only when their MR is merged. Enabling existing-MR review can create
 significant API cost. If OpenAI and Copilot credentials are later added, queued
 revisions can be processed by all four comparison profiles.
 
@@ -439,7 +438,7 @@ vulnerability-free.
 On both Dashboard and Repositories, Day, Week, and Month select rolling windows
 of 24 hours, 7 days, and 30 days. The administrator can also select an inclusive
 UTC start-date and end-date range; choosing the same date in both fields filters
-one calendar day. MRs created before the deployment cutoff remain excluded.
+one calendar day. MRs merged before the deployment cutoff remain excluded.
 
 ## Automatic discovery
 
@@ -449,8 +448,9 @@ optional group path define the boundary. Every polling cycle:
 1. GitLab returns projects from the configured group and its subgroups, or all
    active projects in which the token owner has at least Reporter access when
    the group path is blank.
-2. The service lists MRs in those projects and retains only revisions created
-   on or after the configured cutoff whose state is `opened` or `merged`.
+2. The service lists only MRs with GitLab state `merged` and retains revisions
+   whose `merged_at` timestamp is on or after the configured cutoff. Open,
+   closed, cancelled, and abandoned MRs are excluded.
 3. The local SQLite database identifies MR commit SHAs not seen before.
 4. Unseen revisions are queued and reviewed in order.
 
@@ -460,11 +460,12 @@ access to the project or place the project outside the token's resource boundary
 
 The first application start creates a persistent `deployment_started_at` cutoff
 in SQLite. By default it is the first-start time; a fresh deployment can seed an
-earlier cutoff with `MR_DISCOVERY_START_AT`. GitLab may return MRs created before
+earlier cutoff with `MR_DISCOVERY_START_AT`. GitLab may return MRs merged before
 the cutoff, but those MRs are not queued, counted, or reviewed. Only MRs whose
-GitLab `created_at` timestamp is on or after the cutoff are included. MRs already
-merged after the cutoff remain eligible, so the service can review historical
-changes that reached production. Closed or abandoned MRs remain excluded.
+GitLab `merged_at` timestamp is on or after the cutoff are included. This means
+an MR created before the cutoff is still eligible when it is merged after the
+cutoff, because the review objective is to cover changes that reached production.
+Open, closed, cancelled, and abandoned MRs remain excluded.
 Rebuilding or replacing the container does not reset the cutoff because it is
 stored in the host `data/` folder.
 
@@ -474,7 +475,7 @@ or restoring an existing `data/` folder is treated as moving the same deployment
 and therefore retains its original cutoff and review history.
 
 Each successful GitLab scan refreshes a persistent inventory of all repositories
-currently visible to the token, including repositories with no open MRs. The web
+currently visible to the token, including repositories with no merged MRs. The web
 console lists the full inventory and each repository's latest successful
 observation time.
 
@@ -487,7 +488,7 @@ then two over three cycles.
 
 Set the value to `0` in the web console to process all pending revisions in the
 same cycle. MR revisions are still processed sequentially, but the four model
-calls for one MR run concurrently against the same immutable prompt. MRs created
+calls for one MR run concurrently against the same immutable prompt. MRs merged
 while a cycle is running are discovered in the next cycle. Unlimited mode can
 create a large and sudden bill across all three services, so a finite limit is
 recommended for normal operation.
@@ -497,7 +498,7 @@ automatically on the next polling cycle. No `.env` file is used.
 
 ## Context and data-flow analysis
 
-For each new MR revision, the reviewer downloads a repository archive at the
+For each merged MR revision, the reviewer downloads a repository archive at the
 exact source commit and selects:
 
 - full contents of changed text files;

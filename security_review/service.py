@@ -313,8 +313,8 @@ class RuntimeSetting:
 RUNTIME_SETTINGS = (
     RuntimeSetting(
         "REVIEW_EXISTING_MRS",
-        "Review existing eligible MRs on first start",
-        "Enable this before the first review scan to include opened and merged MRs that already exist.",
+        "Review existing merged MRs on first start",
+        "Enable this before the first review scan to include merged MRs that already exist.",
         "choice",
         "false",
         choices=("false", "true"),
@@ -730,17 +730,17 @@ class GitLabClient:
         return [item for item in projects if isinstance(item, dict)]
 
     def list_merge_requests(
-        self, project_path: str, *, created_after: datetime | None = None
+        self, project_path: str, *, merged_after: datetime | None = None
     ) -> list[dict[str, Any]]:
         project = api_project(project_path)
         query: dict[str, Any] = {
-            "state": "all",
+            "state": "merged",
             "scope": "all",
-            "order_by": "created_at",
+            "order_by": "merged_at",
             "sort": "asc",
         }
-        if created_after is not None:
-            query["created_after"] = created_after.isoformat()
+        if merged_after is not None:
+            query["merged_after"] = merged_after.isoformat()
         result = self.get_all(
             f"projects/{project}/merge_requests",
             query,
@@ -749,7 +749,7 @@ class GitLabClient:
 
     # Kept as a compatibility alias for integrations that used the original
     # client method name. Discovery itself uses list_merge_requests so that it
-    # can include merged revisions from the configured starting date.
+    # can include only merged revisions from the configured starting date.
     def list_open_merge_requests(self, project_path: str) -> list[dict[str, Any]]:
         return self.list_merge_requests(project_path)
 
@@ -913,7 +913,11 @@ class ReviewState:
             "SELECT status FROM reviews WHERE project_id = ? AND mr_iid = ? AND head_sha = ?",
             (target.project_id, target.mr_iid, target.head_sha),
         ).fetchone()
-        return row is not None and str(row[0]) not in {"pending", "in_progress"}
+        return row is not None and str(row[0]) not in {
+            "pending",
+            "in_progress",
+            "not_eligible",
+        }
 
     def queue(self, target: ReviewTarget) -> bool:
         discovered_at = utc_now()
@@ -934,6 +938,29 @@ class ReviewState:
                 discovered_at,
             ),
         )
+        if cursor.rowcount == 0:
+            cursor = self.connection.execute(
+                """
+                UPDATE reviews
+                SET status = 'pending',
+                    report_path = '',
+                    report_content = '',
+                    metadata_json = '',
+                    discovered_at = ?,
+                    mr_created_at = ?,
+                    reviewed_at = ?
+                WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
+                  AND status = 'not_eligible'
+                """,
+                (
+                    discovered_at,
+                    target.created_at or discovered_at,
+                    discovered_at,
+                    target.project_id,
+                    target.mr_iid,
+                    target.head_sha,
+                ),
+            )
         self.connection.commit()
         return cursor.rowcount > 0
 
@@ -975,6 +1002,65 @@ class ReviewState:
             )
             for row in rows
         ]
+
+    def mark_pending_not_eligible(
+        self,
+        eligible_keys: set[tuple[int, int, str]],
+        *,
+        healthy_projects_only: bool = False,
+    ) -> int:
+        """Remove previously queued revisions that are not merged anymore.
+
+        Discovery is merged-only. Pending rows created by the former open-MR
+        policy must not remain actionable or be sent to the reviewer manually.
+        Keep the row as an audit marker instead of deleting it.
+        """
+        query = """
+            SELECT project_id, mr_iid, head_sha
+            FROM reviews
+            WHERE status = 'pending'
+        """
+        if healthy_projects_only:
+            query += """
+              AND project_id IN (
+                    SELECT project_id
+                    FROM visible_projects
+                    WHERE is_visible = 1 AND last_check_status = 'up'
+              )
+            """
+        rows = self.connection.execute(query).fetchall()
+        changed = 0
+        for row in rows:
+            key = (int(row[0]), int(row[1]), str(row[2]))
+            if key in eligible_keys:
+                continue
+            self.connection.execute(
+                """
+                UPDATE reviews
+                SET status = 'not_eligible',
+                    priority_requested_at = '',
+                    metadata_json = ?
+                WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
+                  AND status = 'pending'
+                """,
+                (
+                    json.dumps(
+                        {
+                            "status": "not_eligible",
+                            "reason": "The MR was not merged and is outside the merged-only review policy.",
+                            "updated_at": utc_now(),
+                        },
+                        sort_keys=True,
+                    ),
+                    key[0],
+                    key[1],
+                    key[2],
+                ),
+            )
+            changed += 1
+        if changed:
+            self.connection.commit()
+        return changed
 
     def prioritize_targets(self, targets: Iterable[ReviewTarget]) -> list[ReviewTarget]:
         requested = {
@@ -2136,9 +2222,9 @@ def review_target(
     try:
         mr = client.get_merge_request(target.project_path, target.mr_iid)
         mr_state = str(mr.get("state") or "").lower()
-        if mr_state not in {"opened", "merged"}:
+        if mr_state != "merged":
             raise ManualReviewRequired(
-                f"The merge request is not open or merged (current state: {mr_state or 'unknown'})."
+                f"The merge request is not merged (current state: {mr_state or 'unknown'})."
             )
         current_sha = str(mr.get("sha") or mr.get("diff_refs", {}).get("head_sha") or "")
         if current_sha != target.head_sha:
@@ -2290,7 +2376,7 @@ def discover_targets(
             continue
         try:
             merge_requests = client.list_merge_requests(
-                project_path, created_after=deployment_started_at
+                project_path, merged_after=deployment_started_at
             )
         except ReviewError as exc:
             if state is not None:
@@ -2300,23 +2386,22 @@ def discover_targets(
         if state is not None:
             state.record_project_check(project_id, "up")
         for mr in merge_requests:
-            # Closed/abandoned MRs are intentionally excluded. Open MRs and
-            # MRs already merged into the production flow are both eligible.
-            if str(mr.get("state") or "").lower() not in {"opened", "merged"}:
+            # Only merged MRs represent changes that actually reached the
+            # repository. Open, closed, and cancelled MRs are excluded.
+            if str(mr.get("state") or "").lower() != "merged":
+                continue
+            try:
+                merged_at = parse_gitlab_timestamp(str(mr.get("merged_at") or ""))
+            except ReviewError as exc:
+                print(
+                    f"Could not determine merge time for {project_path}!{mr.get('iid', '?')}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            if merged_at < deployment_started_at:
                 continue
             target = target_from(project, mr)
-            if deployment_started_at is not None:
-                try:
-                    created_at = parse_gitlab_timestamp(target.created_at)
-                except ReviewError as exc:
-                    print(
-                        f"Could not determine creation time for {project_path}!{target.mr_iid}: {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    continue
-                if created_at < deployment_started_at:
-                    continue
             targets.append(target)
     return targets
 
@@ -2331,15 +2416,9 @@ def scan_once(
     target_keys = {
         (target.project_id, target.mr_iid, target.head_sha) for target in targets
     }
-    for requested_target in state.requested_targets():
-        key = (
-            requested_target.project_id,
-            requested_target.mr_iid,
-            requested_target.head_sha,
-        )
-        if key not in target_keys:
-            targets.append(requested_target)
-            target_keys.add(key)
+    not_eligible = state.mark_pending_not_eligible(
+        target_keys, healthy_projects_only=True
+    )
     active_comparison_configs = list(comparison_configs or [])
     if not config.llm_api_key and not active_comparison_configs:
         if not state.initialized():
@@ -2355,6 +2434,7 @@ def scan_once(
             "discovered": len(targets),
             "pending": pending,
             "queued": queued,
+            "not_eligible": not_eligible,
             "waiting_for_llm": pending,
         }
     if not state.initialized():
@@ -2381,6 +2461,7 @@ def scan_once(
         "discovered": len(targets),
         "pending": len(pending),
         "deferred": len(pending) - review_limit,
+        "not_eligible": not_eligible,
     }
     remaining = list(pending)
     for _ in range(review_limit):
