@@ -1527,6 +1527,18 @@ def isolated_runtime_env() -> dict[str, str]:
     return {name: os.environ[name] for name in allowed if name in os.environ}
 
 
+def summarize_process_failure(stderr: str, stdout: str, secret: str = "") -> str:
+    """Return a short, secret-safe diagnostic from a failed child process."""
+    detail = (stderr or stdout or "").strip()
+    if secret:
+        detail = detail.replace(secret, "[REDACTED]")
+    detail = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[REDACTED]", detail)
+    detail = " ".join(detail.split())
+    if len(detail) > 1200:
+        detail = detail[:1200].rstrip() + "..."
+    return detail
+
+
 def run_claude(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
     command = [
         "claude",
@@ -1574,7 +1586,13 @@ def run_claude(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
     except subprocess.TimeoutExpired as exc:
         raise ReviewError("Claude review exceeded the 15-minute timeout.") from exc
     if completed.returncode != 0:
-        raise ReviewError(f"Claude review failed with exit code {completed.returncode}.")
+        detail = summarize_process_failure(
+            completed.stderr, completed.stdout, config.llm_api_key
+        )
+        suffix = f": {detail}" if detail else "."
+        raise ReviewError(
+            f"Claude review failed with exit code {completed.returncode}{suffix}"
+        )
     try:
         result = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:

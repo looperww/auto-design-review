@@ -46,6 +46,7 @@ from security_review.service import (  # noqa: E402
     render_commit_context,
     review_target,
     scan_once,
+    summarize_process_failure,
     test_claude_api_key as verify_claude_api_key,
 )
 from security_review.web import (  # noqa: E402
@@ -336,6 +337,16 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(ReviewError):
                 verify_claude_api_key("")
         run.assert_not_called()
+
+    def test_process_failure_summary_redacts_secrets_and_bounds_output(self):
+        summary = summarize_process_failure(
+            "Bearer secret-token\n" + ("x" * 2000),
+            "",
+            "secret-token",
+        )
+        self.assertNotIn("secret-token", summary)
+        self.assertLessEqual(len(summary), 1203)
+        self.assertIn("Bearer [REDACTED]", summary)
 
     def test_openai_uses_responses_api_without_storage(self):
         config = config_for_test(

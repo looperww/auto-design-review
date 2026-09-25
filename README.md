@@ -298,6 +298,12 @@ queued MRs sequentially, so normally only one MR is In Progress at a time. The
 container log also prints `Reviewing <project>!<MR>` while that review is running.
 An interrupted In Progress review remains retryable on the next polling cycle.
 
+If a Claude review fails, the application stores a bounded, secret-redacted
+diagnostic from the Claude CLI error output with the failed profile. This helps
+distinguish provider errors, rate limits, timeouts, and request-size problems
+from GitLab access failures. A failed review is not considered safe and must be
+retried or reviewed manually.
+
 Every finding row on the Dashboard and Completed MRs page, and every MR row on
 the repository-specific MR page, has a human-review control. Its default state
 is **Open**. An administrator can change it to **Under Verification** or
