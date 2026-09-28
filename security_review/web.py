@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import hmac
 import html
+import io
 import json
 import os
 import re
@@ -611,6 +613,182 @@ def completed_review_entries(
                 }
             )
     return entries
+
+
+def build_review_export(store: Any) -> dict[str, Any]:
+    """Build a credential-free export of the retained model results and usage."""
+    manual_reviews = store.manual_review_map()
+    profiles: dict[str, dict[str, Any]] = {}
+    exported_reviews: list[dict[str, Any]] = []
+    for profile in COMPARISON_PROFILES:
+        reviews = store.completed_reviews(profile)
+        summary = profile_usage_summary(reviews, profile)
+        profile_reviews: list[dict[str, Any]] = []
+        for review in reviews:
+            entries = completed_review_entries([review], manual_reviews)
+            if not entries:
+                continue
+            try:
+                metadata = json.loads(str(review.get("metadata_json", "{}") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            usage = metadata.get("llm_usage")
+            if not isinstance(usage, dict):
+                usage = {}
+            raw_cost = metadata.get("llm_cost_usd")
+            cost_usd = (
+                float(raw_cost)
+                if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool)
+                else None
+            )
+            raw_input = usage.get("input_tokens", usage.get("lastCallInputTokens"))
+            raw_output = usage.get("output_tokens", usage.get("lastCallOutputTokens"))
+            input_tokens = raw_input if isinstance(raw_input, int) and not isinstance(raw_input, bool) else None
+            output_tokens = raw_output if isinstance(raw_output, int) and not isinstance(raw_output, bool) else None
+            findings = [
+                {
+                    "severity": str(entry["severity"]),
+                    "title": str(entry["title"]),
+                    "details": str(entry["finding_details"]),
+                    "severity_explanation": str(entry["severity_explanation"]),
+                    "manual_status": str(entry["manual_status"]),
+                    "manual_resolution": str(entry["manual_resolution"]),
+                    "manual_severity": str(entry["manual_severity"]),
+                    "manual_comments": str(entry["manual_comments"]),
+                }
+                for entry in entries
+            ]
+            severity_order = lambda finding: SEVERITY_ORDER.get(
+                str(finding["severity"]), len(SEVERITY_ORDER)
+            )
+            highest = min(findings, key=severity_order)
+            manual_statuses = {str(finding["manual_status"]) for finding in findings}
+            if "in_progress" in manual_statuses:
+                manual_status = "in_progress"
+            elif manual_statuses and manual_statuses == {"done"}:
+                manual_status = "done"
+            else:
+                manual_status = "open"
+            record = {
+                "project_id": int(review["project_id"]),
+                "project_path": str(review["project_path"]),
+                "mr_iid": int(review["mr_iid"]),
+                "mr_url": str(entries[0]["mr_url"]),
+                "head_sha": str(review["head_sha"]),
+                "profile": profile,
+                "provider": str(review.get("llm_provider", "")),
+                "model": str(review.get("llm_model", "")),
+                "status": str(review["status"]),
+                "manual_status": manual_status,
+                "reviewed_at": str(review["reviewed_at"]),
+                "cost_usd": cost_usd,
+                "cost_display": f"${cost_usd:,.4f}" if cost_usd is not None else "Provider billing",
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "summary": str(entries[0]["summary"]),
+                "report": str(review.get("report_content", "") or ""),
+                "highest_severity": str(highest["severity"]),
+                "finding_count": sum(
+                    1 for finding in findings if str(finding["severity"]) != "SAFE"
+                ),
+                "findings": findings,
+            }
+            profile_reviews.append(record)
+            exported_reviews.append(record)
+        profiles[profile] = {"summary": summary, "reviews": profile_reviews}
+    status = store.scan_status()
+    return {
+        "schema_version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "deployment_started_at": status.get("deployment_started_at", ""),
+        "review_count": len(exported_reviews),
+        "profiles": profiles,
+        "reviews": exported_reviews,
+    }
+
+
+def render_review_export_csv(payload: Mapping[str, Any]) -> str:
+    """Render one spreadsheet-friendly row per model/MR review."""
+    output = io.StringIO(newline="")
+    fieldnames = [
+        "profile",
+        "provider",
+        "model",
+        "project_id",
+        "project_path",
+        "mr_iid",
+        "mr_url",
+        "head_sha",
+        "status",
+        "manual_status",
+        "reviewed_at",
+        "highest_severity",
+        "finding_count",
+        "cost_usd",
+        "cost_display",
+        "input_tokens",
+        "output_tokens",
+        "finding_titles",
+        "vulnerability_details",
+        "severity_explanations",
+        "manual_comments",
+        "summary",
+        "report",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    for record in payload.get("reviews", []):
+        if not isinstance(record, Mapping):
+            continue
+        findings = record.get("findings", [])
+        if not isinstance(findings, list):
+            findings = []
+        writer.writerow(
+            {
+                "profile": record.get("profile", ""),
+                "provider": record.get("provider", ""),
+                "model": record.get("model", ""),
+                "project_id": record.get("project_id", ""),
+                "project_path": record.get("project_path", ""),
+                "mr_iid": record.get("mr_iid", ""),
+                "mr_url": record.get("mr_url", ""),
+                "head_sha": record.get("head_sha", ""),
+                "status": record.get("status", ""),
+                "manual_status": record.get("manual_status", ""),
+                "reviewed_at": record.get("reviewed_at", ""),
+                "highest_severity": record.get("highest_severity", ""),
+                "finding_count": record.get("finding_count", 0),
+                "cost_usd": record.get("cost_usd", ""),
+                "cost_display": record.get("cost_display", ""),
+                "input_tokens": record.get("input_tokens", ""),
+                "output_tokens": record.get("output_tokens", ""),
+                "finding_titles": "\n".join(
+                    f"[{item.get('severity', '')}] {item.get('title', '')}"
+                    for item in findings
+                    if isinstance(item, Mapping)
+                ),
+                "vulnerability_details": "\n\n".join(
+                    str(item.get("details", ""))
+                    for item in findings
+                    if isinstance(item, Mapping)
+                ),
+                "severity_explanations": "\n\n".join(
+                    str(item.get("severity_explanation", ""))
+                    for item in findings
+                    if isinstance(item, Mapping)
+                ),
+                "manual_comments": "\n\n".join(
+                    str(item.get("manual_comments", ""))
+                    for item in findings
+                    if isinstance(item, Mapping) and item.get("manual_comments")
+                ),
+                "summary": record.get("summary", ""),
+                "report": record.get("report", ""),
+            }
+        )
+    return output.getvalue()
 
 
 def manual_review_status_for_mr(
@@ -2115,6 +2293,24 @@ def handler_factory(
             self.end_headers()
             self.wfile.write(encoded)
 
+        def send_download(
+            self,
+            content: str,
+            content_type: str,
+            filename: str,
+            disposition: str = "attachment",
+        ) -> None:
+            encoded = content.encode("utf-8")
+            self.send_response(200)
+            self.security_headers()
+            self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+            self.send_header(
+                "Content-Disposition", f'{disposition}; filename="{filename}"'
+            )
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
         def redirect(
             self, location: str, extra_headers: list[tuple[str, str]] | None = None
         ) -> None:
@@ -2222,6 +2418,8 @@ def handler_factory(
                 self.show_mr_diff(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/mr-commits":
                 self.show_mr_commits(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/export":
+                self.export_reviews(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/repository":
                 self.show_repository(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/":
@@ -2683,6 +2881,12 @@ def handler_factory(
                 return "Reviewer locked", "failed"
             return "Waiting for reviewer heartbeat", "failed"
 
+        def export_links(self) -> str:
+            return (
+                "<a class='button secondary' href='/export?format=csv'>Download CSV</a>"
+                "<a class='button secondary' href='/export?format=json' target='_blank' rel='noopener noreferrer'>View JSON</a>"
+            )
+
         def application_response(
             self,
             title: str,
@@ -2965,7 +3169,8 @@ def handler_factory(
                 body,
                 user,
                 "dashboard",
-                "<a class='button secondary' href='/repositories'>View repositories</a>",
+                self.export_links()
+                + "<a class='button secondary' href='/repositories'>View repositories</a>",
                 connection_status,
             )
 
@@ -3328,6 +3533,7 @@ def handler_factory(
                 body,
                 user,
                 "completed",
+                self.export_links(),
             )
 
         def show_repositories(self, query: dict[str, list[str]]) -> None:
@@ -3463,6 +3669,7 @@ def handler_factory(
                 body,
                 user,
                 "repositories",
+                self.export_links(),
             )
 
         def show_settings(self, query: dict[str, list[str]]) -> None:
@@ -4047,6 +4254,38 @@ def handler_factory(
                 user,
                 "dashboard",
                 "<a class='button secondary' href='/'>Back to dashboard</a>",
+            )
+
+        def export_reviews(self, query: dict[str, list[str]]) -> None:
+            session = self.require_session()
+            if session is None:
+                return
+            export_format = query.get("format", ["csv"])[0].strip().lower()
+            if export_format not in {"csv", "json"}:
+                self.send_page(
+                    400,
+                    page(
+                        "Invalid export format",
+                        "<div class='card'><h1>Invalid export format</h1>"
+                        "<p class='error'>Choose CSV or JSON.</p></div>",
+                    ),
+                )
+                return
+            payload = build_review_export(store)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            if export_format == "json":
+                content = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+                self.send_download(
+                    content,
+                    "application/json",
+                    f"design-review-export-{timestamp}.json",
+                    disposition="inline",
+                )
+                return
+            self.send_download(
+                render_review_export_csv(payload),
+                "text/csv",
+                f"design-review-export-{timestamp}.csv",
             )
 
     return Handler

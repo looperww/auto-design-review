@@ -702,6 +702,30 @@ class DifferentialReviewTests(unittest.TestCase):
             self.assertEqual(result, "completed")
             state.close()
 
+    def test_unmerged_mr_cannot_be_reviewed_even_if_queued(self):
+        target = ReviewTarget(1, "company/app", 9, "head-sha", "https://example/mr/9")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "SKILL.md").write_text("# Approved workflow\n", encoding="utf-8")
+            state = ReviewState(root / "state.sqlite3")
+            with patch("security_review.service.run_llm") as run_llm:
+                result = review_target(
+                    self.FakeGitLabClient(mr_state="opened"),
+                    state,
+                    config_for_test(root),
+                    target,
+                )
+            self.assertEqual(result, "manual_review_required")
+            run_llm.assert_not_called()
+            reason = json.loads(
+                state.connection.execute(
+                    "SELECT metadata_json FROM reviews WHERE head_sha = ?",
+                    ("head-sha",),
+                ).fetchone()[0]
+            )["reason"]
+            self.assertIn("not merged", reason)
+            state.close()
+
     def test_comparison_reviews_both_direct_profiles_from_one_fetched_context(self):
         target = ReviewTarget(1, "company/app", 9, "head-sha", "https://example/mr/9")
         with tempfile.TemporaryDirectory() as directory:
@@ -1620,6 +1644,104 @@ class WebAuthenticationTests(unittest.TestCase):
 
             store.reset_review_data()
             self.assertEqual(store.manual_review_map(), {})
+
+    def test_review_export_is_downloadable_with_results_and_cost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state.sqlite3"
+            store = WebStore(database)
+            user_id = store.create_first_user(
+                "security-admin", "a secure test password"
+            )
+            session_token, _ = store.create_session(user_id)
+            target = ReviewTarget(
+                1,
+                "company/app",
+                7,
+                "abcdef1234567",
+                "https://gitlab.example.com/company/app/-/merge_requests/7",
+                "2026-09-16T10:00:00+00:00",
+            )
+            state = ReviewState(database)
+            state.record_visible_projects(
+                [
+                    {
+                        "id": 1,
+                        "path_with_namespace": "company/app",
+                        "web_url": "https://gitlab.example.com/company/app",
+                    }
+                ]
+            )
+            report = (
+                "# Security review\n\n## Summary\nA changed shell path requires review.\n\n"
+                "## Findings\n### [HIGH] Command injection\n"
+                "File: app.py:9\nUser input may reach the shell.\n\n"
+                "## Overall severity rationale\nThe path is high risk."
+            )
+            state.record_comparison(
+                target,
+                {
+                    "anthropic": {
+                        "status": "high_severity",
+                        "provider": "anthropic",
+                        "model": "claude-test",
+                        "report_content": report,
+                        "metadata": {
+                            "llm_cost_usd": 1.25,
+                            "llm_usage": {"input_tokens": 100, "output_tokens": 20},
+                        },
+                    },
+                    "openai": {
+                        "status": "completed",
+                        "provider": "openai",
+                        "model": "gpt-test",
+                        "report_content": "# Security review\n\n## Summary\nNo issue found.",
+                        "metadata": {
+                            "llm_cost_usd": 0.45,
+                            "llm_usage": {"input_tokens": 90, "output_tokens": 15},
+                        },
+                    },
+                },
+                "## Changed file: app.py\n+run(user_input)",
+                '{"status":"comparison_complete"}',
+            )
+            state.close()
+            handler = handler_factory(store, root / "reports", False, MemoryVault())
+            handler.log_message = lambda *_args: None
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            headers = {"Cookie": f"reviewer_session={session_token}"}
+            try:
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/export?format=csv",
+                        headers=headers,
+                    )
+                ) as response:
+                    csv_body = response.read().decode("utf-8")
+                    csv_disposition = response.headers["Content-Disposition"]
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/export?format=json",
+                        headers=headers,
+                    )
+                ) as response:
+                    json_body = json.loads(response.read().decode("utf-8"))
+                    json_disposition = response.headers["Content-Disposition"]
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+
+            self.assertIn("attachment; filename=\"design-review-export-", csv_disposition)
+            self.assertIn("inline; filename=\"design-review-export-", json_disposition)
+            self.assertIn("anthropic", csv_body)
+            self.assertIn("1.25", csv_body)
+            self.assertIn("Command injection", csv_body)
+            self.assertEqual(json_body["review_count"], 2)
+            self.assertEqual(json_body["profiles"]["anthropic"]["summary"]["cost_display"], "$1.2500")
+            self.assertEqual(json_body["profiles"]["openai"]["summary"]["cost_display"], "$0.4500")
 
     def test_restart_invalidates_session_and_requires_fresh_login(self):
         with tempfile.TemporaryDirectory() as directory:

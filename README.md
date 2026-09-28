@@ -258,6 +258,8 @@ primary pages:
   compact summary for the selected tab shows completed reviews, average runtime,
   input/output tokens, and the cost value reported by that service. A green/red
   indicator beneath the page title shows the latest GitLab connection status.
+  **Download CSV** and **View JSON** actions are available from the Dashboard
+  and Completed MRs pages; they generate a credential-free export immediately.
 - **Queued MRs** lists every revision waiting for automated review and the MR
   currently being processed. An administrator can select **Start now** to move a
   queued revision to the front, wake the worker, and start it immediately after
@@ -355,6 +357,10 @@ the MR identity, commit, selected context files, prompt size, profile, provider,
 model, elapsed time, token usage when returned, and provider-reported cost when
 available. Direct provider billing units are not assumed to be equivalent;
 use the provider billing exports for authoritative financial comparison.
+The export actions produce one row/object per completed MR and model, including
+the report summary, findings, manual-review decision, token usage, and any
+provider-reported cost. When a provider does not return a monetary value, the
+export explicitly records `Provider billing` instead of inventing a cost.
 Reviews created before diff retention was introduced remain visible, but their
 expanded view explains that the historical diff is unavailable.
 Report records never contain credentials; API credentials exist in a separate
@@ -456,6 +462,9 @@ GitLab `merged_at` timestamp is on or after the cutoff are included. This means
 an MR created before the cutoff is still eligible when it is merged after the
 cutoff, because the review objective is to cover changes that reached production.
 Open, closed, cancelled, and abandoned MRs remain excluded.
+This merged-only rule is applied on every polling cycle and again immediately
+before an AI review starts, so a queued or manually prioritized record cannot
+bypass the production-merge requirement.
 Rebuilding or replacing the container does not reset the cutoff because it is
 stored in the host `data/` folder.
 
