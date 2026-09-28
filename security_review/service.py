@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import concurrent.futures
 import heapq
 import io
@@ -12,7 +11,6 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
-import tempfile
 import threading
 import time
 import urllib.error
@@ -135,33 +133,37 @@ STOPWORDS = {
     "while",
 }
 
-LLM_PROVIDERS = ("anthropic", "openai", "gemini", "custom", "copilot")
+LLM_PROVIDERS = ("anthropic", "openai", "gemini", "custom")
 LLM_PROVIDER_LABELS = {
     "anthropic": "Anthropic (Claude Code)",
     "openai": "OpenAI",
     "gemini": "Google Gemini",
     "custom": "Custom (OpenAI-compatible)",
-    "copilot": "GitHub Copilot",
 }
 LLM_DEFAULT_MODELS = {
     "anthropic": "opus",
     "openai": "gpt-6-astra",
     "gemini": "gemini-3.8-flash",
     "custom": "",
-    "copilot": "gpt-5.4",
 }
 COMPARISON_PROFILES = (
     "anthropic",
     "openai",
-    "copilot_anthropic",
-    "copilot_openai",
 )
 COMPARISON_PROFILE_LABELS = {
     "anthropic": "Anthropic",
     "openai": "OpenAI",
-    "copilot_anthropic": "Copilot · Anthropic",
-    "copilot_openai": "Copilot · OpenAI",
 }
+MODEL_PAUSE_SETTINGS = {
+    "anthropic": "MODEL_PAUSED_ANTHROPIC",
+    "openai": "MODEL_PAUSED_OPENAI",
+}
+
+
+def model_is_paused(settings: Mapping[str, str], profile: str) -> bool:
+    """Return whether automated scans are paused for a direct model profile."""
+    key = MODEL_PAUSE_SETTINGS.get(profile)
+    return bool(key and str(settings.get(key, "false")).strip().lower() == "true")
 LLM_SYSTEM_INSTRUCTION = (
     "Apply only the approved instructions supplied in the input. Trace relevant "
     "user-controlled sources through validation and sanitization to changed or "
@@ -359,7 +361,7 @@ RUNTIME_SETTINGS = (
     RuntimeSetting("MAX_DIFF_BYTES", "Maximum diff bytes", "Maximum complete MR diff sent for analysis.", "integer", "300000", Decimal(10000), Decimal(5000000)),
     RuntimeSetting("MAX_ARCHIVE_BYTES", "Maximum repository archive bytes", "Maximum in-memory repository snapshot size.", "integer", "100000000", Decimal(1000000), Decimal(1000000000)),
     RuntimeSetting("MAX_ARCHIVE_MEMBERS", "Maximum archive members", "Maximum number of files examined in a repository archive.", "integer", "50000", Decimal(100), Decimal(500000)),
-    RuntimeSetting("MAX_CONTEXT_FILES", "Maximum context files", "Changed and related files supplied identically to all four comparison profiles.", "integer", "20", Decimal(1), Decimal(200)),
+    RuntimeSetting("MAX_CONTEXT_FILES", "Maximum context files", "Changed and related files supplied identically to both direct comparison profiles.", "integer", "20", Decimal(1), Decimal(200)),
     RuntimeSetting("MAX_CONTEXT_FILE_BYTES", "Maximum bytes per context file", "Oversized files are omitted and reported.", "integer", "100000", Decimal(1000), Decimal(1000000)),
     RuntimeSetting("MAX_CONTEXT_BYTES", "Maximum total context bytes", "Maximum selected repository context supplied identically to each comparison profile.", "integer", "350000", Decimal(10000), Decimal(5000000)),
     RuntimeSetting("MAX_CONTEXT_SCAN_BYTES", "Maximum context scan bytes", "Maximum repository text scanned when selecting related files.", "integer", "30000000", Decimal(100000), Decimal(500000000)),
@@ -1283,10 +1285,11 @@ class ReviewState:
 
     def runtime_settings(self) -> dict[str, str]:
         rows = self.connection.execute("SELECT key, value FROM settings").fetchall()
+        allowed_keys = set(RUNTIME_SETTING_MAP) | set(MODEL_PAUSE_SETTINGS.values())
         return {
             str(key): str(value)
             for key, value in rows
-            if str(key) in RUNTIME_SETTING_MAP
+            if str(key) in allowed_keys
         }
 
 
@@ -1607,8 +1610,6 @@ def isolated_runtime_env() -> dict[str, str]:
         "HTTP_PROXY",
         "NO_PROXY",
         "XDG_CACHE_HOME",
-        "COPILOT_CLI_PATH",
-        "COPILOT_CLI_EXTRACT_DIR",
     )
     return {name: os.environ[name] for name in allowed if name in os.environ}
 
@@ -1809,8 +1810,6 @@ def list_llm_models(provider: str, api_key: str, api_url: str = "") -> list[str]
                 models.append(name.removeprefix("models/"))
         items = [{"id": model} for model in models]
         name_key = "id"
-    elif provider == "copilot":
-        return list_copilot_models(api_key)
     else:
         if not api_url:
             raise ReviewError("Enter the custom API URL before fetching models.")
@@ -1955,111 +1954,6 @@ def run_custom_llm(
     return custom_response_text(result), dict(result)
 
 
-def _copilot_runtime_env() -> dict[str, str]:
-    # Give the isolated Copilot runtime only the process settings it needs. The
-    # GitHub token is passed through the SDK's dedicated authentication field;
-    # GitLab and other provider credentials must never reach the child runtime.
-    return isolated_runtime_env()
-
-
-async def _run_copilot_async(
-    prompt_input: str, config: Config
-) -> tuple[str, dict[str, Any]]:
-    try:
-        from copilot import CopilotClient
-        from copilot.session_events import AssistantMessageData
-    except ImportError as exc:
-        raise ReviewError("The GitHub Copilot SDK is not installed in the reviewer image.") from exc
-    with tempfile.TemporaryDirectory(prefix="copilot-review-", dir="/tmp") as copilot_home:
-        client = CopilotClient(
-            github_token=config.llm_api_key,
-            use_logged_in_user=False,
-            working_directory="/tmp",
-            base_directory=copilot_home,
-            env=_copilot_runtime_env(),
-            mode="empty",
-        )
-        await client.start()
-        try:
-            session = await client.create_session(
-                model=config.llm_model,
-                system_message={"mode": "replace", "content": LLM_SYSTEM_INSTRUCTION},
-                available_tools=[],
-                enable_session_store=False,
-                enable_skills=False,
-                memory={"enabled": False},
-            )
-            try:
-                response = await session.send_and_wait(prompt_input, timeout=900)
-                if response is None or not isinstance(response.data, AssistantMessageData):
-                    raise ReviewError("GitHub Copilot returned no text report.")
-                report = response.data.content.strip()
-                if not report:
-                    raise ReviewError("GitHub Copilot returned an empty text report.")
-                usage: dict[str, Any] = {}
-                try:
-                    usage = (await session.rpc.usage.get_metrics(timeout=30)).to_dict()
-                except Exception:
-                    # A report remains valid if an experimental usage endpoint is unavailable.
-                    usage = {}
-                return report, {"usage": usage, "copilot_model": response.data.model}
-            finally:
-                await session.disconnect()
-        finally:
-            await client.stop()
-
-
-def run_copilot(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
-    try:
-        return asyncio.run(_run_copilot_async(prompt_input, config))
-    except ReviewError:
-        raise
-    except TimeoutError as exc:
-        raise ReviewError("GitHub Copilot review exceeded the 15-minute timeout.") from exc
-    except Exception as exc:
-        raise ReviewError("GitHub Copilot review failed.") from exc
-
-
-async def _list_copilot_models_async(api_key: str) -> list[str]:
-    try:
-        from copilot import CopilotClient
-    except ImportError as exc:
-        raise ReviewError("The GitHub Copilot SDK is not installed in the reviewer image.") from exc
-    with tempfile.TemporaryDirectory(prefix="copilot-models-", dir="/tmp") as copilot_home:
-        client = CopilotClient(
-            github_token=api_key,
-            use_logged_in_user=False,
-            working_directory="/tmp",
-            base_directory=copilot_home,
-            env=_copilot_runtime_env(),
-            mode="empty",
-        )
-        await client.start()
-        try:
-            return sorted(
-                {
-                    str(model.id).strip()
-                    for model in await client.list_models()
-                    if 0 < len(str(model.id).strip()) <= 256
-                },
-                key=str.casefold,
-            )
-        finally:
-            await client.stop()
-
-
-def list_copilot_models(api_key: str) -> list[str]:
-    try:
-        models = asyncio.run(_list_copilot_models_async(api_key))
-    except ReviewError:
-        raise
-    except Exception as exc:
-        raise ReviewError("Could not list models from GitHub Copilot.") from exc
-    if not models:
-        raise ReviewError("GitHub Copilot returned no selectable models for this token.")
-    return models
-
-
 def run_llm(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
     if config.llm_provider == "anthropic":
         return run_claude(prompt_input, config)
@@ -2069,8 +1963,6 @@ def run_llm(prompt_input: str, config: Config) -> tuple[str, dict[str, Any]]:
         return run_gemini(prompt_input, config)
     if config.llm_provider == "custom":
         return run_custom_llm(prompt_input, config)
-    if config.llm_provider == "copilot":
-        return run_copilot(prompt_input, config)
     raise ReviewError("The selected LLM provider is not supported.")
 
 
@@ -2147,9 +2039,6 @@ def test_llm_connection(config: Config) -> None:
         return
     if config.llm_provider == "custom":
         run_custom_llm("Reply with exactly OK.", config, max_output_tokens=16)
-        return
-    if config.llm_provider == "copilot":
-        run_copilot("Reply with exactly OK.", config)
         return
     raise ReviewError("The selected LLM provider is not supported.")
 
@@ -2540,60 +2429,37 @@ def run_managed_poll(
         credentials, vault_version = vault.wait_for_credentials()
         sleep_seconds = 300
         try:
+            runtime_settings = state.runtime_settings()
             anthropic_ready = bool(credentials.llm_api_key.strip())
-            comparison_ready = bool(
-                credentials.llm_api_key.strip()
-                and credentials.openai_api_key.strip()
-                and credentials.copilot_api_key.strip()
-            )
+            openai_ready = bool(credentials.openai_api_key.strip())
+            anthropic_paused = model_is_paused(runtime_settings, "anthropic")
+            openai_paused = model_is_paused(runtime_settings, "openai")
             config = Config.from_credentials(
                 credentials.gitlab_url,
                 credentials.gitlab_token,
-                credentials.llm_api_key if anthropic_ready else "",
-                state.runtime_settings(),
+                credentials.llm_api_key if anthropic_ready and not anthropic_paused else "",
+                runtime_settings,
                 llm_provider="anthropic",
                 llm_model=credentials.llm_model,
                 gitlab_group_path=credentials.gitlab_group_path,
                 review_profile="anthropic",
             )
-            if comparison_ready:
-                comparison_configs = [
-                    config,
+            comparison_configs = []
+            if anthropic_ready and not anthropic_paused:
+                comparison_configs.append(config)
+            if openai_ready and not openai_paused:
+                comparison_configs.append(
                     Config.from_credentials(
                         credentials.gitlab_url,
                         credentials.gitlab_token,
                         credentials.openai_api_key,
-                        state.runtime_settings(),
+                        runtime_settings,
                         llm_provider="openai",
                         llm_model=credentials.openai_model,
                         gitlab_group_path=credentials.gitlab_group_path,
                         review_profile="openai",
-                    ),
-                    Config.from_credentials(
-                        credentials.gitlab_url,
-                        credentials.gitlab_token,
-                        credentials.copilot_api_key,
-                        state.runtime_settings(),
-                        llm_provider="copilot",
-                        llm_model=credentials.copilot_anthropic_model,
-                        gitlab_group_path=credentials.gitlab_group_path,
-                        review_profile="copilot_anthropic",
-                    ),
-                    Config.from_credentials(
-                        credentials.gitlab_url,
-                        credentials.gitlab_token,
-                        credentials.copilot_api_key,
-                        state.runtime_settings(),
-                        llm_provider="copilot",
-                        llm_model=credentials.copilot_openai_model,
-                        gitlab_group_path=credentials.gitlab_group_path,
-                        review_profile="copilot_openai",
-                    ),
-                ]
-            elif anthropic_ready:
-                comparison_configs = [config]
-            else:
-                comparison_configs = []
+                    )
+                )
             sleep_seconds = config.poll_interval_seconds
             client = GitLabClient(
                 config.gitlab_url, config.gitlab_token, config.gitlab_group_path

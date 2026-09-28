@@ -31,12 +31,14 @@ from .service import (
     LLM_DEFAULT_MODELS,
     LLM_PROVIDER_LABELS,
     LLM_PROVIDERS,
+    MODEL_PAUSE_SETTINGS,
     RUNTIME_SETTINGS,
     Config,
     ReviewError,
     effective_runtime_settings,
     initial_mr_discovery_started_at,
     list_llm_models,
+    model_is_paused,
     normalize_gitlab_group_path,
     normalize_runtime_setting,
     render_diffs,
@@ -765,20 +767,16 @@ class Credentials:
     gitlab_group_path: str = ""
     openai_api_key: str = ""
     openai_model: str = ""
-    copilot_api_key: str = ""
-    copilot_anthropic_model: str = "claude-sonnet-5"
-    copilot_openai_model: str = "gpt-5.4"
 
     def comparison_ready(self) -> bool:
         return bool(
             self.llm_api_key.strip()
             and self.openai_api_key.strip()
-            and self.copilot_api_key.strip()
         )
 
     def review_ready(self) -> bool:
-        """Whether the direct Anthropic reviewer can run by itself."""
-        return bool(self.llm_api_key.strip())
+        """Whether at least one direct model can run by itself."""
+        return bool(self.llm_api_key.strip() or self.openai_api_key.strip())
 
 
 def credential_key(password: str, salt: bytes) -> bytes:
@@ -801,9 +799,6 @@ def credential_payload(credentials: Credentials) -> bytes:
             "anthropic_model": credentials.llm_model,
             "openai_api_key": credentials.openai_api_key,
             "openai_model": credentials.openai_model,
-            "copilot_api_key": credentials.copilot_api_key,
-            "copilot_anthropic_model": credentials.copilot_anthropic_model,
-            "copilot_openai_model": credentials.copilot_openai_model,
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -861,13 +856,6 @@ def decrypt_credentials_with_key(
             ),
             openai_api_key=openai_key,
             openai_model=openai_model,
-            copilot_api_key=str(payload.get("copilot_api_key", "")),
-            copilot_anthropic_model=str(
-                payload.get("copilot_anthropic_model", "claude-sonnet-5")
-            ),
-            copilot_openai_model=str(
-                payload.get("copilot_openai_model", "gpt-5.4")
-            ),
         )
     except (ValueError, KeyError, TypeError, json.JSONDecodeError, InvalidTag) as exc:
         raise ReviewError("The credential vault could not be unlocked.") from exc
@@ -941,8 +929,6 @@ def profile_usage_summary(
     output_tokens = 0
     reported_usd = 0.0
     has_reported_usd = False
-    premium_requests = 0.0
-    has_premium_requests = False
     for report in reports:
         try:
             metadata = json.loads(str(report.get("metadata_json", "{}") or "{}"))
@@ -967,19 +953,8 @@ def profile_usage_summary(
             input_tokens += raw_input
         if isinstance(raw_output, int) and not isinstance(raw_output, bool):
             output_tokens += raw_output
-        raw_premium = usage.get("totalPremiumRequestCost")
-        if isinstance(raw_premium, (int, float)) and not isinstance(raw_premium, bool):
-            premium_requests += float(raw_premium)
-            has_premium_requests = True
     average_ms = sum(durations) / len(durations) if durations else None
-    if profile.startswith("copilot_"):
-        cost_display = (
-            f"{premium_requests:,.2f} premium requests"
-            if has_premium_requests
-            else "Not reported"
-        )
-    else:
-        cost_display = f"${reported_usd:,.4f}" if has_reported_usd else "Provider billing"
+    cost_display = f"${reported_usd:,.4f}" if has_reported_usd else "Provider billing"
     return {
         "reviews": review_count,
         "average_ms": average_ms,
@@ -1092,9 +1067,6 @@ def validated_credentials(
     *,
     openai_api_key: str = "",
     openai_model: str = "",
-    copilot_api_key: str = "",
-    copilot_anthropic_model: str = "claude-sonnet-5",
-    copilot_openai_model: str = "gpt-5.4",
 ) -> Credentials:
     url = gitlab_url.strip().rstrip("/")
     parsed = urllib.parse.urlparse(url)
@@ -1139,17 +1111,11 @@ def validated_credentials(
     if len(llm_api_url) > 2048:
         raise ReviewError("Custom LLM API URL is too long.")
     openai_api_key = openai_api_key.strip()
-    copilot_api_key = copilot_api_key.strip()
     openai_model = openai_model.strip() or LLM_DEFAULT_MODELS["openai"]
-    copilot_anthropic_model = copilot_anthropic_model.strip() or "claude-sonnet-5"
-    copilot_openai_model = copilot_openai_model.strip() or "gpt-5.4"
-    for label, secret in (
-        ("OpenAI API key", openai_api_key),
-        ("GitHub Copilot token", copilot_api_key),
-    ):
+    for label, secret in (("OpenAI API key", openai_api_key),):
         if secret and not 8 <= len(secret) <= 4096:
             raise ReviewError(f"{label} has an invalid length.")
-    for model in (openai_model, copilot_anthropic_model, copilot_openai_model):
+    for model in (openai_model,):
         if len(model) > 256:
             raise ReviewError("LLM model name is too long.")
     return Credentials(
@@ -1162,9 +1128,6 @@ def validated_credentials(
         gitlab_group_path=normalize_gitlab_group_path(gitlab_group_path),
         openai_api_key=openai_api_key,
         openai_model=openai_model,
-        copilot_api_key=copilot_api_key,
-        copilot_anthropic_model=copilot_anthropic_model,
-        copilot_openai_model=copilot_openai_model,
     )
 
 
@@ -1992,7 +1955,7 @@ STYLE = """
 .severity-safe{background:var(--green-soft);color:var(--green)}.severity-filter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}.severity-filter .button{padding:8px 12px}.expandable-row{cursor:pointer}.expandable-row:focus{outline:3px solid #bed4ff;outline-offset:-3px}.row-toggle,.manual-review-button{padding:7px 10px;font-size:13px;white-space:nowrap}.review-state{font-weight:800}.review-state-open{color:var(--blue-dark)}.review-state-in_progress{color:var(--amber)}.review-state-done{color:var(--green)}.expanded-review td{padding:0 11px 18px;background:#f8fafc}.review-details{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px}.review-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}.review-section{border:1px solid var(--line);border-radius:10px;padding:16px}.review-section+.review-section{margin-top:16px}.review-section h3{font-size:14px;margin:0 0 8px}.review-copy{white-space:pre-wrap;margin:0;color:var(--ink)}.diff-view{max-height:520px;overflow:auto;margin:8px 0 0;padding:8px 0;background:#fff;color:#344054;border:1px solid #d0d5dd;border-radius:10px;font-size:12px;line-height:1.55;white-space:pre}.diff-view code{display:block;min-width:max-content}.diff-line{display:block;padding:0 14px;min-height:1.55em}.diff-context{color:#344054}.diff-add{color:#067647;background:#ecfdf3}.diff-delete{color:#b42318;background:#fff1f0}.diff-hunk{color:#175cd3;background:#eff8ff}.diff-meta{color:#6941c6;background:#f9f5ff;font-weight:650}.historical-note{color:var(--muted);font-style:italic}.review-meta{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-top:14px}.inline-commit-summary{margin:0 0 12px;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:#f8fafc;color:var(--muted)}.commit-summary-list{display:grid;gap:8px}.commit-summary-item{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}.commit-message{font-weight:750;color:var(--ink);white-space:pre-wrap}.commit-author{font-size:13px;color:var(--muted)}.manual-review-dialog{width:min(620px,calc(100vw - 32px));border:0;border-radius:16px;padding:24px;box-shadow:0 24px 80px rgba(17,24,39,.28)}.manual-review-dialog::backdrop{background:rgba(15,23,42,.55)}.dialog-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:20px}.dialog-heading h2{margin:0}.manual-review-dialog fieldset{display:flex;gap:18px;border:1px solid var(--line);border-radius:10px;margin:18px 0;padding:14px}.manual-review-dialog legend{font-weight:750;padding:0 6px}.manual-review-dialog textarea{width:100%;padding:11px 12px;border:1px solid #aebdce;border-radius:9px;font:inherit;resize:vertical}.manual-decision{margin-top:12px;padding:12px;border-radius:9px;background:#f8fafc;border:1px solid var(--line)}
 .grid+.table-wrap{margin-top:22px}
 .table-controls{display:flex;justify-content:flex-end;margin:22px 0 10px}
-.model-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 18px;border-bottom:1px solid var(--line)}.model-tab{display:inline-flex;padding:10px 14px;color:var(--muted);font-weight:750;text-decoration:none;border-bottom:3px solid transparent;margin-bottom:-1px}.model-tab:hover{color:var(--blue)}.model-tab[aria-selected=true]{color:var(--blue-dark);border-bottom-color:var(--blue)}.comparison-summary{display:grid;grid-template-columns:minmax(180px,1.5fr) repeat(5,minmax(110px,1fr));gap:10px;margin:0 0 18px}.comparison-model,.comparison-stat{padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#f8fafc;min-width:0}.comparison-model span,.comparison-stat span{display:block;color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.04em}.comparison-model strong,.comparison-stat strong{display:block;margin-top:5px;overflow-wrap:anywhere}.comparison-stat strong{font-size:16px}
+.model-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 18px;border-bottom:1px solid var(--line)}.model-tab{display:inline-flex;padding:10px 14px;color:var(--muted);font-weight:750;text-decoration:none;border-bottom:3px solid transparent;margin-bottom:-1px}.model-tab:hover{color:var(--blue)}.model-tab[aria-selected=true]{color:var(--blue-dark);border-bottom-color:var(--blue)}.model-pause-list{display:grid;gap:10px}.model-pause-control{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:#f8fafc}.model-pause-control strong,.model-pause-control .sub{display:block}.model-pause-control form{margin:0}.comparison-summary{display:grid;grid-template-columns:minmax(180px,1.5fr) repeat(5,minmax(110px,1fr));gap:10px;margin:0 0 18px}.comparison-model,.comparison-stat{padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#f8fafc;min-width:0}.comparison-model span,.comparison-stat span{display:block;color:var(--muted);font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.04em}.comparison-model strong,.comparison-stat strong{display:block;margin-top:5px;overflow-wrap:anywhere}.comparison-stat strong{font-size:16px}
 @media(max-width:900px){.app-shell{grid-template-columns:1fr}.sidebar{position:relative;height:auto;padding:14px 18px}.brand{padding:0 4px 14px}.side-nav{display:flex;overflow:auto;padding:12px 0 0}.side-nav a{white-space:nowrap}.sidebar-footer{display:flex;align-items:center;gap:14px;margin:12px 0 0;padding:12px 4px 0}.service-state{margin:0;margin-right:auto}.user-row{margin:0}.signout{width:auto}.app-main{padding:26px 20px 56px}.page-header{margin-bottom:22px}}
 @media(max-width:1100px){.comparison-summary{grid-template-columns:repeat(3,minmax(140px,1fr))}}@media(max-width:680px){.grid,.form-grid,.review-detail-grid,.comparison-summary{grid-template-columns:1fr}.inline-control{align-items:stretch;flex-direction:column}.filter-bar,.pagination,.page-header,.section-heading{align-items:stretch;flex-direction:column}.date-filter{grid-template-columns:1fr}.page-header h1{font-size:28px}.app-main{padding:22px 14px 48px}.card{padding:18px}.sidebar-footer{align-items:stretch;flex-wrap:wrap}.service-state{width:100%}.table-wrap{overflow:auto}}
 """
@@ -2286,6 +2249,8 @@ def handler_factory(
                     self.fetch_llm_models(form)
                 elif parsed.path == "/settings":
                     self.update_settings(form)
+                elif parsed.path == "/model-pause":
+                    self.update_model_pause(form)
                 elif parsed.path == "/reset-review-data":
                     self.reset_review_data(form)
                 elif parsed.path == "/manual-review":
@@ -2421,11 +2386,16 @@ def handler_factory(
             store.save_encrypted_credentials(credentials, salt, encryption_key)
             vault.set(credentials)
             if credentials.comparison_ready():
-                message = "Credentials saved; four-model comparison reviews are active."
-            elif credentials.review_ready():
+                message = "Credentials saved; Anthropic and OpenAI comparison reviews are active."
+            elif credentials.llm_api_key.strip():
                 message = (
                     "Credentials saved; Anthropic-only reviews are active. "
-                    "Add OpenAI and Copilot credentials later to enable comparison reviews."
+                    "Add an OpenAI credential later to enable comparison reviews."
+                )
+            elif credentials.openai_api_key.strip():
+                message = (
+                    "Credentials saved; OpenAI-only reviews are active. "
+                    "Add an Anthropic credential later to enable comparison reviews."
                 )
             else:
                 message = "Credentials saved; MR discovery is active. Add an Anthropic API key to start reviews."
@@ -2538,7 +2508,7 @@ def handler_factory(
             credentials, _ = vault.snapshot()
             if credentials is None or not credentials.review_ready():
                 raise ReviewError(
-                    "Save and unlock an Anthropic API key before starting an AI review."
+                    "Save and unlock at least one Anthropic or OpenAI API key before starting an AI review."
                 )
             try:
                 project_id = int(form.get("project_id", ""))
@@ -2588,18 +2558,6 @@ def handler_factory(
                 openai_model=(
                     form.get("openai_model", "").strip() or existing.openai_model
                 ),
-                copilot_api_key=(
-                    form.get("copilot_api_key", "").strip()
-                    or existing.copilot_api_key
-                ),
-                copilot_anthropic_model=(
-                    form.get("copilot_anthropic_model", "").strip()
-                    or existing.copilot_anthropic_model
-                ),
-                copilot_openai_model=(
-                    form.get("copilot_openai_model", "").strip()
-                    or existing.copilot_openai_model
-                ),
             )
 
         def test_gitlab_credentials(self, form: dict[str, str]) -> None:
@@ -2633,16 +2591,16 @@ def handler_factory(
             existing, _, _ = self.credential_context()
             credentials = self.merged_credentials(form, existing)
             if not credentials.review_ready():
-                raise ReviewError("Save an Anthropic API key before testing the review model.")
-            if credentials.comparison_ready():
-                configs = (
-                    ("Anthropic", "anthropic", credentials.llm_api_key, credentials.llm_model),
-                    ("OpenAI", "openai", credentials.openai_api_key, credentials.openai_model),
-                    ("Copilot · Anthropic", "copilot", credentials.copilot_api_key, credentials.copilot_anthropic_model),
-                    ("Copilot · OpenAI", "copilot", credentials.copilot_api_key, credentials.copilot_openai_model),
+                raise ReviewError("Save an Anthropic or OpenAI API key before testing the review model.")
+            configs = []
+            if credentials.llm_api_key.strip():
+                configs.append(
+                    ("Anthropic", "anthropic", credentials.llm_api_key, credentials.llm_model)
                 )
-            else:
-                configs = (("Anthropic", "anthropic", credentials.llm_api_key, credentials.llm_model),)
+            if credentials.openai_api_key.strip():
+                configs.append(
+                    ("OpenAI", "openai", credentials.openai_api_key, credentials.openai_model)
+                )
             for profile, provider, key, model in configs:
                 config = Config.from_credentials(
                     credentials.gitlab_url,
@@ -2655,11 +2613,7 @@ def handler_factory(
                     review_profile=profile,
                 )
                 test_llm_connection(config)
-            message = (
-                "All four model connection tests succeeded."
-                if credentials.comparison_ready()
-                else "Anthropic model connection test succeeded."
-            )
+            message = "Configured model connection test(s) succeeded."
             self.redirect("/settings?message=" + urllib.parse.quote(message))
 
         def fetch_llm_models(self, form: dict[str, str]) -> None:
@@ -2677,14 +2631,12 @@ def handler_factory(
                 key_field = {
                     "anthropic": "anthropic_api_key",
                     "openai": "openai_api_key",
-                    "copilot": "copilot_api_key",
                 }.get(provider)
                 if key_field is None:
                     raise ReviewError("Select a supported model provider.")
                 stored_key = {
                     "anthropic": existing.llm_api_key,
                     "openai": existing.openai_api_key,
-                    "copilot": existing.copilot_api_key,
                 }[provider]
                 api_key = form.get(key_field, "").strip() or stored_key
                 models = list_llm_models(provider, api_key)
@@ -2695,22 +2647,38 @@ def handler_factory(
 
         def reviewer_status(self) -> tuple[str, str]:
             active_credentials, _ = vault.snapshot()
+            saved_settings = store.settings()
             heartbeat = Path(os.environ.get("HEARTBEAT_FILE", "/data/heartbeat"))
             try:
                 running = heartbeat.is_file() and time.time() - heartbeat.stat().st_mtime < 180
             except OSError:
                 running = False
             if running and active_credentials is not None:
-                return (
-                    "Reviews active"
-                    if active_credentials.comparison_ready()
-                    else (
-                        "Anthropic review active"
-                        if active_credentials.review_ready()
-                        else "GitLab discovery active"
-                    ),
-                    "completed",
-                )
+                active_models = [
+                    COMPARISON_PROFILE_LABELS[profile]
+                    for profile, key in (
+                        ("anthropic", active_credentials.llm_api_key),
+                        ("openai", active_credentials.openai_api_key),
+                    )
+                    if key.strip() and not model_is_paused(saved_settings, profile)
+                ]
+                paused_models = [
+                    COMPARISON_PROFILE_LABELS[profile]
+                    for profile, key in (
+                        ("anthropic", active_credentials.llm_api_key),
+                        ("openai", active_credentials.openai_api_key),
+                    )
+                    if key.strip() and model_is_paused(saved_settings, profile)
+                ]
+                if active_models:
+                    status = f"{', '.join(active_models)} scanning"
+                    if paused_models:
+                        status += f" · paused: {', '.join(paused_models)}"
+                elif paused_models:
+                    status = f"Scanning paused for {', '.join(paused_models)}"
+                else:
+                    status = "GitLab discovery active"
+                return status, "completed"
             if running:
                 return "Reviewer locked", "failed"
             return "Waiting for reviewer heartbeat", "failed"
@@ -2823,13 +2791,42 @@ def handler_factory(
             active_profile: str,
             query: Mapping[str, Any],
         ) -> str:
+            saved_settings = store.settings()
             tabs = "".join(
                 f"<a class='model-tab' role='tab' aria-selected='{'true' if profile == active_profile else 'false'}' "
                 f"href='{html.escape(action + '?' + urllib.parse.urlencode({**dict(query), 'profile': profile, 'page': 1}))}'>"
-                f"{html.escape(COMPARISON_PROFILE_LABELS[profile])}</a>"
+                f"{html.escape(COMPARISON_PROFILE_LABELS[profile] + (' · Paused' if model_is_paused(saved_settings, profile) else ''))}</a>"
                 for profile in COMPARISON_PROFILES
             )
             return f"<nav class='model-tabs' role='tablist' aria-label='Review model'>{tabs}</nav>"
+
+        def model_pause_controls(
+            self, csrf_token: str, settings: Mapping[str, str], return_to: str
+        ) -> str:
+            controls = []
+            for profile in COMPARISON_PROFILES:
+                paused = model_is_paused(settings, profile)
+                label = COMPARISON_PROFILE_LABELS[profile]
+                status = "Paused" if paused else "Scanning enabled"
+                action = "Resume scanning" if paused else "Pause scanning"
+                next_state = "false" if paused else "true"
+                controls.append(
+                    f"<div class='model-pause-control'><div><strong>{html.escape(label)}</strong>"
+                    f"<span class='sub'>{html.escape(status)}</span></div>"
+                    f"<form method='post' action='/model-pause'><input type='hidden' name='csrf' value='{html.escape(csrf_token)}'>"
+                    f"<input type='hidden' name='provider' value='{html.escape(profile)}'>"
+                    f"<input type='hidden' name='paused' value='{next_state}'>"
+                    f"<input type='hidden' name='return_to' value='{html.escape(return_to)}'>"
+                    f"<button class='{'secondary' if paused else 'danger'}' type='submit'>{html.escape(action)}</button></form></div>"
+                )
+            return (
+                "<section class='card'><div class='section-heading'><div>"
+                "<h2>Model scanning controls</h2>"
+                "<p class='sub'>Pause or resume automated review independently for each direct model. GitLab discovery continues while a model is paused; a review already running is allowed to finish.</p>"
+                "</div></div><div class='model-pause-list'>"
+                + "".join(controls)
+                + "</div></section>"
+            )
 
         def usage_tiles(
             self, reports: Iterable[Mapping[str, Any]], profile: str
@@ -2902,7 +2899,7 @@ def handler_factory(
                 )
             if not active_credentials.comparison_ready():
                 return ""
-            return "<p class='notice'>GitLab discovery and four-model comparison reviews are active.</p>"
+            return "<p class='notice'>GitLab discovery and Anthropic/OpenAI comparison reviews are active.</p>"
 
         def gitlab_connection_status(self) -> tuple[str, str]:
             scan_status = store.scan_status()
@@ -3488,6 +3485,7 @@ def handler_factory(
             notice = (
                 f"<p class='notice'>{html.escape(message)}</p>" if message else ""
             )
+            pause_panel = ""
             active_credentials, _ = vault.snapshot()
             credentials_configured = store.credentials_configured()
             if credentials_configured and active_credentials is None:
@@ -3520,18 +3518,12 @@ def handler_factory(
                     if displayed_credentials.openai_api_key
                     else "Enter OpenAI API key"
                 )
-                copilot_key_placeholder = (
-                    "•••••••••••• (stored)"
-                    if displayed_credentials.copilot_api_key
-                    else "Enter GitHub Copilot token"
-                )
                 anthropic_model = displayed_credentials.llm_model or LLM_DEFAULT_MODELS["anthropic"]
                 openai_model = displayed_credentials.openai_model or LLM_DEFAULT_MODELS["openai"]
-                copilot_anthropic_model = displayed_credentials.copilot_anthropic_model or "claude-sonnet-5"
-                copilot_openai_model = displayed_credentials.copilot_openai_model or "gpt-5.4"
+                saved_settings = store.settings()
                 credential_panel = f"""
                 <section class='card'><h2>Configure or rotate encrypted credentials</h2>
-                <p class='sub'>GitLab discovery can run independently. Anthropic-only reviews start as soon as the Anthropic key is stored; adding OpenAI and Copilot credentials enables four-model comparisons. Blank secret fields retain their encrypted values.</p>
+                <p class='sub'>GitLab discovery can run independently. Anthropic and OpenAI reviews run independently when their keys are stored. Blank secret fields retain their encrypted values.</p>
                 <form id='credential_form' method='post' action='/credentials'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>
                 <div class='field'><label for='rotate_gitlab_url'>GitLab URL</label><input id='rotate_gitlab_url' name='gitlab_url' type='url' value='{html.escape(gitlab_url)}' required></div>
                 <div class='field'><label for='gitlab_group_path'>GitLab group path (optional)</label><input id='gitlab_group_path' name='gitlab_group_path' value='{html.escape(gitlab_group_path)}' placeholder='maas' maxlength='512'><small>Enter a namespace path such as maas or company/platform, not a URL. Subgroups are included automatically. Leave blank for user-wide discovery.</small></div>
@@ -3540,17 +3532,17 @@ def handler_factory(
                 <div class='field'><label for='anthropic_model'>Direct Anthropic model</label><div class='inline-control'><input id='anthropic_model' name='anthropic_model' value='{html.escape(anthropic_model)}' maxlength='256'><button class='secondary fetch-models' type='button' data-provider='anthropic' data-key-field='anthropic_api_key' data-model-field='anthropic_model' data-picker='anthropic_models' data-status='anthropic_model_status'>Fetch models</button></div><select class='model-picker' id='anthropic_models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='anthropic_model_status'>Billed directly by Anthropic.</small></div>
                 <div class='field'><label for='openai_api_key'>OpenAI API key</label><input id='openai_api_key' name='openai_api_key' type='password' autocomplete='off' placeholder='{html.escape(openai_key_placeholder)}'><small>Used for the direct OpenAI comparison.</small></div>
                 <div class='field'><label for='openai_model'>Direct OpenAI model</label><div class='inline-control'><input id='openai_model' name='openai_model' value='{html.escape(openai_model)}' maxlength='256'><button class='secondary fetch-models' type='button' data-provider='openai' data-key-field='openai_api_key' data-model-field='openai_model' data-picker='openai_models' data-status='openai_model_status'>Fetch models</button></div><select class='model-picker' id='openai_models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='openai_model_status'>Billed directly by OpenAI.</small></div>
-                <div class='field'><label for='copilot_api_key'>GitHub Copilot token</label><input id='copilot_api_key' name='copilot_api_key' type='password' autocomplete='off' placeholder='{html.escape(copilot_key_placeholder)}'><small>One GitHub token is used for both Copilot-hosted comparisons and must have Copilot access.</small></div>
-                <div class='field'><label for='copilot_anthropic_model'>Copilot Anthropic model</label><div class='inline-control'><input id='copilot_anthropic_model' name='copilot_anthropic_model' value='{html.escape(copilot_anthropic_model)}' maxlength='256'><button class='secondary fetch-models' type='button' data-provider='copilot' data-key-field='copilot_api_key' data-model-field='copilot_anthropic_model' data-picker='copilot_anthropic_models' data-status='copilot_anthropic_status'>Fetch models</button></div><select class='model-picker' id='copilot_anthropic_models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='copilot_anthropic_status'>Select an Anthropic model enabled in Copilot policy.</small></div>
-                <div class='field'><label for='copilot_openai_model'>Copilot OpenAI model</label><div class='inline-control'><input id='copilot_openai_model' name='copilot_openai_model' value='{html.escape(copilot_openai_model)}' maxlength='256'><button class='secondary fetch-models' type='button' data-provider='copilot' data-key-field='copilot_api_key' data-model-field='copilot_openai_model' data-picker='copilot_openai_models' data-status='copilot_openai_status'>Fetch models</button></div><select class='model-picker' id='copilot_openai_models' hidden><option value=''>Select a fetched model...</option></select><small class='model-status' id='copilot_openai_status'>Select an OpenAI model enabled in Copilot policy.</small></div>
                 </div><div class='actions'><button type='submit'>Save encrypted credentials</button>
                 <button class='secondary' type='submit' formaction='/credentials/test-gitlab'>Test GitLab access</button>
                 <button class='secondary' type='submit' formaction='/credentials/test-llm'>Test configured model connection(s)</button></div>
                 <p class='sub'>Tests do not save entered values. The model test sends one minimal request to each configured model and may incur API usage charges.</p></form></section>"""
+                pause_panel = self.model_pause_controls(
+                    str(user["csrf_token"]), saved_settings, "/settings"
+                )
             body = f"""
             {notice}<section class='card'><h2>Runtime settings</h2><p class='sub'>Saved in SQLite and applied automatically at the next polling cycle.</p>
             <form method='post' action='/settings'><input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'><div class='form-grid'>{fields}</div><div class='actions'><button type='submit'>Save settings</button></div></form></section>
-            {credential_panel}
+            {credential_panel}{pause_panel}
             <section class='card danger-zone'><h2>Reset repository and MR data</h2>
             <p>Clear the repository inventory, MR revisions, reports, and findings from SQLite and start a new deployment period. Administrator accounts, encrypted credentials, runtime settings, and the current login are preserved.</p>
             <p class='error'><strong>This cannot be undone.</strong> Open MRs created before the reset time will not be imported again.</p>
@@ -3581,6 +3573,39 @@ def handler_factory(
             store.save_settings(normalized)
             message = "Settings saved. They will apply on the next polling cycle."
             self.redirect("/settings?message=" + urllib.parse.quote(message))
+
+        def update_model_pause(self, form: dict[str, str]) -> None:
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
+                raise ReviewError("Invalid form token.")
+            provider = form.get("provider", "").strip().lower()
+            setting_key = MODEL_PAUSE_SETTINGS.get(provider)
+            if setting_key is None:
+                raise ReviewError("Select Anthropic or OpenAI for the pause control.")
+            paused_value = form.get("paused", "").strip().lower()
+            if paused_value not in {"true", "false"}:
+                raise ReviewError("The model pause state is invalid.")
+            store.save_settings({setting_key: paused_value})
+            vault.notify_change()
+            action = "paused" if paused_value == "true" else "resumed"
+            return_to = form.get("return_to", "/settings").strip()
+            parsed_return_to = urllib.parse.urlparse(return_to)
+            if (
+                parsed_return_to.scheme
+                or parsed_return_to.netloc
+                or parsed_return_to.path not in {"/", "/settings"}
+            ):
+                return_to = "/settings"
+            self.redirect(
+                return_to
+                + ("&" if "?" in return_to else "?")
+                + urllib.parse.urlencode(
+                    {"message": f"{COMPARISON_PROFILE_LABELS[provider]} scanning {action}."}
+                )
+            )
 
         def reset_review_data(self, form: dict[str, str]) -> None:
             session = self.require_session()

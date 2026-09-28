@@ -24,7 +24,6 @@ ENV PATH="/opt/venv/bin:/home/reviewer/.local/bin:${PATH}" \
 USER reviewer
 WORKDIR /opt/claude-installer
 RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_CHANNEL}"
-RUN python3 -m copilot download-runtime
 
 WORKDIR /app
 COPY --chown=reviewer:reviewer . /app
