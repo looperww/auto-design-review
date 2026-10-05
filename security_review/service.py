@@ -533,6 +533,7 @@ class ContextBundle:
     files: tuple[str, ...]
     notes: tuple[str, ...]
     bytes_used: int
+    coverage: Mapping[str, Any] | None = None
 
 
 def required_env(name: str) -> str:
@@ -1611,6 +1612,7 @@ def build_context_bundle(
                 members[normalized] = member
 
         selected: list[tuple[str, str]] = []
+        selected_context: list[dict[str, Any]] = []
         changed_texts: list[str] = []
         used_bytes = 0
 
@@ -1636,6 +1638,9 @@ def build_context_bundle(
                 notes.append("Changed-file context exceeded the total context limit.")
                 break
             selected.append((path, text))
+            selected_context.append(
+                {"path": path, "role": "changed", "dependency_depth": 0}
+            )
             changed_texts.append(text)
             used_bytes += encoded_size
 
@@ -1648,6 +1653,7 @@ def build_context_bundle(
         changed_suffixes = {PurePosixPath(path).suffix.lower() for path in changed_paths}
         candidates: list[tuple[str, str, int]] = []
         scanned_bytes = 0
+        scanned_files = 0
 
         for path, member in members.items():
             if path in changed_paths or not is_context_candidate(path):
@@ -1659,6 +1665,7 @@ def build_context_bundle(
                 break
             text = read_member(path, member)
             scanned_bytes += member.size
+            scanned_files += 1
             if text is None:
                 continue
             file_identifiers = set(IDENTIFIER_PATTERN.findall(text))
@@ -1729,6 +1736,9 @@ def build_context_bundle(
                 if used_bytes + encoded_size > config.max_context_bytes:
                     continue
                 selected.append((path, text))
+                selected_context.append(
+                    {"path": path, "role": "related", "dependency_depth": depth + 1}
+                )
                 selected_paths.add(path)
                 used_bytes += encoded_size
                 dependency_sources.append((path, dependency_references(text)))
@@ -1745,11 +1755,39 @@ def build_context_bundle(
     rendered = "\n\n".join(
         f"## Snapshot file: {path}\n\n```text\n{text}\n```" for path, text in selected
     )
+    related_context = [
+        item for item in selected_context if item["role"] == "related"
+    ]
+    coverage = {
+        "changed_files_total": len(changed_paths),
+        "changed_files_included": sum(
+            1 for item in selected_context if item["role"] == "changed"
+        ),
+        "related_files_selected": len(related_context),
+        "dependency_depth_limit": config.context_dependency_depth,
+        "dependency_depth_reached": max(
+            (int(item["dependency_depth"]) for item in related_context),
+            default=0,
+        ),
+        "selected_files": selected_context,
+        "scanned_files": scanned_files,
+        "scanned_bytes": scanned_bytes,
+        "candidate_files": len(candidates),
+        "bytes_used": used_bytes,
+        "limits": {
+            "max_context_files": config.max_context_files,
+            "max_context_file_bytes": config.max_context_file_bytes,
+            "max_context_bytes": config.max_context_bytes,
+            "max_context_scan_bytes": config.max_context_scan_bytes,
+        },
+        "notes": list(dict.fromkeys(notes)),
+    }
     return ContextBundle(
         rendered=rendered,
         files=tuple(path for path, _ in selected),
         notes=tuple(dict.fromkeys(notes)),
         bytes_used=used_bytes,
+        coverage=coverage,
     )
 
 
@@ -2390,6 +2428,7 @@ def review_target(
                 "context_files": list(context.files),
                 "context_bytes": context.bytes_used,
                 "context_notes": list(context.notes),
+                "context_coverage": context.coverage or {},
                 "prompt_bytes": len(prompt_input.encode("utf-8")),
             }
             with concurrent.futures.ThreadPoolExecutor(
@@ -2435,6 +2474,7 @@ def review_target(
                 "context_files": list(context.files),
                 "context_bytes": context.bytes_used,
                 "context_notes": list(context.notes),
+                "context_coverage": context.coverage or {},
                 "prompt_bytes": len(prompt_input.encode("utf-8")),
                 "llm_provider": config.llm_provider,
                 "llm_model": config.llm_model,

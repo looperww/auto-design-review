@@ -331,6 +331,65 @@ def render_diff_html(diff_content: str) -> str:
     return "<pre class='diff-view'><code>" + "".join(rendered_lines) + "</code></pre>"
 
 
+def render_context_coverage(coverage: Mapping[str, Any] | None) -> str:
+    """Render an auditable, credential-free summary of the supplied review context."""
+    data = coverage if isinstance(coverage, Mapping) else {}
+    selected = data.get("selected_files", [])
+    selected_files = [item for item in selected if isinstance(item, Mapping)]
+    changed_total = int(data.get("changed_files_total", 0) or 0)
+    changed_included = int(data.get("changed_files_included", 0) or 0)
+    related_selected = int(data.get("related_files_selected", 0) or 0)
+    depth_reached = int(data.get("dependency_depth_reached", 0) or 0)
+    depth_limit = int(data.get("dependency_depth_limit", 0) or 0)
+    bytes_used = int(data.get("bytes_used", 0) or 0)
+    limits = data.get("limits", {})
+    limits = limits if isinstance(limits, Mapping) else {}
+    max_context_bytes = int(limits.get("max_context_bytes", 0) or 0)
+    scanned_files = int(data.get("scanned_files", 0) or 0)
+    scanned_bytes = int(data.get("scanned_bytes", 0) or 0)
+    notes = [str(note) for note in data.get("notes", []) if str(note).strip()]
+    file_rows = []
+    for item in selected_files:
+        path = str(item.get("path", ""))
+        role = str(item.get("role", "related"))
+        depth = int(item.get("dependency_depth", 0) or 0)
+        label = "Changed file" if role == "changed" else f"Related file · dependency depth {depth}"
+        file_rows.append(
+            f"<li><code>{html.escape(path)}</code><span class='sub'>{html.escape(label)}</span></li>"
+        )
+    files_html = (
+        "<details class='coverage-files'><summary>Show supplied files ("
+        f"{len(file_rows)})</summary><ul>{''.join(file_rows)}</ul></details>"
+        if file_rows
+        else "<p class='sub'>No repository context files were supplied.</p>"
+    )
+    notes_html = (
+        "<details class='coverage-notes'><summary>Coverage limitations</summary><ul>"
+        + "".join(f"<li>{html.escape(note)}</li>" for note in notes)
+        + "</ul></details>"
+        if notes
+        else "<p class='sub'>No context omissions were recorded.</p>"
+    )
+    bytes_label = (
+        f"{bytes_used:,} / {max_context_bytes:,} bytes"
+        if max_context_bytes
+        else f"{bytes_used:,} bytes"
+    )
+    return (
+        "<section class='review-section context-coverage'><h3>Review coverage</h3>"
+        "<div class='review-detail-grid'>"
+        f"<p class='review-copy'><strong>Changed files supplied:</strong> {changed_included}/{changed_total}</p>"
+        f"<p class='review-copy'><strong>Related files supplied:</strong> {related_selected}</p>"
+        f"<p class='review-copy'><strong>Dependency depth:</strong> {depth_reached} reached (limit {depth_limit})</p>"
+        f"<p class='review-copy'><strong>Context size:</strong> {html.escape(bytes_label)}</p>"
+        f"<p class='review-copy'><strong>Repository scan:</strong> {scanned_files:,} files / {scanned_bytes:,} bytes</p>"
+        "</div>"
+        + files_html
+        + notes_html
+        + "</section>"
+    )
+
+
 def normalize_gitlab_commits(
     commits: Iterable[Mapping[str, Any]], gitlab_url: str
 ) -> list[dict[str, str]]:
@@ -468,6 +527,15 @@ def completed_review_entries(
     for review in reviews:
         review_profile = str(review.get("review_profile", ""))
         report = str(review["report_content"] or "")
+        try:
+            review_metadata = json.loads(str(review.get("metadata_json", "{}") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            review_metadata = {}
+        if not isinstance(review_metadata, Mapping):
+            review_metadata = {}
+        context_coverage = review_metadata.get("context_coverage", {})
+        if not isinstance(context_coverage, Mapping):
+            context_coverage = {}
         summary = report_section(report, "Summary") or "Security review completed."
         overall_rationale = report_section(report, "Overall severity rationale")
         findings = parse_security_findings(report)
@@ -491,6 +559,7 @@ def completed_review_entries(
             "reviewed_at": str(review["reviewed_at"]),
             "review_profile": review_profile,
             "llm_model": str(review.get("llm_model", "")),
+            "context_coverage": dict(context_coverage),
         }
         mr_item_key = (
             hashlib.sha256(
@@ -3516,7 +3585,7 @@ def handler_factory(
                     "<div class='review-detail-grid'>"
                     f"<section class='review-section'><h3>Review summary</h3><p class='review-copy'>{html.escape(str(entry['summary']))}</p></section>"
                     f"<section class='review-section'><h3>Severity explanation</h3><p class='review-copy'>{html.escape(str(entry['severity_explanation']))}</p></section>"
-                    f"</div><section class='review-section'><h3>{evidence_heading}</h3><p class='review-copy'>{html.escape(str(entry['finding_details']))}</p></section>{decision_details}"
+                    f"</div>{render_context_coverage(entry.get('context_coverage'))}<section class='review-section'><h3>{evidence_heading}</h3><p class='review-copy'>{html.escape(str(entry['finding_details']))}</p></section>{decision_details}"
                     f"<section class='review-section'><h3>Reviewed code diff</h3>{commit_summary}{diff_display}</section>"
                     f"<div class='review-meta'><span class='sub'>Reviewed {html.escape(reviewed_at)} · Commit {commit_display}</span>"
                     f"<a class='button secondary' href='/report?{report_query}'>Open full report</a></div>"

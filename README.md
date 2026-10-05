@@ -528,6 +528,13 @@ that coverage limitation rather than claim the path is safe. Production
 assurance should combine it with the company's SAST and dependency-scanning
 controls.
 
+Each completed MR stores a credential-free coverage record in the review
+metadata. Expand a result on **Completed MRs** to see the changed-file coverage,
+selected related files, dependency depth reached, context bytes, repository scan
+size, and any omission or truncation notes. This makes it possible to distinguish
+“no finding in the supplied context” from “the relevant path was not available
+within the configured limits.”
+
 ## Security-review skill
 
 The centralized reviewer uses

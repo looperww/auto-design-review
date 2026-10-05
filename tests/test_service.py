@@ -68,6 +68,7 @@ from security_review.web import (  # noqa: E402
     password_record,
     profile_usage_summary,
     report_section,
+    render_context_coverage,
     render_diff_html,
     handler_factory,
     validated_credentials,
@@ -635,6 +636,33 @@ class ContextTests(unittest.TestCase):
             ("src/controller.py", "src/service.py", "src/repository.py"),
         )
         self.assertTrue(any("Dependency-aware context expansion" in note for note in bundle.notes))
+        self.assertEqual(bundle.coverage["dependency_depth_reached"], 2)
+        self.assertEqual(bundle.coverage["changed_files_included"], 1)
+        self.assertEqual(bundle.coverage["related_files_selected"], 2)
+
+    def test_context_coverage_rendering_exposes_files_and_limits(self):
+        rendered = render_context_coverage(
+            {
+                "changed_files_total": 2,
+                "changed_files_included": 2,
+                "related_files_selected": 1,
+                "dependency_depth_reached": 1,
+                "dependency_depth_limit": 2,
+                "bytes_used": 1234,
+                "scanned_files": 12,
+                "scanned_bytes": 5678,
+                "selected_files": [
+                    {"path": "src/app.py", "role": "changed", "dependency_depth": 0},
+                    {"path": "src/service.py", "role": "related", "dependency_depth": 1},
+                ],
+                "limits": {"max_context_bytes": 10000},
+                "notes": ["A file was omitted due to the context limit."],
+            }
+        )
+        self.assertIn("2/2", rendered)
+        self.assertIn("dependency depth 1", rendered)
+        self.assertIn("src/service.py", rendered)
+        self.assertIn("A file was omitted", rendered)
 
 
 class DifferentialReviewTests(unittest.TestCase):
@@ -710,6 +738,8 @@ class DifferentialReviewTests(unittest.TestCase):
             )
             self.assertEqual(metadata["commit_context_count"], 1)
             self.assertEqual(metadata["commit_context_error"], "")
+            self.assertIn("context_coverage", metadata)
+            self.assertEqual(metadata["context_coverage"]["changed_files_included"], 1)
             state.close()
 
     def test_unavailable_commit_timeline_does_not_block_review(self):
