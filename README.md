@@ -203,6 +203,10 @@ both model credentials are saved, queued revisions are reviewed by both profiles
 Leaving a secret field blank during a later update
 preserves its stored value.
 
+Model profiles are tracked independently. If one model is paused while another
+model reviews an MR, resuming the paused model automatically backfills its
+missing result and preserves the result already produced by the first model.
+
 After a key is saved, its empty password field displays a masked
 `•••••••••••• (stored)` placeholder. This confirms that a value exists without
 returning the secret to the browser or submitting the placeholder as a new key.

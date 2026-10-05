@@ -823,6 +823,50 @@ class DifferentialReviewTests(unittest.TestCase):
             self.assertEqual(set(comparison), {"anthropic"})
             state.close()
 
+    def test_resumed_profile_is_needed_and_is_merged_without_rerunning_other_model(self):
+        target = ReviewTarget(1, "company/app", 9, "head-sha", "https://example/mr/9")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "SKILL.md").write_text("# Approved workflow\n", encoding="utf-8")
+            state = ReviewState(root / "state.sqlite3")
+            anthropic_result = {
+                "status": "completed",
+                "provider": "anthropic",
+                "model": "opus",
+                "report_content": "# Anthropic report\n",
+                "metadata": {"review_profile": "anthropic"},
+            }
+            openai_result = {
+                "status": "completed",
+                "provider": "openai",
+                "model": "gpt-6-sol",
+                "report_content": "# OpenAI report\n",
+                "metadata": {"review_profile": "openai"},
+            }
+            state.record_comparison(
+                target, {"anthropic": anthropic_result}, "+diff", "{}"
+            )
+            self.assertEqual(
+                state.missing_review_profiles(target, ["anthropic", "openai"]),
+                {"openai"},
+            )
+            self.assertTrue(state.needs_review(target, ["openai"]))
+            self.assertFalse(state.needs_review(target, ["anthropic"]))
+            state.record_comparison(target, {"openai": openai_result}, "+diff", "{}")
+            self.assertEqual(
+                state.missing_review_profiles(target, ["anthropic", "openai"]),
+                set(),
+            )
+            self.assertFalse(state.needs_review(target, ["anthropic", "openai"]))
+            stored = json.loads(
+                state.connection.execute(
+                    "SELECT comparison_json FROM reviews WHERE head_sha = ?",
+                    ("head-sha",),
+                ).fetchone()[0]
+            )
+            self.assertEqual(set(stored), {"anthropic", "openai"})
+            state.close()
+
 
 class StateTests(unittest.TestCase):
     def test_review_revision_is_recorded_once(self):
@@ -957,6 +1001,9 @@ class CycleLimitTests(unittest.TestCase):
 
         def has(self, target):
             return False
+
+        def needs_review(self, target, review_profiles):
+            return True
 
         def requested_targets(self):
             return []

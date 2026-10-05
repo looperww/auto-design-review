@@ -925,6 +925,62 @@ class ReviewState:
             "not_eligible",
         }
 
+    def missing_review_profiles(
+        self, target: ReviewTarget, review_profiles: Iterable[str]
+    ) -> set[str]:
+        """Return the requested model profiles that still need this revision."""
+        profiles = {
+            str(profile).strip()
+            for profile in review_profiles
+            if str(profile).strip()
+        }
+        row = self.connection.execute(
+            """
+            SELECT status, comparison_json, metadata_json
+            FROM reviews
+            WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
+            """,
+            (target.project_id, target.mr_iid, target.head_sha),
+        ).fetchone()
+        if row is None:
+            return profiles
+        status = str(row[0] or "")
+        if status in {"pending", "in_progress", "not_eligible"}:
+            return profiles
+        if not profiles or status == "manual_review_required":
+            return set()
+        try:
+            comparison = json.loads(str(row[1] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            comparison = {}
+        if isinstance(comparison, dict) and comparison:
+            missing: set[str] = set()
+            for profile in profiles:
+                result = comparison.get(profile)
+                if not isinstance(result, dict):
+                    missing.add(profile)
+                elif str(result.get("status", "failed")) in {
+                    "failed",
+                    "in_progress",
+                }:
+                    missing.add(profile)
+            return missing
+        try:
+            metadata = json.loads(str(row[2] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        recorded_profile = ""
+        if isinstance(metadata, dict):
+            recorded_profile = str(
+                metadata.get("review_profile") or metadata.get("llm_provider") or ""
+            ).strip()
+        if recorded_profile:
+            return {profile for profile in profiles if profile != recorded_profile}
+        return profiles if status == "failed" else set()
+
+    def needs_review(self, target: ReviewTarget, review_profiles: Iterable[str]) -> bool:
+        return bool(self.missing_review_profiles(target, review_profiles))
+
     def queue(self, target: ReviewTarget) -> bool:
         discovered_at = utc_now()
         cursor = self.connection.execute(
@@ -1156,7 +1212,28 @@ class ReviewState:
         metadata_json: str,
     ) -> str:
         """Persist all model outcomes for one MR revision as one atomic result."""
-        statuses = {str(result.get("status", "failed")) for result in results.values()}
+        existing_results: dict[str, Any] = {}
+        existing_row = self.connection.execute(
+            """
+            SELECT comparison_json
+            FROM reviews
+            WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
+            """,
+            (target.project_id, target.mr_iid, target.head_sha),
+        ).fetchone()
+        if existing_row is not None:
+            try:
+                loaded = json.loads(str(existing_row[0] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                loaded = {}
+            if isinstance(loaded, dict):
+                existing_results = loaded
+        merged_results = {**existing_results, **dict(results)}
+        statuses = {
+            str(result.get("status", "failed"))
+            for result in merged_results.values()
+            if isinstance(result, dict)
+        }
         if "high_severity" in statuses:
             aggregate_status = "high_severity"
         elif statuses and statuses <= {"failed"}:
@@ -1165,9 +1242,9 @@ class ReviewState:
             aggregate_status = "completed"
         representative = next(
             (
-                str(results[profile].get("report_content", ""))
+                str(merged_results[profile].get("report_content", ""))
                 for profile in COMPARISON_PROFILES
-                if profile in results
+                if profile in merged_results
             ),
             "",
         )
@@ -1199,7 +1276,7 @@ class ReviewState:
                 representative,
                 diff_content,
                 metadata_json,
-                json.dumps(results, sort_keys=True),
+                json.dumps(merged_results, sort_keys=True),
                 reviewed_at,
                 target.created_at or reviewed_at,
                 reviewed_at,
@@ -2131,8 +2208,15 @@ def review_target(
     force: bool = False,
     comparison_configs: Iterable[Config] | None = None,
 ) -> str:
-    if state.has(target) and not force:
-        return "already_reviewed"
+    profiles = list(comparison_configs or [])
+    if not force:
+        if profiles:
+            if not state.needs_review(
+                target, [profile.review_profile for profile in profiles]
+            ):
+                return "already_reviewed"
+        elif state.has(target):
+            return "already_reviewed"
     metadata: dict[str, Any] = {"target": asdict(target), "started_at": utc_now()}
     try:
         mr = client.get_merge_request(target.project_path, target.mr_iid)
@@ -2175,7 +2259,6 @@ def review_target(
             context,
             commit_context,
         )
-        profiles = list(comparison_configs or [])
         if profiles:
             common_metadata = {
                 "target": asdict(target),
@@ -2364,8 +2447,13 @@ def scan_once(
             )
             return {"discovered": len(targets), "baseline": len(targets), "pending": 0}
 
+    active_profiles = (
+        [profile.review_profile for profile in active_comparison_configs]
+        if active_comparison_configs
+        else [config.review_profile]
+    )
     pending = state.prioritize_targets(
-        target for target in targets if not state.has(target)
+        target for target in targets if state.needs_review(target, active_profiles)
     )
     review_limit = (
         len(pending)
@@ -2382,23 +2470,31 @@ def scan_once(
     for _ in range(review_limit):
         remaining = state.prioritize_targets(remaining)
         target = remaining.pop(0)
-        active_profiles = (
-            [profile.review_profile for profile in active_comparison_configs]
-            if active_comparison_configs
+        target_comparison_configs = list(active_comparison_configs)
+        if active_comparison_configs:
+            missing_profiles = state.missing_review_profiles(target, active_profiles)
+            target_comparison_configs = [
+                profile
+                for profile in active_comparison_configs
+                if profile.review_profile in missing_profiles
+            ]
+        target_profiles = (
+            [profile.review_profile for profile in target_comparison_configs]
+            if target_comparison_configs
             else [config.review_profile]
         )
-        state.mark_in_progress(target, active_profiles)
+        state.mark_in_progress(target, target_profiles)
         print(
             f"Reviewing {target.project_path}!{target.mr_iid} at {target.head_sha[:12]}...",
             flush=True,
         )
-        if active_comparison_configs:
+        if target_comparison_configs:
             status = review_target(
                 client,
                 state,
                 config,
                 target,
-                comparison_configs=active_comparison_configs,
+                comparison_configs=target_comparison_configs,
             )
         else:
             status = review_target(client, state, config, target)
