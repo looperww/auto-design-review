@@ -509,6 +509,8 @@ exact source commit and selects:
 
 - full contents of changed text files;
 - related files sharing changed identifiers, functions, classes, and paths;
+- bounded dependency context: imports/includes from changed files, then imports
+  from the selected related files for the configured number of expansion passes;
 - security-relevant files involving authentication, authorization, routes, and
   permissions;
 - the complete MR diff and MR description; and
@@ -518,8 +520,13 @@ exact source commit and selects:
 Both profiles are instructed to trace attacker-controlled input through
 transformations and sanitizers to SQL, command, filesystem, template,
 deserialization, logging, redirect, and outbound-request sinks. This is bounded,
-heuristic contextual analysis rather than a formal proof. Production assurance
-should combine it with the company's SAST and dependency-scanning controls.
+heuristic contextual analysis rather than a formal proof: the dependency
+expansion recognizes common import/include forms, but it is not a compiler-grade
+call graph or complete interprocedural taint analysis. If the source, sink, or
+sanitization path is outside the selected bounded context, the report must state
+that coverage limitation rather than claim the path is safe. Production
+assurance should combine it with the company's SAST and dependency-scanning
+controls.
 
 ## Security-review skill
 
@@ -577,15 +584,25 @@ cost envelope:
 | Reviews per cycle | 5; `0` means all pending |
 | Changed files | 200 |
 | Diff size | 300 KB |
-| Repository archive | 100 MB |
-| Context files | 20 |
-| Individual context file | 100 KB |
-| Total selected context | 350 KB |
+| Repository archive | 250 MB |
+| Context files | 50 |
+| Individual context file | 250 KB |
+| Total selected context | 1.5 MB |
+| Context dependency depth | 2 bounded expansion passes |
+| Context scan budget | 100 MB |
 | MR commit context | 100 commits and 32 KB |
 | Anthropic budget per review | USD 5.00 |
 
 Oversized, collapsed, or incomplete changes produce a manual-review-required
 report instead of a false clean result.
+
+`CONTEXT_DEPENDENCY_DEPTH` is configurable in the web console from 0 to 4. A
+value of 0 keeps the related-file selection bounded to the changed files and
+their direct similarity/security signals. The default value of 2 adds two
+additional dependency-aware passes while still enforcing the file, per-file,
+total-byte, archive, and scan-byte limits. Existing deployments keep explicitly
+saved runtime values; update these context settings in **Settings** if the
+SQLite database already contains the older limits.
 
 ## Operations
 

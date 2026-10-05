@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import heapq
 import io
 import json
 import os
@@ -363,12 +362,13 @@ RUNTIME_SETTINGS = (
     ),
     RuntimeSetting("MAX_DIFF_FILES", "Maximum changed files", "Larger MRs require manual review.", "integer", "200", Decimal(1), Decimal(5000)),
     RuntimeSetting("MAX_DIFF_BYTES", "Maximum diff bytes", "Maximum complete MR diff sent for analysis.", "integer", "300000", Decimal(10000), Decimal(5000000)),
-    RuntimeSetting("MAX_ARCHIVE_BYTES", "Maximum repository archive bytes", "Maximum in-memory repository snapshot size.", "integer", "100000000", Decimal(1000000), Decimal(1000000000)),
-    RuntimeSetting("MAX_ARCHIVE_MEMBERS", "Maximum archive members", "Maximum number of files examined in a repository archive.", "integer", "50000", Decimal(100), Decimal(500000)),
-    RuntimeSetting("MAX_CONTEXT_FILES", "Maximum context files", "Changed and related files supplied identically to both direct comparison profiles.", "integer", "20", Decimal(1), Decimal(200)),
-    RuntimeSetting("MAX_CONTEXT_FILE_BYTES", "Maximum bytes per context file", "Oversized files are omitted and reported.", "integer", "100000", Decimal(1000), Decimal(1000000)),
-    RuntimeSetting("MAX_CONTEXT_BYTES", "Maximum total context bytes", "Maximum selected repository context supplied identically to each comparison profile.", "integer", "350000", Decimal(10000), Decimal(5000000)),
-    RuntimeSetting("MAX_CONTEXT_SCAN_BYTES", "Maximum context scan bytes", "Maximum repository text scanned when selecting related files.", "integer", "30000000", Decimal(100000), Decimal(500000000)),
+    RuntimeSetting("MAX_ARCHIVE_BYTES", "Maximum repository archive bytes", "Maximum in-memory repository snapshot size.", "integer", "250000000", Decimal(1000000), Decimal(1000000000)),
+    RuntimeSetting("MAX_ARCHIVE_MEMBERS", "Maximum archive members", "Maximum number of files examined in a repository archive.", "integer", "100000", Decimal(100), Decimal(500000)),
+    RuntimeSetting("MAX_CONTEXT_FILES", "Maximum context files", "Changed and related files supplied identically to both direct comparison profiles.", "integer", "50", Decimal(1), Decimal(200)),
+    RuntimeSetting("MAX_CONTEXT_FILE_BYTES", "Maximum bytes per context file", "Oversized files are omitted and reported.", "integer", "250000", Decimal(1000), Decimal(1000000)),
+    RuntimeSetting("MAX_CONTEXT_BYTES", "Maximum total context bytes", "Maximum selected repository context supplied identically to each comparison profile.", "integer", "1500000", Decimal(10000), Decimal(5000000)),
+    RuntimeSetting("MAX_CONTEXT_SCAN_BYTES", "Maximum context scan bytes", "Maximum repository text scanned when selecting related files.", "integer", "100000000", Decimal(100000), Decimal(500000000)),
+    RuntimeSetting("CONTEXT_DEPENDENCY_DEPTH", "Context dependency depth", "Number of bounded import/call context expansion passes after the changed files.", "integer", "2", Decimal(0), Decimal(4)),
 )
 RUNTIME_SETTING_MAP = {setting.key: setting for setting in RUNTIME_SETTINGS}
 
@@ -433,6 +433,7 @@ class Config:
     llm_api_url: str = ""
     gitlab_group_path: str = ""
     review_profile: str = "anthropic"
+    context_dependency_depth: int = 2
 
     @classmethod
     def from_env(cls, overrides: Mapping[str, str] | None = None) -> "Config":
@@ -512,6 +513,7 @@ class Config:
             llm_api_url=llm_api_url.strip(),
             gitlab_group_path=normalize_gitlab_group_path(gitlab_group_path),
             review_profile=review_profile.strip() or llm_provider,
+            context_dependency_depth=int(settings["CONTEXT_DEPENDENCY_DEPTH"]),
         )
 
 
@@ -1520,6 +1522,67 @@ def focus_identifiers(diffs: list[dict[str, Any]], changed_texts: Iterable[str])
     return set(sorted(identifiers, key=lambda value: (-len(value), value))[:500])
 
 
+IMPORT_REFERENCE_PATTERN = re.compile(
+    r"""(?mx)
+    \b(?:from|import)\s+[\"']?([A-Za-z0-9_@./\\:-]+)
+    |\b(?:require|include|import)\s*\(\s*[\"']([^\"']+)
+    |\busing\s+([A-Za-z0-9_.]+)
+    |\#\s*include\s*[<\"]([^>\"]+)
+    """
+)
+
+
+def dependency_references(text: str) -> set[str]:
+    """Extract bounded import/include references from a source file."""
+    references: set[str] = set()
+    for match in IMPORT_REFERENCE_PATTERN.finditer(text):
+        for value in match.groups():
+            if value:
+                normalized = value.strip().replace("\\", "/")
+                if normalized and len(normalized) <= 256:
+                    references.add(normalized)
+    return references
+
+
+def dependency_path_score(
+    candidate_path: str,
+    source_path: str,
+    references: Iterable[str],
+) -> int:
+    """Score a candidate file when it matches an import from a source file."""
+    candidate = PurePosixPath(candidate_path)
+    candidate_full = candidate.as_posix().lower()
+    candidate_without_ext = str(candidate.with_suffix("")).lower()
+    candidate_stem = candidate.stem.lower()
+    source_parent = PurePosixPath(source_path).parent
+    best = 0
+    for raw_reference in references:
+        reference = raw_reference.strip().replace("\\", "/").lower()
+        if not reference:
+            continue
+        if reference.startswith("."):
+            resolved = (source_parent / reference).as_posix()
+            reference_variants = {resolved, resolved.lstrip("./")}
+        else:
+            reference_variants = {reference, reference.replace(".", "/")}
+        for variant in reference_variants:
+            variant = variant.rstrip("/")
+            if not variant:
+                continue
+            variant_without_ext = str(PurePosixPath(variant).with_suffix(""))
+            variant_stem = PurePosixPath(variant).stem
+            if (
+                candidate_without_ext == variant_without_ext
+                or candidate_full.endswith("/" + variant_without_ext.lstrip("./"))
+            ):
+                best = max(best, 100)
+            elif candidate_stem == variant_stem or candidate_full.endswith(
+                "/" + variant_stem + candidate.suffix.lower()
+            ):
+                best = max(best, 70)
+    return best
+
+
 def build_context_bundle(
     archive: bytes,
     diffs: list[dict[str, Any]],
@@ -1577,10 +1640,13 @@ def build_context_bundle(
             used_bytes += encoded_size
 
         identifiers = focus_identifiers(diffs, changed_texts)
+        changed_dependency_sources = [
+            (path, dependency_references(text))
+            for path, text in selected
+        ]
         changed_directories = {str(PurePosixPath(path).parent) for path in changed_paths}
         changed_suffixes = {PurePosixPath(path).suffix.lower() for path in changed_paths}
-        candidate_limit = max(config.max_context_files * 4, 20)
-        candidates: list[tuple[int, str, str]] = []
+        candidates: list[tuple[str, str, int]] = []
         scanned_bytes = 0
 
         for path, member in members.items():
@@ -1598,27 +1664,83 @@ def build_context_bundle(
             file_identifiers = set(IDENTIFIER_PATTERN.findall(text))
             overlap = identifiers & file_identifiers
             score = min(len(overlap), 30) * 10
+            dependency_score = max(
+                (
+                    dependency_path_score(path, source_path, references)
+                    for source_path, references in changed_dependency_sources
+                ),
+                default=0,
+            )
+            score += dependency_score
             if str(PurePosixPath(path).parent) in changed_directories:
                 score += 20
             if PurePosixPath(path).suffix.lower() in changed_suffixes:
                 score += 3
             if any(word in path.lower() for word in ("auth", "security", "permission", "route")):
                 score += 5
-            if score <= 0:
-                continue
-            entry = (score, path, text)
-            if len(candidates) < candidate_limit:
-                heapq.heappush(candidates, entry)
-            elif entry > candidates[0]:
-                heapq.heapreplace(candidates, entry)
+            candidates.append((path, text, score))
 
         remaining_files = max(config.max_context_files - len(selected), 0)
-        for _, path, text in sorted(candidates, reverse=True)[:remaining_files]:
-            encoded_size = len(text.encode("utf-8"))
-            if used_bytes + encoded_size > config.max_context_bytes:
-                continue
-            selected.append((path, text))
-            used_bytes += encoded_size
+        selected_paths = {path for path, _ in selected}
+        dependency_notes = 0
+        dependency_sources = list(changed_dependency_sources)
+        for depth in range(max(config.context_dependency_depth, 0) + 1):
+            if remaining_files <= 0:
+                break
+            available = [
+                candidate
+                for candidate in candidates
+                if candidate[0] not in selected_paths
+                and (
+                    candidate[2] > 0
+                    or any(
+                        dependency_path_score(candidate[0], source_path, references) > 0
+                        for source_path, references in dependency_sources
+                    )
+                )
+            ]
+            if not available:
+                break
+            quota = remaining_files
+            if depth < config.context_dependency_depth:
+                quota = max(1, remaining_files // 2)
+            ranked = sorted(
+                available,
+                key=lambda candidate: (
+                    candidate[2]
+                    + max(
+                        (
+                            dependency_path_score(
+                                candidate[0], source_path, references
+                            )
+                            for source_path, references in dependency_sources
+                        ),
+                        default=0,
+                    ),
+                    candidate[0],
+                ),
+                reverse=True,
+            )
+            added = 0
+            for path, text, _ in ranked:
+                if added >= quota:
+                    break
+                encoded_size = len(text.encode("utf-8"))
+                if used_bytes + encoded_size > config.max_context_bytes:
+                    continue
+                selected.append((path, text))
+                selected_paths.add(path)
+                used_bytes += encoded_size
+                dependency_sources.append((path, dependency_references(text)))
+                remaining_files -= 1
+                added += 1
+                dependency_notes += 1
+            if not added:
+                break
+        if dependency_notes and config.context_dependency_depth > 0:
+            notes.append(
+                f"Dependency-aware context expansion selected {dependency_notes} related file(s) across up to {config.context_dependency_depth} pass(es)."
+            )
 
     rendered = "\n\n".join(
         f"## Snapshot file: {path}\n\n```text\n{text}\n```" for path, text in selected

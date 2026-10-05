@@ -598,6 +598,44 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(bundle.files, ())
         self.assertTrue(any("omitted" in note for note in bundle.notes))
 
+    def test_dependency_aware_context_expands_across_bounded_hops(self):
+        data = archive_with(
+            {
+                "src/controller.py": (
+                    "from service import lookup_user\n"
+                    "def route(request): return lookup_user(request.args['name'])\n"
+                ),
+                "src/service.py": (
+                    "from repository import find_user\n"
+                    "def lookup_user(name): return find_user(name)\n"
+                ),
+                "src/repository.py": (
+                    "def find_user(name):\n"
+                    "    return database.execute('select ' + name)\n"
+                ),
+                "src/unrelated.py": "def unrelated(): return 1\n",
+            }
+        )
+        diffs = [
+            {
+                "new_path": "src/controller.py",
+                "old_path": "src/controller.py",
+                "diff": "+def route(request): return lookup_user(request.args['name'])",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            config = config_for_test(
+                Path(directory),
+                max_context_files=3,
+                context_dependency_depth=2,
+            )
+            bundle = build_context_bundle(data, diffs, config)
+        self.assertEqual(
+            bundle.files,
+            ("src/controller.py", "src/service.py", "src/repository.py"),
+        )
+        self.assertTrue(any("Dependency-aware context expansion" in note for note in bundle.notes))
+
 
 class DifferentialReviewTests(unittest.TestCase):
     class FakeGitLabClient:
