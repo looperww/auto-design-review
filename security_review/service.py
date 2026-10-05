@@ -146,6 +146,10 @@ LLM_DEFAULT_MODELS = {
     "gemini": "gemini-3.8-flash",
     "custom": "",
 }
+# Responses API reasoning models can consume output tokens before producing
+# visible text. Keep the connection test small, but large enough to leave room
+# for a short response such as "OK".
+LLM_CONNECTION_TEST_MAX_OUTPUT_TOKENS = 256
 COMPARISON_PROFILES = (
     "anthropic",
     "openai",
@@ -1856,6 +1860,16 @@ def openai_response_text(result: Mapping[str, Any]) -> str:
                     chunks.append(str(part["text"]))
     report = "\n".join(chunks).strip()
     if not report:
+        incomplete = result.get("incomplete_details")
+        reason = (
+            incomplete.get("reason")
+            if isinstance(incomplete, dict)
+            else None
+        )
+        if isinstance(reason, str) and reason.strip():
+            raise ReviewError(
+                f"OpenAI returned no text report (response incomplete: {reason})."
+            )
         raise ReviewError("OpenAI returned no text report.")
     return report
 
@@ -2032,13 +2046,25 @@ def test_llm_connection(config: Config) -> None:
         test_claude_api_key(config.llm_api_key, config.llm_model)
         return
     if config.llm_provider == "openai":
-        run_openai("Reply with exactly OK.", config, max_output_tokens=16)
+        run_openai(
+            "Reply with exactly OK.",
+            config,
+            max_output_tokens=LLM_CONNECTION_TEST_MAX_OUTPUT_TOKENS,
+        )
         return
     if config.llm_provider == "gemini":
-        run_gemini("Reply with exactly OK.", config, max_output_tokens=16)
+        run_gemini(
+            "Reply with exactly OK.",
+            config,
+            max_output_tokens=LLM_CONNECTION_TEST_MAX_OUTPUT_TOKENS,
+        )
         return
     if config.llm_provider == "custom":
-        run_custom_llm("Reply with exactly OK.", config, max_output_tokens=16)
+        run_custom_llm(
+            "Reply with exactly OK.",
+            config,
+            max_output_tokens=LLM_CONNECTION_TEST_MAX_OUTPUT_TOKENS,
+        )
         return
     raise ReviewError("The selected LLM provider is not supported.")
 

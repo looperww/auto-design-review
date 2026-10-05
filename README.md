@@ -222,7 +222,9 @@ Before saving, use the two credential-test buttons in the web console:
 - **Test GitLab access** calls the GitLab Projects API and reports how many
   repositories are visible to the submitted or stored token.
 - **Test configured model connection(s)** sends one minimal request through each
-  configured direct model. A small provider usage charge may occur.
+  configured direct model. The test allows 256 output tokens so reasoning models
+  have enough room to produce visible text; a small provider usage charge may
+  occur.
 
 Testing does not save or replace either credential. Signing in derives and
 unlocks the vault encryption key in memory, so the credential form does not ask

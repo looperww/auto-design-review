@@ -43,6 +43,7 @@ from security_review.service import (  # noqa: E402
     run_custom_llm,
     run_gemini,
     run_openai,
+    test_llm_connection,
     parse_mr_url,
     render_commit_context,
     review_target,
@@ -382,6 +383,23 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(metadata["usage"]["input_tokens"], 10)
         self.assertEqual(post.call_args.args[0], "https://api.openai.com/v1/responses")
         self.assertFalse(post.call_args.args[2]["store"])
+
+    def test_openai_connection_test_allows_reasoning_tokens(self):
+        config = config_for_test(
+            Path("/tmp"),
+            llm_provider="openai",
+            llm_model="gpt-6-sol",
+        )
+        with patch(
+            "security_review.service.run_openai",
+            return_value=("OK", {}),
+        ) as run:
+            test_llm_connection(config)
+        run.assert_called_once_with(
+            "Reply with exactly OK.",
+            config,
+            max_output_tokens=256,
+        )
 
     def test_gemini_uses_generate_content_api(self):
         config = config_for_test(
