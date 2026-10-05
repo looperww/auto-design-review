@@ -3007,6 +3007,29 @@ def handler_factory(
         def model_pause_controls(
             self, csrf_token: str, settings: Mapping[str, str], return_to: str
         ) -> str:
+            all_paused = all(
+                model_is_paused(settings, profile) for profile in COMPARISON_PROFILES
+            )
+            none_paused = all(
+                not model_is_paused(settings, profile) for profile in COMPARISON_PROFILES
+            )
+            all_controls = (
+                "<div class='actions model-pause-all'>"
+                "<form method='post' action='/model-pause'>"
+                f"<input type='hidden' name='csrf' value='{html.escape(csrf_token)}'>"
+                "<input type='hidden' name='provider' value='all'>"
+                "<input type='hidden' name='paused' value='true'>"
+                f"<input type='hidden' name='return_to' value='{html.escape(return_to)}'>"
+                f"<button class='danger' type='submit'{' disabled' if all_paused else ''}>Pause all</button>"
+                "</form>"
+                "<form method='post' action='/model-pause'>"
+                f"<input type='hidden' name='csrf' value='{html.escape(csrf_token)}'>"
+                "<input type='hidden' name='provider' value='all'>"
+                "<input type='hidden' name='paused' value='false'>"
+                f"<input type='hidden' name='return_to' value='{html.escape(return_to)}'>"
+                f"<button class='secondary' type='submit'{' disabled' if none_paused else ''}>Resume all</button>"
+                "</form></div>"
+            )
             controls = []
             for profile in COMPARISON_PROFILES:
                 paused = model_is_paused(settings, profile)
@@ -3027,7 +3050,9 @@ def handler_factory(
                 "<section class='card'><div class='section-heading'><div>"
                 "<h2>Model scanning controls</h2>"
                 "<p class='sub'>Pause or resume automated review independently for each direct model. GitLab discovery continues while a model is paused; a review already running is allowed to finish.</p>"
-                "</div></div><div class='model-pause-list'>"
+                "</div>"
+                + all_controls
+                + "</div><div class='model-pause-list'>"
                 + "".join(controls)
                 + "</div></section>"
             )
@@ -3789,13 +3814,17 @@ def handler_factory(
             if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
                 raise ReviewError("Invalid form token.")
             provider = form.get("provider", "").strip().lower()
-            setting_key = MODEL_PAUSE_SETTINGS.get(provider)
-            if setting_key is None:
-                raise ReviewError("Select Anthropic or OpenAI for the pause control.")
+            if provider == "all":
+                setting_keys = list(MODEL_PAUSE_SETTINGS.values())
+            else:
+                setting_key = MODEL_PAUSE_SETTINGS.get(provider)
+                setting_keys = [setting_key] if setting_key else []
+            if not setting_keys:
+                raise ReviewError("Select Anthropic, OpenAI, or all models for the pause control.")
             paused_value = form.get("paused", "").strip().lower()
             if paused_value not in {"true", "false"}:
                 raise ReviewError("The model pause state is invalid.")
-            store.save_settings({setting_key: paused_value})
+            store.save_settings({setting_key: paused_value for setting_key in setting_keys})
             vault.notify_change()
             action = "paused" if paused_value == "true" else "resumed"
             return_to = form.get("return_to", "/settings").strip()
@@ -3806,11 +3835,12 @@ def handler_factory(
                 or parsed_return_to.path not in {"/", "/settings"}
             ):
                 return_to = "/settings"
+            label = "all models" if provider == "all" else COMPARISON_PROFILE_LABELS[provider]
             self.redirect(
                 return_to
                 + ("&" if "?" in return_to else "?")
                 + urllib.parse.urlencode(
-                    {"message": f"{COMPARISON_PROFILE_LABELS[provider]} scanning {action}."}
+                    {"message": f"{label.capitalize()} scanning {action}."}
                 )
             )
 

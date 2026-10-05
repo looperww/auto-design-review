@@ -2004,6 +2004,48 @@ class WebAuthenticationTests(unittest.TestCase):
                     urllib.request.Request(base_url + "/settings", headers=headers)
                 ) as response:
                     settings_page = response.read().decode("utf-8")
+                pause_all_form = urllib.parse.urlencode(
+                    {
+                        "csrf": csrf,
+                        "provider": "all",
+                        "paused": "true",
+                    }
+                ).encode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        base_url + "/model-pause",
+                        data=pause_all_form,
+                        headers={
+                            **headers,
+                            "Content-Type": "application/x-www-form-urlencoded",
+                        },
+                    )
+                ) as response:
+                    paused_settings_page = response.read().decode("utf-8")
+                self.assertIn("All models scanning paused", paused_settings_page)
+                self.assertTrue(model_is_paused(store.settings(), "anthropic"))
+                self.assertTrue(model_is_paused(store.settings(), "openai"))
+                resume_all_form = urllib.parse.urlencode(
+                    {
+                        "csrf": csrf,
+                        "provider": "all",
+                        "paused": "false",
+                    }
+                ).encode("utf-8")
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        base_url + "/model-pause",
+                        data=resume_all_form,
+                        headers={
+                            **headers,
+                            "Content-Type": "application/x-www-form-urlencoded",
+                        },
+                    )
+                ) as response:
+                    resumed_settings_page = response.read().decode("utf-8")
+                self.assertIn("All models scanning resumed", resumed_settings_page)
+                self.assertFalse(model_is_paused(store.settings(), "anthropic"))
+                self.assertFalse(model_is_paused(store.settings(), "openai"))
                 with urllib.request.urlopen(
                     urllib.request.Request(
                         base_url + "/repository?project_id=1&period=week",
@@ -2134,6 +2176,8 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertIn("AI review requested", queue_after_start)
             self.assertIn("Start requested", queue_after_start)
             self.assertIn("Waiting for worker", queue_after_start)
+            self.assertIn("Pause all", settings_page)
+            self.assertIn("Resume all", settings_page)
             self.assertIn("<h1>Completed MRs</h1>", completed)
             self.assertNotIn("<h2>AI reviews in progress</h2>", completed)
             self.assertIn("<h2>Completed review results</h2>", completed)

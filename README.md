@@ -280,7 +280,8 @@ primary pages:
   pagination. Overall GitLab health remains in the compact Dashboard header.
 - **Settings** contains runtime controls, credential tests and rotation, and the
   protected data-reset action. It also provides independent pause/resume controls
-  for Anthropic and OpenAI scanning; pausing a model does not stop GitLab
+  for Anthropic and OpenAI scanning, plus **Pause all** and **Resume all** actions;
+  pausing a model does not stop GitLab
   discovery or the other model. A review already running is allowed to finish;
   the pause is applied before the next review is selected.
 
