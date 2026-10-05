@@ -611,6 +611,14 @@ total-byte, archive, and scan-byte limits. Existing deployments keep explicitly
 saved runtime values; update these context settings in **Settings** if the
 SQLite database already contains the older limits.
 
+When an LLM key is configured, deferred eligible MRs are persisted with status
+`pending`, so the **Queued MRs** page reflects the real worker backlog. The
+worker processes up to `MAX_REVIEWS_PER_CYCLE` items per poll; `deferred` items
+remain queued for later cycles. MRs that stop with `manual_review_required` are
+listed on **Manual reviews** with the recorded reason and context summary. An
+administrator can force a retry from that page; the global safety limits still
+apply to the retry.
+
 ## Operations
 
 Stop the service:

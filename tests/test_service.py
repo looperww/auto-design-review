@@ -1033,6 +1033,48 @@ class StateTests(unittest.TestCase):
             self.assertEqual(str(store.queued_reviews()[0]["head_sha"]), "abc1234")
             state.close()
 
+    def test_deferred_targets_are_persisted_in_the_queue(self):
+        target = ReviewTarget(1, "company/app", 3, "abc123", "https://example/mr/3")
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            state = ReviewState(database)
+            self.assertTrue(state.ensure_pending(target))
+            self.assertFalse(state.ensure_pending(target))
+            self.assertEqual(
+                state.connection.execute(
+                    "SELECT status FROM reviews WHERE head_sha = ?", ("abc123",)
+                ).fetchone()[0],
+                "pending",
+            )
+            state.close()
+
+    def test_manual_review_records_can_be_inspected_and_forced(self):
+        target = ReviewTarget(1, "company/app", 4, "abc123", "https://example/mr/4")
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            store = WebStore(database)
+            state = ReviewState(database)
+            state.record(
+                target,
+                "manual_review_required",
+                report_content="# Manual security review required\n\nToo large.",
+                metadata_json=json.dumps(
+                    {
+                        "status": "manual_review_required",
+                        "reason": "MR changes more than 200 files.",
+                        "changed_files": 250,
+                    }
+                ),
+            )
+            records = store.manual_review_required_reviews()
+            self.assertEqual(len(records), 1)
+            self.assertIn("more than 200", records[0]["metadata_json"])
+            self.assertTrue(store.force_manual_review(1, 4, "abc123"))
+            self.assertFalse(store.manual_review_required_reviews())
+            self.assertEqual(len(store.queued_reviews()), 1)
+            self.assertFalse(store.force_manual_review(1, 4, "abc123"))
+            state.close()
+
     def test_web_store_projects_comparison_results_by_profile(self):
         target = ReviewTarget(1, "company/app", 3, "abc123", "https://example/mr/3")
         with tempfile.TemporaryDirectory() as directory:
@@ -1075,6 +1117,9 @@ class CycleLimitTests(unittest.TestCase):
 
         def requested_targets(self):
             return []
+
+        def ensure_pending(self, target):
+            return True
 
         def mark_pending_not_eligible(self, eligible_keys, *, healthy_projects_only=False):
             return 0
@@ -2333,6 +2378,7 @@ class WebAuthenticationTests(unittest.TestCase):
 
         self.assertIn("href='/'", rendered)
         self.assertIn("href='/completed'", rendered)
+        self.assertIn("href='/manual-reviews'", rendered)
         self.assertIn("href='/repositories' aria-current='page'", rendered)
         self.assertIn("href='/settings'", rendered)
         self.assertEqual(rendered.count("aria-current='page'"), 1)

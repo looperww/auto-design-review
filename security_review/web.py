@@ -1923,6 +1923,52 @@ class WebStore:
                 """
             ).fetchall()
 
+    def manual_review_required_reviews(self) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT reviews.project_id, reviews.project_path, reviews.mr_iid,
+                       reviews.head_sha, reviews.report_content,
+                       reviews.diff_content, reviews.metadata_json,
+                       reviews.reviewed_at, projects.web_url AS project_web_url
+                FROM reviews
+                LEFT JOIN visible_projects AS projects
+                  ON projects.project_id = reviews.project_id
+                WHERE reviews.status = 'manual_review_required'
+                ORDER BY reviews.reviewed_at DESC,
+                         reviews.project_path COLLATE NOCASE,
+                         reviews.mr_iid DESC
+                """
+            ).fetchall()
+
+    def force_manual_review(
+        self, project_id: int, mr_iid: int, head_sha: str
+    ) -> bool:
+        metadata = json.dumps(
+            {
+                "status": "pending",
+                "reason": "AI review manually forced after a previous manual-review stop.",
+                "forced_at": now_iso(),
+            },
+            sort_keys=True,
+        )
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE reviews
+                SET status = 'pending',
+                    report_path = '',
+                    report_content = '',
+                    diff_content = '',
+                    metadata_json = ?,
+                    priority_requested_at = ?
+                WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
+                  AND status = 'manual_review_required'
+                """,
+                (metadata, now_iso(), project_id, mr_iid, head_sha),
+            )
+            return cursor.rowcount == 1
+
     def request_ai_review(
         self, project_id: int, mr_iid: int, head_sha: str
     ) -> bool:
@@ -2238,6 +2284,7 @@ def application_page(
     for key, href, icon, label in (
         ("dashboard", "/", "D", "Dashboard"),
         ("queue", "/queue", "Q", "Queued MRs"),
+        ("manual", "/manual-reviews", "M", "Manual reviews"),
         ("completed", "/completed", "C", "Completed MRs"),
         ("repositories", "/repositories", "R", "Repositories"),
         ("settings", "/settings", "S", "Settings"),
@@ -2479,6 +2526,8 @@ def handler_factory(
                 self.show_repositories(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/queue":
                 self.show_queue(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/manual-reviews":
+                self.show_manual_reviews(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/completed":
                 self.show_completed(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/report":
@@ -2524,6 +2573,8 @@ def handler_factory(
                     self.update_manual_review(form)
                 elif parsed.path == "/queue/start":
                     self.start_queued_review(form)
+                elif parsed.path == "/manual-review/force":
+                    self.force_manual_review(form)
                 else:
                     self.send_page(404, page("Not found", "<div class='card'><h1>Not found</h1></div>"))
             except (ReviewError, UnicodeDecodeError) as exc:
@@ -2795,6 +2846,36 @@ def handler_factory(
                 "currently running review finishes."
             )
             self.redirect("/queue?message=" + urllib.parse.quote(message))
+
+        def force_manual_review(self, form: dict[str, str]) -> None:
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            if not self.valid_csrf(form.get("csrf", ""), str(user["csrf_token"])):
+                raise ReviewError("Invalid form token.")
+            credentials, _ = vault.snapshot()
+            if credentials is None or not credentials.review_ready():
+                raise ReviewError(
+                    "Save and unlock at least one Anthropic or OpenAI API key before forcing an AI review."
+                )
+            try:
+                project_id = int(form.get("project_id", ""))
+                mr_iid = int(form.get("mr_iid", ""))
+            except ValueError as exc:
+                raise ReviewError("Invalid merge-request reference.") from exc
+            head_sha = form.get("head_sha", "").strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{7,64}", head_sha):
+                raise ReviewError("Invalid merge-request revision.")
+            if not store.force_manual_review(project_id, mr_iid, head_sha):
+                raise ReviewError(
+                    "This manual-review record is no longer available. Refresh the page."
+                )
+            vault.notify_change()
+            message = (
+                "AI review forced and placed at the front of the queue. Global safety limits still apply."
+            )
+            self.redirect("/manual-reviews?message=" + urllib.parse.quote(message))
 
         def credential_context(self) -> tuple[Credentials, bytes, bytes]:
             existing, _ = vault.snapshot()
@@ -3246,7 +3327,7 @@ def handler_factory(
               <div class='metric'>In progress<strong>{counts.get('in_progress', 0)}</strong></div>
               <div class='metric success'>Completed<strong>{counts.get('completed', 0)}</strong></div>
               <div class='metric critical'>High findings<strong>{len(findings)}</strong></div>
-              <div class='metric'>Manual review<strong>{counts.get('manual_review_required', 0)}</strong></div>
+              <div class='metric'>Manual review<a class='metric-link' href='/manual-reviews'><strong>{counts.get('manual_review_required', 0)}</strong></a></div>
               <div class='metric'>Failed<strong>{counts.get('failed', 0)}</strong></div>
             </div></section>
             <section class='card'><div class='section-heading'><div><h2>High-severity findings</h2><p class='sub'>Critical and High findings from {html.escape(COMPARISON_PROFILE_LABELS[selected_profile])} for the latest reviewed revision of each MR in {html.escape(str(context['filter_label']))}.</p></div><span class='severity severity-high'>{len(findings)} findings</span></div>
@@ -3420,6 +3501,124 @@ def handler_factory(
                 user,
                 "queue",
                 "<a class='button secondary' href='/completed'>View completed MRs</a>",
+                self.gitlab_connection_status(),
+            )
+
+        def show_manual_reviews(self, query: dict[str, list[str]]) -> None:
+            if store.user_count() == 0:
+                self.redirect("/setup")
+                return
+            session = self.require_session()
+            if session is None:
+                return
+            _, user = session
+            message = query.get("message", [""])[0]
+            notice = (
+                f"<p class='notice'>{html.escape(message)}</p>" if message else ""
+            )
+            records = store.manual_review_required_reviews()
+            rows: list[str] = []
+            for record in records:
+                project_path = str(record["project_path"])
+                project_url = str(record["project_web_url"] or "")
+                parsed_project_url = urllib.parse.urlparse(project_url)
+                mr_iid = int(record["mr_iid"])
+                mr_url = (
+                    project_url.rstrip("/") + f"/-/merge_requests/{mr_iid}"
+                    if parsed_project_url.scheme == "https"
+                    and parsed_project_url.netloc
+                    else ""
+                )
+                mr_label = f"{html.escape(project_path)} !{mr_iid}"
+                mr_display = (
+                    f"<a href='{html.escape(mr_url)}' target='_blank' rel='noopener noreferrer'>{mr_label}</a>"
+                    if mr_url
+                    else mr_label
+                )
+                head_sha = str(record["head_sha"])
+                commit_url = (
+                    project_url.rstrip("/") + "/-/commit/" + urllib.parse.quote(head_sha, safe="")
+                    if parsed_project_url.scheme == "https"
+                    and parsed_project_url.netloc
+                    else ""
+                )
+                commit_display = (
+                    f"<a href='{html.escape(commit_url)}' target='_blank' rel='noopener noreferrer'><code>{html.escape(head_sha[:12])}</code></a>"
+                    if commit_url
+                    else f"<code>{html.escape(head_sha[:12])}</code>"
+                )
+                try:
+                    metadata = json.loads(str(record["metadata_json"] or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    metadata = {}
+                if not isinstance(metadata, Mapping):
+                    metadata = {}
+                reason = str(metadata.get("reason") or "The reviewer stopped before producing a complete AI result.")
+                changed_files = metadata.get("changed_files")
+                context_files = metadata.get("context_files", [])
+                context_notes = metadata.get("context_notes", [])
+                coverage = metadata.get("context_coverage", {})
+                if not isinstance(coverage, Mapping):
+                    coverage = {}
+                coverage_summary = []
+                if changed_files is not None:
+                    coverage_summary.append(f"Changed files: {changed_files}")
+                if context_files:
+                    coverage_summary.append(f"Context files: {len(context_files)}")
+                if coverage.get("dependency_depth_limit") is not None:
+                    coverage_summary.append(
+                        "Dependency depth: "
+                        f"{coverage.get('dependency_depth_reached', 0)}/"
+                        f"{coverage.get('dependency_depth_limit')}"
+                    )
+                coverage_html = (
+                    "<ul>"
+                    + "".join(
+                        f"<li>{html.escape(str(item))}</li>"
+                        for item in coverage_summary
+                    )
+                    + "</ul>"
+                    if coverage_summary
+                    else "<p class='sub'>Context details were not collected before the stop.</p>"
+                )
+                if context_notes:
+                    coverage_html += (
+                        "<p class='sub'><strong>Notes:</strong> "
+                        + html.escape("; ".join(str(note) for note in context_notes))
+                        + "</p>"
+                    )
+                stopped_at = str(record["reviewed_at"] or "")[:19].replace("T", " ") + " UTC"
+                action = (
+                    "<form method='post' action='/manual-review/force'>"
+                    f"<input type='hidden' name='csrf' value='{html.escape(str(user['csrf_token']))}'>"
+                    f"<input type='hidden' name='project_id' value='{int(record['project_id'])}'>"
+                    f"<input type='hidden' name='mr_iid' value='{mr_iid}'>"
+                    f"<input type='hidden' name='head_sha' value='{html.escape(head_sha)}'>"
+                    "<button class='secondary' type='submit'>Force AI review</button>"
+                    "<p class='sub'>Configured safety limits still apply.</p></form>"
+                )
+                rows.append(
+                    "<tr>"
+                    f"<td>{mr_display}</td><td>{commit_display}</td>"
+                    f"<td>{html.escape(stopped_at)}</td>"
+                    f"<td><details><summary>{html.escape(reason)}</summary><div class='review-details'>{coverage_html}</div></details></td>"
+                    f"<td>{action}</td></tr>"
+                )
+            table_rows = "".join(rows) or (
+                "<tr><td class='empty-state' colspan='5'>No merge requests currently require manual review.</td></tr>"
+            )
+            body = f"""
+            {notice}
+            <section class='card'><div class='section-heading'><div><h2>Manual review required</h2><p class='sub'>These MRs were not given a complete AI result. Review the recorded reason and force a retry when appropriate.</p></div><span class='review-state review-state-open'>{len(records)} stopped</span></div>
+            <div class='table-wrap'><table><thead><tr><th>MR</th><th>Commit</th><th>Stopped time</th><th>Reason and coverage</th><th>Action</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
+            self.application_response(
+                "Manual reviews",
+                "Manual reviews",
+                "Investigate incomplete AI reviews and retry them when appropriate.",
+                body,
+                user,
+                "manual",
+                "<a class='button secondary' href='/queue'>View queue</a>",
                 self.gitlab_connection_status(),
             )
 

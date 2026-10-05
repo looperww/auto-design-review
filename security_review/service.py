@@ -1029,6 +1029,23 @@ class ReviewState:
         self.connection.commit()
         return cursor.rowcount > 0
 
+    def ensure_pending(self, target: ReviewTarget) -> bool:
+        """Persist an eligible target so deferred work is visible in the queue."""
+        inserted = self.queue(target)
+        if inserted:
+            return True
+        cursor = self.connection.execute(
+            """
+            UPDATE reviews
+            SET status = 'pending', priority_requested_at = ''
+            WHERE project_id = ? AND mr_iid = ? AND head_sha = ?
+              AND status NOT IN ('pending', 'in_progress')
+            """,
+            (target.project_id, target.mr_iid, target.head_sha),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
     def mark_in_progress(
         self, target: ReviewTarget, review_profiles: Iterable[str]
     ) -> None:
@@ -2614,9 +2631,12 @@ def scan_once(
         if active_comparison_configs
         else [config.review_profile]
     )
-    pending = state.prioritize_targets(
+    pending_targets = [
         target for target in targets if state.needs_review(target, active_profiles)
-    )
+    ]
+    for target in pending_targets:
+        state.ensure_pending(target)
+    pending = state.prioritize_targets(pending_targets)
     review_limit = (
         len(pending)
         if config.max_reviews_per_cycle == 0
